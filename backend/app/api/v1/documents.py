@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel
@@ -11,6 +11,7 @@ from app.rag.document_processor import extract_text, clean_text, chunk_text
 from app.rag.embeddings import embed_texts
 from app.rag.vector_store import upsert_chunks, delete_document_vectors
 from app.core.config import settings
+from app.core.audit import audit, AuditAction, AuditOutcome
 import os
 import shutil
 from datetime import datetime
@@ -70,6 +71,7 @@ async def get_documents(
 
 @router.post("/upload")
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     workspace_id: Optional[str] = Form(None),
     folder: Optional[str] = Form(None),
@@ -167,10 +169,39 @@ async def upload_document(
         # Clean up file on failure
         if os.path.exists(file_path):
             os.remove(file_path)
+        audit(
+            action=AuditAction.DOCUMENT_UPLOAD,
+            actor=current_user,
+            outcome=AuditOutcome.FAILURE,
+            resource=f"document:{doc.id}",
+            request=request,
+            metadata={
+                "filename": doc.original_filename,
+                "file_type": ext,
+                "file_size": file_size,
+                "workspace_id": workspace_id,
+                "reason": str(e)[:200],
+            },
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process document: {str(e)}"
         )
+
+    audit(
+        action=AuditAction.DOCUMENT_UPLOAD,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"document:{doc.id}",
+        request=request,
+        metadata={
+            "filename": doc.original_filename,
+            "file_type": ext,
+            "file_size": file_size,
+            "chunk_count": doc.chunk_count,
+            "workspace_id": workspace_id,
+        },
+    )
         
     return {
         "id": doc.id,
@@ -190,11 +221,20 @@ async def upload_document(
 @router.delete("/{id}")
 async def delete_document(
     id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     doc = db.query(Document).filter(Document.id == id).first()
     if not doc:
+        audit(
+            action=AuditAction.DOCUMENT_DELETE,
+            actor=current_user,
+            outcome=AuditOutcome.FAILURE,
+            resource=f"document:{id}",
+            request=request,
+            metadata={"reason": "not_found"},
+        )
         raise HTTPException(status_code=404, detail="Document not found")
         
     # Delete from Qdrant
@@ -210,6 +250,19 @@ async def delete_document(
         except Exception as e:
             print(f"Failed to remove local file: {e}")
             
+    deleted_meta = {
+        "filename": doc.original_filename,
+        "workspace_id": doc.workspace_id,
+        "chunk_count": doc.chunk_count,
+    }
     db.delete(doc)
     db.commit()
+    audit(
+        action=AuditAction.DOCUMENT_DELETE,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"document:{id}",
+        request=request,
+        metadata=deleted_meta,
+    )
     return {"message": "Document successfully deleted"}

@@ -46,6 +46,11 @@ class JSONFormatter(logging.Formatter):
             log_entry["resource_type"] = record.resource_type
         if hasattr(record, "status_code"):
             log_entry["status_code"] = record.status_code
+        # Structured audit payload (see app/core/audit.py). Emitted as a nested
+        # object so audit records stay machine-parseable and can be routed to a
+        # separate sink without changing the surrounding log format.
+        if hasattr(record, "audit"):
+            log_entry["audit"] = record.audit
 
         # Add exception info
         if record.exc_info and record.exc_info[1]:

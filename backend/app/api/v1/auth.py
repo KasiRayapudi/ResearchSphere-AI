@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import create_access_token, hash_password, verify_password, get_current_user
 from app.models.user import User
 from app.models.workspace import Workspace
+from app.core.audit import audit, AuditAction, AuditOutcome
 
 router = APIRouter()
 
@@ -28,15 +29,32 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 @router.post("/login")
-async def login(payload: UserLogin, db: Session = Depends(get_db)):
+async def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
     if not user or not verify_password(payload.password, user.hashed_password):
+        # The submitted password is never logged, only the outcome and which
+        # of the two failure modes occurred.
+        audit(
+            action=AuditAction.LOGIN_FAILURE,
+            actor=payload.email,
+            outcome=AuditOutcome.FAILURE,
+            resource=f"user:{user.id}" if user else "user:unknown",
+            request=request,
+            metadata={"reason": "bad_password" if user else "unknown_email"},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password"
         )
-    
+
     token = create_access_token({"sub": user.id, "role": user.role})
+    audit(
+        action=AuditAction.LOGIN_SUCCESS,
+        actor=user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{user.id}",
+        request=request,
+    )
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -50,10 +68,18 @@ async def login(payload: UserLogin, db: Session = Depends(get_db)):
     }
 
 @router.post("/signup")
-async def signup(payload: UserSignup, db: Session = Depends(get_db)):
+async def signup(payload: UserSignup, request: Request, db: Session = Depends(get_db)):
     # Check if user already exists
     existing_user = db.query(User).filter(User.email == payload.email).first()
     if existing_user:
+        audit(
+            action=AuditAction.USER_REGISTERED,
+            actor=payload.email,
+            outcome=AuditOutcome.FAILURE,
+            resource="user:new",
+            request=request,
+            metadata={"reason": "email_already_registered"},
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
@@ -78,6 +104,15 @@ async def signup(payload: UserSignup, db: Session = Depends(get_db)):
     )
     db.add(default_ws)
     db.commit()
+
+    audit(
+        action=AuditAction.USER_REGISTERED,
+        actor=new_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{new_user.id}",
+        request=request,
+        metadata={"default_workspace_id": default_ws.id},
+    )
 
     token = create_access_token({"sub": new_user.id, "role": new_user.role})
     return {

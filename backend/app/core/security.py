@@ -2,11 +2,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.audit import audit, AuditAction, AuditOutcome
 
 import bcrypt
 security = HTTPBearer()
@@ -42,7 +43,14 @@ def decode_token(token: str) -> dict:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         return payload
-    except JWTError:
+    except JWTError as exc:
+        # The token itself is never logged - only the reason it was rejected.
+        audit(
+            action=AuditAction.INVALID_TOKEN,
+            outcome=AuditOutcome.DENIED,
+            resource="auth:token",
+            metadata={"reason": type(exc).__name__},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
@@ -51,6 +59,7 @@ def decode_token(token: str) -> dict:
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
 ):
@@ -59,11 +68,33 @@ def get_current_user(
     payload = decode_token(credentials.credentials)
     user_id: str = payload.get("sub")
     if not user_id:
+        audit(
+            action=AuditAction.INVALID_TOKEN,
+            outcome=AuditOutcome.DENIED,
+            resource="auth:token",
+            request=request,
+            metadata={"reason": "missing_subject_claim"},
+        )
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
+        audit(
+            action=AuditAction.UNAUTHORIZED_ACCESS,
+            outcome=AuditOutcome.DENIED,
+            resource=f"user:{user_id}",
+            request=request,
+            metadata={"reason": "user_not_found"},
+        )
         raise HTTPException(status_code=401, detail="User not found")
     if not user.is_active:
+        audit(
+            action=AuditAction.UNAUTHORIZED_ACCESS,
+            actor=user,
+            outcome=AuditOutcome.DENIED,
+            resource=f"user:{user.id}",
+            request=request,
+            metadata={"reason": "account_deactivated"},
+        )
         raise HTTPException(status_code=401, detail="Account is deactivated")
     return user

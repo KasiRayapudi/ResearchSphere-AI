@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -7,6 +7,7 @@ from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.report import Report as ReportModel
 from app.agents.graph import LangGraphResearchEngine
+from app.core.audit import audit, AuditAction, AuditOutcome
 from typing import Optional, List
 
 router = APIRouter()
@@ -57,6 +58,7 @@ async def get_reports(
 @router.post("/generate")
 async def generate_report(
     payload: ReportGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -72,6 +74,18 @@ async def generate_report(
     try:
         graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
     except Exception as e:
+        audit(
+            action=AuditAction.REPORT_GENERATE,
+            actor=current_user,
+            outcome=AuditOutcome.FAILURE,
+            resource="report:new",
+            request=request,
+            metadata={
+                "title": payload.title,
+                "workspace_id": workspace_id,
+                "reason": str(e)[:200],
+            },
+        )
         raise HTTPException(
             status_code=500,
             detail=f"LangGraph failed to generate report: {str(e)}"
@@ -97,6 +111,19 @@ async def generate_report(
     db.add(report)
     db.commit()
     db.refresh(report)
+
+    audit(
+        action=AuditAction.REPORT_GENERATE,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"report:{report.id}",
+        request=request,
+        metadata={
+            "title": report.title,
+            "workspace_id": workspace_id,
+            "source_document_count": len(report.source_document_ids or []),
+        },
+    )
 
     return {
         "id": report.id,
