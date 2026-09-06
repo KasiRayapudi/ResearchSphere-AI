@@ -1,0 +1,280 @@
+name: Security
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly, so newly-published advisories against unchanged pins are noticed
+    # without waiting for the next commit.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # ------------------------------------------------------------ code scans --
+  bandit:
+    name: Bandit (Python SAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install Bandit
+        run: pip install "bandit[toml]==1.8.0"
+
+      # Blocking at medium severity and above; low-severity findings are
+      # reported in the artifact but do not fail the build.
+      - name: Scan
+        working-directory: backend
+        run: |
+          bandit -c pyproject.toml -r app main.py \
+            -f json -o bandit-report.json --severity-level low || true
+          bandit -c pyproject.toml -r app main.py \
+            --severity-level medium --confidence-level medium
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: backend/bandit-report.json
+          retention-days: 30
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # ------------------------------------------------------------ dependency --
+  python-dependencies:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.7.3
+
+      # Advisory rather than blocking: the pinned dependency set currently
+      # carries known advisories (see docs/SECURITY.md). Upgrading them is a
+      # deliberate, separately-verified change, not something a CI failure
+      # should force mid-feature. The report is always published.
+      - name: Audit
+        id: audit
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          pip-audit -r requirements.txt \
+            --format json --output pip-audit.json --progress-spinner off || true
+          pip-audit -r requirements.txt --progress-spinner off \
+            | tee pip-audit.txt
+
+      - name: Summarise
+        if: always()
+        working-directory: backend
+        run: |
+          {
+            echo "### Python dependency audit"
+            echo ""
+            echo '```'
+            tail -n 40 pip-audit.txt 2>/dev/null || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: |
+            backend/pip-audit.json
+            backend/pip-audit.txt
+          retention-days: 30
+
+  node-dependencies:
+    name: Node dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      # Blocking on high and critical only: moderate advisories in build-time
+      # dependencies do not reach production, and blocking on them would stall
+      # unrelated work.
+      - name: Audit
+        working-directory: frontend
+        run: |
+          npm audit --json > npm-audit.json || true
+          npm audit --audit-level=high
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npm-audit-report
+          path: frontend/npm-audit.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------- secrets --
+  secret-scan:
+    name: Secret detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret committed earlier and later removed is still
+          # a leaked secret.
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+
+  # -------------------------------------------------------------- container --
+  container-scan:
+    name: Container image scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: false
+          load: true
+          tags: researchsphere/backend:scan
+          cache-from: type=gha,scope=backend
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: false
+          load: true
+          tags: researchsphere/frontend:scan
+          cache-from: type=gha,scope=frontend
+
+      - name: Trivy - backend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: researchsphere/backend:scan
+          format: sarif
+          output: trivy-backend.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Trivy - frontend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: researchsphere/frontend:scan
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload results to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: .
+          category: trivy
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-reports
+          path: "*.sarif"
+          retention-days: 30
+
+  # -------------------------------------------------------- SBOM / licences --
+  sbom:
+    name: SBOM and licence check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Python SBOM (CycloneDX)
+        working-directory: backend
+        run: |
+          pip install cyclonedx-bom==5.1.1 pip-licenses==5.0.0
+          pip install -r requirements.txt
+          cyclonedx-py environment --output-format json --outfile sbom-backend.json
+          pip-licenses --format=json --output-file licenses-backend.json
+          pip-licenses --format=markdown > licenses-backend.md
+
+      - name: Fail on copyleft licences in production dependencies
+        working-directory: backend
+        run: |
+          # AGPL/GPL in a dependency of a hosted service has real distribution
+          # implications, so it is surfaced as a build failure rather than a
+          # line in a report nobody reads.
+          if grep -Ei '"License": "[^"]*(AGPL|GPL-3)' licenses-backend.json; then
+            echo "::error::Copyleft-licensed dependency detected - review required."
+            exit 1
+          fi
+          echo "No AGPL/GPL-3 dependencies found."
+
+      - name: Node SBOM
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npx --yes @cyclonedx/cyclonedx-npm --output-file sbom-frontend.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-and-licenses
+          path: |
+            backend/sbom-backend.json
+            backend/licenses-backend.json
+            backend/licenses-backend.md
+            frontend/sbom-frontend.json
+          retention-days: 90
