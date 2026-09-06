@@ -8,11 +8,13 @@ from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.chat import ChatSession, ChatMessage
 from app.rag.pipeline import stream_rag_response
+from app.core.logging import get_logger
 import json
 import asyncio
 from typing import Optional, List
 
 router = APIRouter()
+logger = get_logger("chat")
 
 class ChatQuery(BaseModel):
     prompt: str
@@ -121,44 +123,58 @@ async def chat_stream(
         sources_meta = []
         response_time = 0
 
-        # Stream real RAG pipeline output
-        async for chunk in stream_rag_response(
-            question=payload.prompt,
-            workspace_id=workspace_id
-        ):
-            if "__SOURCES_JSON__" in chunk:
-                # Parse metadata JSON payload
-                try:
-                    parts = chunk.split("__SOURCES_JSON__")
-                    # yield any text before token marker
-                    if parts[0]:
-                        yield f"data: {json.dumps({'text': parts[0]})}\n\n"
-                        accumulated_text += parts[0]
-                        
-                    meta_raw = parts[1].replace("__END_SOURCES__", "").strip()
-                    meta_parsed = json.loads(meta_raw)
-                    sources_meta = meta_parsed.get("__sources__", [])
-                    response_time = meta_parsed.get("__response_time_ms__", 0)
-                except Exception as e:
-                    print(f"Error parsing RAG metadata: {e}")
-            else:
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
-                accumulated_text += chunk
-                
-            await asyncio.sleep(0.01)
+        try:
+            # Stream real RAG pipeline output
+            async for chunk in stream_rag_response(
+                question=payload.prompt,
+                workspace_id=workspace_id
+            ):
+                if "__SOURCES_JSON__" in chunk:
+                    # Parse metadata JSON payload
+                    try:
+                        parts = chunk.split("__SOURCES_JSON__")
+                        # yield any text before token marker
+                        if parts[0]:
+                            yield f"data: {json.dumps({'text': parts[0]})}\n\n"
+                            accumulated_text += parts[0]
+
+                        meta_raw = parts[1].replace("__END_SOURCES__", "").strip()
+                        meta_parsed = json.loads(meta_raw)
+                        sources_meta = meta_parsed.get("__sources__", [])
+                        response_time = meta_parsed.get("__response_time_ms__", 0)
+                    except Exception as e:
+                        logger.error(f"Error parsing RAG metadata: {e}")
+                else:
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                    accumulated_text += chunk
+
+                await asyncio.sleep(0.01)
+        except Exception as exc:
+            # A retrieval or model failure must not escape the generator: once
+            # the response has started streaming the status code is already
+            # sent, so an exception here would truncate the stream with no
+            # explanation. Emit a typed error event instead.
+            logger.error(f"Chat stream failed: {exc}", exc_info=True)
+            yield f"data: {json.dumps({'error': 'The assistant is temporarily unavailable. Please try again.'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
         # Write Assistant response message to DB
-        assistant_msg = ChatMessage(
-            session_id=session_id,
-            role="assistant",
-            content=accumulated_text,
-            sources=sources_meta,
-            model_used=payload.model,
-            response_time_ms=response_time
-        )
-        db.add(assistant_msg)
-        db.commit()
-        
+        try:
+            assistant_msg = ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=accumulated_text,
+                sources=sources_meta,
+                model_used=payload.model,
+                response_time_ms=response_time
+            )
+            db.add(assistant_msg)
+            db.commit()
+        except Exception as exc:
+            logger.error(f"Failed to persist assistant message: {exc}", exc_info=True)
+            db.rollback()
+
         # Send completed session marker
         yield f"data: [DONE]\n\n"
 

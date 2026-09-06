@@ -26,10 +26,14 @@ class JSONFormatter(logging.Formatter):
             "line": record.lineno,
         }
 
-        # Add request ID if available
-        req_id = request_id_var.get("")
+        # Add request ID if available. An explicit `extra={"request_id": ...}`
+        # wins over the contextvar, so middleware running outside the
+        # RequestIDMiddleware scope can still correlate its log lines.
+        req_id = getattr(record, "request_id", "") or request_id_var.get("")
         if req_id:
             log_entry["request_id"] = req_id
+        if hasattr(record, "client_ip"):
+            log_entry["client_ip"] = record.client_ip
 
         # Add extra fields
         if hasattr(record, "duration_ms"):

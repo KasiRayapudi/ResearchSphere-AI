@@ -1,9 +1,12 @@
 import os
 import logging
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy import text
 from fastapi import FastAPI, HTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -56,6 +59,191 @@ setup_logging()
 logger = get_logger("main")
 
 # ---------------------------------------------------------------------------
+# Application runtime state (populated by the lifespan startup hook)
+# ---------------------------------------------------------------------------
+START_TIME: datetime | None = None
+qdrant_client = None
+redis_client = None
+
+
+# ---------------------------------------------------------------------------
+# Dependency checks - shared by the lifespan hook and the health endpoints so
+# startup diagnostics and probe output can never drift apart.
+# ---------------------------------------------------------------------------
+def check_database() -> str:
+    """Verify the database accepts a trivial query."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return "ok"
+    except Exception as exc:
+        logger.error(f"Database check failed: {exc}")
+        return "failed"
+
+
+def check_qdrant() -> str:
+    """Verify Qdrant is reachable. The collection is created lazily on first
+    ingest, so a reachable server with no collection still counts as ``ok``."""
+    if QdrantClient is None:
+        return "unavailable"
+    try:
+        client = qdrant_client or QdrantClient(
+            host=settings.QDRANT_HOST, port=settings.QDRANT_PORT, timeout=5
+        )
+        client.get_collections()
+        return "ok"
+    except Exception as exc:
+        logger.error(f"Qdrant check failed: {exc}")
+        return "failed"
+
+
+def check_redis() -> str:
+    """Verify Redis when configured. Redis is optional: a blank REDIS_URL
+    reports ``disabled`` and does not hold readiness back."""
+    if not settings.redis_enabled:
+        return "disabled"
+    if redis is None:
+        return "unavailable"
+    try:
+        client = redis_client or redis.from_url(
+            settings.REDIS_URL, socket_connect_timeout=5
+        )
+        client.ping()
+        return "ok"
+    except Exception as exc:
+        logger.error(f"Redis check failed: {exc}")
+        return "failed"
+
+
+def check_gemini() -> str:
+    """Verify the Gemini API key is configured (no network call)."""
+    return "configured" if getattr(settings, "GEMINI_API_KEY", "") else "missing"
+
+
+def check_storage() -> str:
+    """Verify the upload directory exists and is writable."""
+    upload_path = Path(getattr(settings, "UPLOAD_DIR", "./uploads"))
+    try:
+        upload_path.mkdir(parents=True, exist_ok=True)
+        probe = upload_path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return "ok"
+    except Exception as exc:
+        logger.error(f"Storage check failed: {exc}")
+        return "failed"
+
+
+def collect_checks() -> dict:
+    """Run every dependency check and return a status map."""
+    return {
+        "database": check_database(),
+        "qdrant": check_qdrant(),
+        "redis": check_redis(),
+        "gemini": check_gemini(),
+        "storage": check_storage(),
+    }
+
+
+# Statuses that do not block readiness. "missing"/"disabled"/"unavailable" mean
+# an optional dependency is simply not configured, which is not a failure.
+_HEALTHY_STATUSES = {"ok", "configured", "disabled", "unavailable"}
+
+
+def uptime_seconds() -> float:
+    if START_TIME is None:
+        return 0.0
+    return round((datetime.now(timezone.utc) - START_TIME).total_seconds(), 2)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan - startup / shutdown
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Verify every dependency on startup and release clients on shutdown."""
+    global START_TIME, qdrant_client, redis_client
+
+    # --- Startup -----------------------------------------------------------
+    setup_logging()  # idempotent; guarantees JSON logging even under Gunicorn
+    START_TIME = datetime.now(timezone.utc)
+    logger.info(
+        f"Starting {settings.APP_NAME} v{settings.APP_VERSION} "
+        f"(environment={settings.ENVIRONMENT})"
+    )
+
+    # Long-lived clients, created once and reused by the health checks
+    if QdrantClient is not None:
+        try:
+            qdrant_client = QdrantClient(
+                host=settings.QDRANT_HOST, port=settings.QDRANT_PORT, timeout=5
+            )
+        except Exception as exc:
+            logger.error(f"Could not construct Qdrant client: {exc}")
+            qdrant_client = None
+    if redis is not None and settings.redis_enabled:
+        try:
+            redis_client = redis.from_url(
+                settings.REDIS_URL, socket_connect_timeout=5
+            )
+        except Exception as exc:
+            logger.error(f"Could not construct Redis client: {exc}")
+            redis_client = None
+
+    checks = collect_checks()
+    for name, status in checks.items():
+        if status in ("ok", "configured"):
+            logger.info(f"[startup] {name}: {status}")
+        elif status in ("disabled", "unavailable"):
+            logger.warning(f"[startup] {name}: {status} (optional, skipped)")
+        else:
+            logger.error(f"[startup] {name}: {status}")
+
+    # Development convenience: ensure tables exist. Production uses migrations.
+    if not settings.is_production and checks["database"] == "ok":
+        try:
+            Base.metadata.create_all(bind=engine)
+            logger.info("[startup] database schema ensured (development mode)")
+        except Exception as exc:
+            logger.error(f"[startup] schema creation failed: {exc}")
+
+    degraded = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
+    if degraded:
+        logger.warning(
+            f"Startup complete with degraded dependencies: {', '.join(degraded)}"
+        )
+    else:
+        logger.info("Startup complete - all dependencies healthy")
+
+    yield
+
+    # --- Shutdown ----------------------------------------------------------
+    logger.info("Shutdown initiated - releasing resources")
+    if qdrant_client is not None:
+        try:
+            qdrant_client.close()
+            logger.info("[shutdown] Qdrant client closed")
+        except Exception as exc:
+            logger.error(f"[shutdown] error closing Qdrant client: {exc}")
+        finally:
+            qdrant_client = None
+    if redis_client is not None:
+        try:
+            redis_client.close()
+            logger.info("[shutdown] Redis client closed")
+        except Exception as exc:
+            logger.error(f"[shutdown] error closing Redis client: {exc}")
+        finally:
+            redis_client = None
+    try:
+        engine.dispose()
+        logger.info("[shutdown] database connection pool disposed")
+    except Exception as exc:
+        logger.error(f"[shutdown] error disposing database pool: {exc}")
+    logger.info(f"Shutdown complete (uptime {uptime_seconds()}s)")
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application with lifespan events
 # ---------------------------------------------------------------------------
 
@@ -69,36 +257,54 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="ResearchSphere AI - Enterprise Backend Gateway",
         description="Production RAG pipeline, LangGraph Multi‑Agent Workflows, and MCP Connectors Engine",
-        version="2.4.0",
+        version=settings.APP_VERSION,
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
     # -------------------------------------------------------------------
     # Middleware registration (order matters)
     # -------------------------------------------------------------------
-    # Trusted hosts – restrict to known hostnames (fallback to localhost)
-    trusted_hosts = getattr(settings, "TRUSTED_HOSTS", ["localhost", "127.0.0.1"])
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
-    app.add_middleware(RequestIDMiddleware)            # 1️⃣ Request ID
-    app.add_middleware(LoggingMiddleware)              # 2️⃣ Structured logging
-    app.add_middleware(SecurityHeadersMiddleware)       # 3️⃣ Security headers
-    app.add_middleware(RateLimitingMiddleware)         # 4️⃣ Rate limiting
-    app.add_middleware(GZipMiddleware, minimum_size=1024)  # 5️⃣ Compression
+    # Registration order below is the documented pipeline order. Starlette wraps
+    # middleware in reverse, so the last one registered (CORS) is the outermost
+    # at runtime - which is what we want: CORS headers are then applied to every
+    # response, including 400s from TrustedHost and 429s from the rate limiter.
+    #
+    #   TrustedHost -> RequestID -> Logging -> SecurityHeaders -> RateLimit -> GZip -> CORS
+    #
+    # 1. Trusted hosts - reject unknown Host headers
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
+    # 2. Request ID - correlation ID for every request
+    app.add_middleware(RequestIDMiddleware)
+    # 3. Structured logging
+    app.add_middleware(LoggingMiddleware)
+    # 4. Security headers
+    app.add_middleware(SecurityHeadersMiddleware)
+    # 5. Rate limiting
+    app.add_middleware(RateLimitingMiddleware)
+    # 6. Compression
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-    # Trusted hosts – restrict to known hostnames (fallback to localhost)
-    trusted_hosts = getattr(settings, "TRUSTED_HOSTS", ["localhost", "127.0.0.1"])
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
-
-    # CORS – restrict to the configured frontend URL (single origin string)
-    frontend_origin = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
-    allow_origins = [frontend_origin]
+    # 7. CORS - explicit origin allowlist loaded from configuration.
+    # Wildcards are rejected in production; they are also incompatible with
+    # allow_credentials=True, which browsers refuse alongside "*".
+    allow_origins = settings.cors_origins
+    if "*" in allow_origins:
+        if settings.is_production:
+            raise RuntimeError(
+                "Wildcard CORS origin '*' is not permitted in production. "
+                "Set CORS_ORIGINS to an explicit comma-separated allowlist."
+            )
+        logger.warning("Wildcard CORS origin enabled - development only")
+    logger.info(f"CORS allowed origins: {allow_origins}")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID", "X-RateLimit-Remaining"],
     )
 
     # -------------------------------------------------------------------
@@ -123,148 +329,54 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix="/api/v1/admin", tags=["Admin & System Health"])
 
     # -------------------------------------------------------------------
-    # Health endpoints – verify core services
+    # Health endpoints - liveness, readiness and full diagnostics
     # -------------------------------------------------------------------
-    @app.get("/health")
-    async def health_check():
-        """Basic liveness endpoint – always returns ``healthy``.
+    @app.get("/api/health", tags=["Health"])
+    async def health():
+        """Full diagnostics: per-dependency status, uptime and version.
 
-        Additional diagnostics are provided by ``/ready``.
+        Always returns 200 so the payload stays readable by dashboards even
+        while the service is degraded; use ``/api/ready`` for gating.
         """
+        checks = await run_in_threadpool(collect_checks)
+        degraded = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
         return {
-            "status": "healthy",
-            "service": "ResearchSphere AI Gateway",
-            "version": settings.APP_VERSION if hasattr(settings, "APP_VERSION") else "2.4.0",
+            "status": "degraded" if degraded else "healthy",
+            "service": settings.APP_NAME,
+            "version": settings.APP_VERSION,
+            "environment": settings.ENVIRONMENT,
+            "uptime_seconds": uptime_seconds(),
+            "checks": checks,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    @app.get("/live")
-    async def liveness():
-        return {"status": "live"}
+    @app.get("/api/live", tags=["Health"])
+    async def live():
+        """Liveness probe - the process is running. No dependency I/O."""
+        return {"status": "live", "uptime_seconds": uptime_seconds()}
 
-    @app.get("/ready")
-    async def readiness():
-        """Readiness probe – checks DB, Qdrant, Redis, Gemini key and storage.
-        Returns ``ready`` only when *all* checks succeed.
-        """
-        checks = {}
-        # Database connectivity
-        try:
-            with engine.connect() as conn:
-                conn.execute("SELECT 1")
-            checks["database"] = "ok"
-        except Exception as exc:
-            logger.error(f"Readiness DB check failed: {exc}")
-            checks["database"] = "failed"
-        # Qdrant connectivity
-        if QdrantClient:
-            try:
-                client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
-                client.get_collection(collection_name=settings.QDRANT_COLLECTION)
-                checks["qdrant"] = "ok"
-            except Exception as exc:  # pragma: no cover
-                logger.error(f"Readiness Qdrant check failed: {exc}")
-                checks["qdrant"] = "failed"
-        else:
-            checks["qdrant"] = "unavailable"
-        # Redis connectivity
-        if redis:
-            try:
-                r = redis.from_url(settings.REDIS_URL)
-                r.ping()
-                checks["redis"] = "ok"
-            except Exception as exc:  # pragma: no cover
-                logger.error(f"Readiness Redis check failed: {exc}")
-                checks["redis"] = "failed"
-        else:
-            checks["redis"] = "unavailable"
-        # Gemini API configuration
-        if getattr(settings, "GEMINI_API_KEY", None):
-            checks["gemini"] = "configured"
-        else:
-            checks["gemini"] = "missing"
-        # Storage directory existence
-        upload_path = Path(getattr(settings, "UPLOAD_DIR", "./uploads"))
-        if upload_path.exists():
-            checks["storage"] = "ok"
-        else:
-            try:
-                upload_path.mkdir(parents=True, exist_ok=True)
-                checks["storage"] = "created"
-            except Exception as exc:  # pragma: no cover
-                logger.error(f"Readiness storage check failed: {exc}")
-                checks["storage"] = "failed"
-        overall = "ready" if all(v in ("ok", "configured", "created") for v in checks.values()) else "unavailable"
-        status_code = 200 if overall == "ready" else 503
-        return JSONResponse(status_code=status_code, content={"status": overall, "checks": checks})
+    @app.get("/api/ready", tags=["Health"])
+    async def ready():
+        """Readiness probe - 503 when a required dependency is unavailable."""
+        checks = await run_in_threadpool(collect_checks)
+        failed = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
+        payload = {
+            "status": "unavailable" if failed else "ready",
+            "version": settings.APP_VERSION,
+            "uptime_seconds": uptime_seconds(),
+            "checks": checks,
+        }
+        if failed:
+            payload["failed"] = failed
+            logger.warning(f"Readiness probe failed: {', '.join(failed)}")
+        return JSONResponse(
+            status_code=503 if failed else 200, content=payload
+        )
 
-    # -------------------------------------------------------------------
-    # Lifespan events – startup / shutdown logging
-    # -------------------------------------------------------------------
-        @app.on_event("startup")
-    async def on_startup():
-        """Application startup hook.
-        Performs connectivity checks for DB, Qdrant, Redis, and Gemini configuration.
-        Records the start time for uptime calculations.
-        """
-        global start_time, qdrant_client, redis_client
-        start_time = datetime.utcnow()
-        # Database check
-        try:
-            with engine.connect() as conn:
-                conn.execute("SELECT 1")
-            logger.info("✅ Database connection established")
-        except Exception as exc:
-            logger.error(f"Database connection failed during startup: {exc}")
-        # Qdrant check
-        if QdrantClient:
-            try:
-                qdrant_client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
-                qdrant_client.get_collection(collection_name=settings.QDRANT_COLLECTION)
-                logger.info("✅ Qdrant connection established")
-            except Exception as exc:
-                logger.error(f"Qdrant connection failed during startup: {exc}")
-                qdrant_client = None
-        else:
-            qdrant_client = None
-        # Redis check
-        if redis:
-            try:
-                redis_client = redis.from_url(settings.REDIS_URL)
-                redis_client.ping()
-                logger.info("✅ Redis connection established")
-            except Exception as exc:
-                logger.error(f"Redis connection failed during startup: {exc}")
-                redis_client = None
-        else:
-            redis_client = None
-        # Gemini configuration check
-        if getattr(settings, "GEMINI_API_KEY", None):
-            logger.info("✅ Gemini API key configured")
-        else:
-            logger.warning("⚠️ Gemini API key not configured")
-        logger.info("🚀 Application startup complete")
-
-    @app.on_event("shutdown")
-    async def on_shutdown():
-        """Application shutdown hook.
-        Closes external resource connections if they were created.
-        """
-        logger.info("🛑 Application shutdown – cleaning up resources")
-        # Close Qdrant client if applicable
-        if 'qdrant_client' in globals() and qdrant_client:
-            try:
-                qdrant_client.close()
-                logger.info("✅ Qdrant client closed")
-            except Exception as exc:
-                logger.error(f"Error closing Qdrant client: {exc}")
-        # Close Redis client if applicable
-        if 'redis_client' in globals() and redis_client:
-            try:
-                redis_client.close()
-                logger.info("✅ Redis client closed")
-            except Exception as exc:
-                logger.error(f"Error closing Redis client: {exc}")
-        logger.info("🚪 Shutdown complete")
+    # Legacy unprefixed aliases - kept so existing probes keep working.
+    app.add_api_route("/health", health, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/live", live, methods=["GET"], include_in_schema=False)
+    app.add_api_route("/ready", ready, methods=["GET"], include_in_schema=False)
 
     return app
 

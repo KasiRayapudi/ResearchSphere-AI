@@ -19,17 +19,24 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=researchsphere_db
+      # config.py reads a full SQLAlchemy URL, not POSTGRES_* pieces.
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/researchsphere_db
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      # config.py reads REDIS_URL, not REDIS_HOST/REDIS_PORT.
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - FRONTEND_URL=http://localhost:3000
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - TRUSTED_HOSTS=${TRUSTED_HOSTS:-localhost,127.0.0.1,backend}
+      - UPLOAD_DIR=/app/uploads
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - SECRET_KEY=${SECRET_KEY:-super-secret-jwt-key-researchsphere-2026-prod}
+      # No insecure default: fail fast if SECRET_KEY is not supplied.
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env}
+    volumes:
+      # Without this, uploaded source files are lost on every restart while
+      # their database rows and Qdrant vectors survive.
+      - uploads_data:/app/uploads
     depends_on:
       - postgres
       - qdrant
@@ -62,3 +69,4 @@ services:
 volumes:
   postgres_data:
   qdrant_data:
+  uploads_data:
