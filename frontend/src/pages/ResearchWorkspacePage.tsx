@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Sparkles,
   Users,
@@ -21,6 +21,10 @@ import { Tabs } from '../components/common/Tabs';
 import { Modal } from '../components/common/Modal';
 import { Input } from '../components/common/Input';
 import { ApiService } from '../services/api';
+import { useAsyncData } from '../hooks/useAsyncData';
+import { useWorkspace } from '../contexts/WorkspaceContext';
+import { useToast } from '../contexts/ToastContext';
+import { EmptyState, ErrorState, ListSkeleton, Skeleton } from '../components/common/States';
 import { ResearchSession, AgentStep } from '../types';
 
 export const ResearchWorkspacePage: React.FC = () => {
@@ -31,23 +35,57 @@ export const ResearchWorkspacePage: React.FC = () => {
   const [titleInput, setTitleInput] = useState('');
   const [objectiveInput, setObjectiveInput] = useState('');
 
+  const { activeWorkspace } = useWorkspace();
+  const workspaceId = activeWorkspace?.id;
+  const toast = useToast();
+  const [isCreating, setIsCreating] = useState(false);
+  const [search, setSearch] = useState('');
+
+  const { data, isInitialLoading, error, refresh, setData } = useAsyncData(
+    () => ApiService.getResearchSessions(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+
   useEffect(() => {
-    const fetchSessions = async () => {
-      const sess = await ApiService.getResearchSessions();
-      setSessions(sess);
-      if (sess.length > 0) setActiveSession(sess[0]);
-    };
-    fetchSessions();
-  }, []);
+    const rows = data ?? [];
+    setSessions(rows);
+    setActiveSession((current) => {
+      if (current && rows.some((r) => r.id === current.id)) return current;
+      return rows[0] ?? null;
+    });
+  }, [data]);
+
+  const visibleSessions = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(
+      (item) =>
+        item.title.toLowerCase().includes(q) ||
+        (item.objective ?? '').toLowerCase().includes(q)
+    );
+  }, [sessions, search]);
 
   const handleCreateSession = async () => {
-    if (!titleInput || !objectiveInput) return;
-    const created = await ApiService.startResearchSession(titleInput, objectiveInput);
-    setSessions((prev) => [created, ...prev]);
-    setActiveSession(created);
-    setNewSessionModal(false);
-    setTitleInput('');
-    setObjectiveInput('');
+    if (!titleInput || !objectiveInput || isCreating) return;
+    setIsCreating(true);
+    try {
+      const created = await ApiService.startResearchSession(
+        titleInput,
+        objectiveInput,
+        workspaceId
+      );
+      setData((prev) => [created, ...(prev ?? [])]);
+      setActiveSession(created);
+      setNewSessionModal(false);
+      setTitleInput('');
+      setObjectiveInput('');
+      toast.success('Research session complete', created.title + ' is ready to review.');
+    } catch (err) {
+      toast.fromError(err, 'Could not run the research workflow');
+    } finally {
+      setIsCreating(false);
+    }
   };
 
   const tabs = [
@@ -55,6 +93,34 @@ export const ResearchWorkspacePage: React.FC = () => {
     { id: 'notes', label: 'Saved Notes & Highlights', icon: <Bookmark className="h-4 w-4" /> },
     { id: 'team', label: 'Team Members & RBAC', icon: <Users className="h-4 w-4" /> },
   ];
+
+  if (!activeWorkspace) {
+    return (
+      <EmptyState
+        title="No workspace selected"
+        description="Create or select a workspace to run multi-agent research."
+      />
+    );
+  }
+
+  if (isInitialLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-80" />
+        <ListSkeleton rows={5} />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <ErrorState
+        title="Could not load research sessions"
+        message={error.message}
+        onRetry={refresh}
+      />
+    );
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -89,7 +155,26 @@ export const ResearchWorkspacePage: React.FC = () => {
               Active Sessions
             </h3>
             <div className="space-y-3">
-              {sessions.map((s) => (
+              <div className="mb-2">
+                <label className="sr-only" htmlFor="session-search">Search sessions</label>
+                <input
+                  id="session-search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search sessions..."
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-brand-500"
+                />
+              </div>
+
+              {visibleSessions.length === 0 && (
+                <p className="px-1 py-6 text-center text-xs text-slate-500">
+                  {sessions.length === 0
+                    ? 'No research sessions yet.'
+                    : 'No sessions match your search.'}
+                </p>
+              )}
+
+              {visibleSessions.map((s) => (
                 <div
                   key={s.id}
                   onClick={() => setActiveSession(s)}
