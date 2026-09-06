@@ -1,0 +1,24 @@
+# Dependencies are installed inside the image; copying the host tree would
+# both bloat the context and risk platform-specific binaries.
+node_modules/
+dist/
+build/
+.vite/
+
+# Local state
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+coverage/
+playwright-report/
+test-results/
+
+# VCS / editors / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

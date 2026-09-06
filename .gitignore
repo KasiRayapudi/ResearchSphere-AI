@@ -55,3 +55,8 @@ backend/uploads/
 
 # Docker dev file (optional)
 Dockerfile.dev
+
+# Production secrets - only the example template is tracked
+.env.prod
+nginx/certs/*
+!nginx/certs/.gitkeep

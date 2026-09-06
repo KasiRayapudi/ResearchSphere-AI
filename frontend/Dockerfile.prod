@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# ResearchSphere AI - production frontend image
+#
+# Builds the SPA and serves it from nginx-unprivileged. The dev Dockerfile is
+# left untouched.
+###############################################################################
+
+# ---------------------------------------------------------------- builder ---
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# `npm ci` needs the lockfile and installs exactly what it pins. The previous
+# image copied only package.json and ran `npm install`, so builds were not
+# reproducible.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY . .
+
+# Build-time API base, baked into the bundle. Defaults to a same-origin
+# relative path, which is what the reverse-proxy deployment wants.
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=${VITE_API_URL}
+
+# scripts/build.mjs type-checks first, so a type error fails the image build
+# rather than shipping broken code.
+RUN npm run build
+
+# ---------------------------------------------------------------- runtime ---
+# nginx-unprivileged runs as uid 101 and listens on 8080; no root anywhere.
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+
+USER root
+# curl for the container HEALTHCHECK; removed from the layer cost by cleaning
+# apk's index in the same layer.
+RUN apk add --no-cache curl \
+    && rm -rf /var/cache/apk/*
+USER 101
+
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.prod.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8080/healthz || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
