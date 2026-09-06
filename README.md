@@ -1,127 +1,443 @@
-# ResearchSphere AI
+# 🚀 ResearchSphere AI
 
-> **Enterprise AI Workspace powered by RAG, MCP, AI Agents, and LangGraph.**
+<div align="center">
 
-ResearchSphere AI is an enterprise-grade AI research and knowledge management platform where users can connect multiple knowledge sources, upload documents, chat with their data using zero-hallucination grounded citations, perform deep research using LangGraph multi-agent workflows, and generate executive PDF reports.
+### Enterprise AI Research Platform powered by RAG, LangGraph Multi-Agent Systems & Model Context Protocol (MCP)
+
+*Build, research, analyze, and generate knowledge using enterprise-grade AI workflows.*
+
+![Python](https://img.shields.io/badge/Python-3.11+-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-Backend-green)
+![React](https://img.shields.io/badge/React-19-blue)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)
+![LangGraph](https://img.shields.io/badge/LangGraph-Multi--Agent-orange)
+![Qdrant](https://img.shields.io/badge/Qdrant-VectorDB-red)
+![Docker](https://img.shields.io/badge/Docker-Ready-blue)
+
+</div>
 
 ---
 
-## Technical Architecture
+# 📖 Overview
+
+ResearchSphere AI is a modern enterprise AI research platform that combines **Retrieval-Augmented Generation (RAG)**, **LangGraph Multi-Agent workflows**, and **Model Context Protocol (MCP)** into a unified workspace for intelligent document analysis and knowledge discovery.
+
+The platform enables users to upload documents, build a private knowledge base, connect external data sources, perform AI-assisted research, and generate structured reports with transparent citations.
+
+Designed with a production-first mindset, ResearchSphere AI focuses on scalability, maintainability, security, observability, and an exceptional user experience.
+
+---
+
+# 🎯 Problem Statement
+
+Modern AI assistants struggle with enterprise knowledge workflows because they often:
+
+- Cannot effectively search private document collections
+- Produce responses without transparent citations
+- Lack coordinated multi-agent reasoning
+- Offer limited integration with enterprise knowledge sources
+- Provide poor traceability and research workflows
+
+ResearchSphere AI addresses these limitations by combining semantic retrieval, agent orchestration, and external knowledge integration into a single enterprise-ready platform.
+
+---
+
+# ✨ Key Features
+
+## 🤖 AI Research Workspace
+
+- Retrieval-Augmented Generation (RAG)
+- Streaming AI responses
+- Source citations
+- Semantic document search
+- Confidence scoring
+- Research history
+
+---
+
+## 📚 Intelligent Document Processing
+
+Supports:
+
+- PDF
+- DOCX
+- TXT
+- Markdown
+
+Pipeline:
 
 ```
-                                  +------------------------------------+
-                                  |     React 19 + Vite Frontend       |
-                                  | (Tailwind CSS, Framer Motion,      |
-                                  |  Lucide Icons, Command Palette)    |
-                                  +-----------------+------------------+
-                                                    |
-                                                    | REST APIs / SSE Streaming
-                                                    v
-                                  +-----------------+------------------+
-                                  |       FastAPI Backend Gateway      |
-                                  |    (JWT Auth, Rate Limiting, CORS) |
-                                  +--------+-----------------+---------+
-                                           |                 |
-                   +-----------------------+                 +------------------------+
-                   v                                                                  v
-    +--------------+---------------+                                   +--------------+---------------+
-    |    LangGraph Multi-Agent     |                                   |     RAG Pipeline Engine      |
-    |      Research Engine         |                                   |  (Semantic + Hybrid Search,  |
-    +--------------+---------------+                                   |   Re-ranking, Citations)     |
-                   |                                                   +--------------+---------------+
-   +---------------+---------------+                                                  |
-   | Planner | Research | Retrieval|                                                  v
-   | Summarizer | Critic| Citation |                                   +--------------+---------------+
-   | Report  | Memory Agents       |                                   | Vector DB & Cache / Storage  |
-   +---------------+---------------+                                   | (Qdrant, PostgreSQL, Redis,  |
-                   |                                                   | Supabase Storage Abstraction)|
-                   v                                                   +------------------------------+
-    +--------------+---------------+
-    |  Modular MCP Connectors      |
-    | (GitHub, GDrive, Local Files)|
-    +------------------------------+
+Upload
+    ↓
+Text Extraction
+    ↓
+Chunking
+    ↓
+Embeddings
+    ↓
+Vector Storage
 ```
 
 ---
 
-## Tech Stack Overview
+## 🧠 Multi-Agent Research Engine
 
-### Frontend
-- **Framework**: React 19, TypeScript, Vite
-- **Styling**: Tailwind CSS (Glassmorphism, Radial Aurora Gradients, Soft Glow Borders)
-- **Animations**: Framer Motion, Micro-interactions, Animated Canvas Visualizers
-- **Icons & Navigation**: Lucide Icons, Linear-style Command Palette (`Ctrl+K`), Responsive Sidebar Layout
-- **State & Router**: React Router v7, Custom Auth & Theme Contexts
+Powered by LangGraph.
 
-### Backend
-- **Framework**: FastAPI (Python 3.11)
-- **Security**: JWT Authentication, Bcrypt Password Hashing, CORS Controls
-- **ORM & DB**: SQLAlchemy, PostgreSQL 16, SQLite fallback mode
-- **Background Tasks**: Celery, Redis Broker
+Current agents include:
 
-### AI & Vector Stack
-- **RAG Pipeline**: Dense Semantic Search (BAAI/bge-large-en-v1.5) + Sparse BM25 + Reciprocal Rank Fusion ($k=60$)
-- **Vector Database**: Qdrant Vector Database
-- **Agent Orchestration**: LangGraph 0.2 Multi-Agent State Graph (Planner, Research, Retrieval, Summarizer, Critic, Citation, Report, Memory)
-- **MCP Protocol**: Modular Model Context Protocol Connectors for **GitHub**, **Google Drive**, and **Local Files** (extensible to Slack, Notion, Jira, Confluence, Teams, Gmail)
+- Planner Agent
+- Retriever Agent
+- Research Agent
+- Critic Agent
+- Citation Agent
+- Report Agent
+
+Each agent specializes in a dedicated stage of the research workflow.
 
 ---
 
-## Features
+## 🔗 Model Context Protocol (MCP)
 
-- **Landing Page**: Sticky glass navbar, animated neural network hero canvas, bento feature grid, interactive LangGraph agent workflow diagram, pricing tier toggles, and FAQ accordion.
-- **RAG Agentic Chat**: Full ChatGPT/Perplexity-style interface with real-time streaming, syntax highlighted markdown code blocks, line-level source citations (`[1]`, `[2]`), right-side **Sources Panel**, document previewer, and model selector.
-- **Document Knowledge Store**: Drag-and-drop file upload for PDF, DOCX, TXT, MD, CSV, PPTX files. Automatic Tesseract OCR text extraction, recursive chunking, and tag filtering.
-- **Research Workspace**: Visual agent research canvas tracking real-time subtask graph execution, state persistence checkpoints, and saved notes.
-- **Executive Report Builder**: Generate PDF, Markdown, and HTML reports complete with executive summaries, technical architecture findings, advantages, limitations, and references.
-- **Real-Time Telemetry & Admin Console**: Storage consumption gauges, daily query volume charts, Qdrant vector index telemetry, system health status, and feature flag toggles.
+External integrations include:
+
+- GitHub
+- Google Drive
+- Local Files
+
+Designed to support additional enterprise connectors.
 
 ---
 
-## Quickstart Guide
+## 💬 AI Chat
 
-### Option 1: Docker Compose (Recommended)
+- Streaming responses
+- Citation panel
+- Source confidence
+- Conversation history
+- Workspace-aware context
+
+---
+
+## 📄 Report Generator
+
+Generate:
+
+- Research Reports
+- Executive Summaries
+- Markdown Reports
+- Citation References
+
+---
+
+## 📊 Analytics Dashboard
+
+Track:
+
+- Documents Indexed
+- Research Sessions
+- Reports Generated
+- Connected Sources
+- Storage Usage
+- System Metrics
+
+---
+
+## 🔐 Authentication
+
+- JWT Authentication
+- Secure Login
+- User Registration
+- Password Hashing
+- Workspace Initialization
+
+---
+
+# 🏗️ System Architecture
+
+```text
+                 User
+                   │
+                   ▼
+         React + TypeScript Frontend
+                   │
+                   ▼
+             FastAPI Backend
+                   │
+        ┌──────────┴──────────┐
+        ▼                     ▼
+ Authentication         Research Engine
+                              │
+      ┌───────────────────────┼───────────────────────┐
+      ▼                       ▼                       ▼
+ LangGraph              RAG Pipeline          MCP Connectors
+ Multi-Agent            Retrieval Engine
+      │                       │
+      ▼                       ▼
+ Google Gemini         Qdrant Vector DB
+      │
+      ▼
+ AI Response + Citations
+```
+
+---
+
+# ⚙️ Technology Stack
+
+## Frontend
+
+- React 19
+- TypeScript
+- Vite
+- Tailwind CSS
+- Framer Motion
+- React Router
+
+## Backend
+
+- FastAPI
+- SQLAlchemy
+- Pydantic v2
+- JWT Authentication
+- bcrypt
+- PostgreSQL
+- SQLite
+
+## AI & ML
+
+- LangChain
+- LangGraph
+- Google Gemini
+- Sentence Transformers
+- RecursiveCharacterTextSplitter
+
+## Vector Database
+
+- Qdrant
+
+## Infrastructure
+
+- Docker
+- Docker Compose
+
+---
+
+# 📂 Project Structure
+
+```
+ResearchSphere-AI/
+
+├── frontend/
+├── backend/
+├── docs/
+├── architecture/
+├── diagrams/
+├── tests/
+├── docker-compose.yml
+├── README.md
+├── CLAUDE.md
+├── LICENSE
+└── .env.example
+```
+
+---
+
+# 🔄 Research Workflow
+
+```text
+Upload Documents
+        │
+        ▼
+Extract Text
+        │
+        ▼
+Chunk Documents
+        │
+        ▼
+Generate Embeddings
+        │
+        ▼
+Store in Qdrant
+        │
+        ▼
+Semantic Retrieval
+        │
+        ▼
+LangGraph Multi-Agent Workflow
+        │
+        ▼
+Gemini Response Generation
+        │
+        ▼
+Streaming Answer
+        │
+        ▼
+Citations & Report Generation
+```
+
+---
+
+# 🚀 Getting Started
+
+## Clone Repository
 
 ```bash
-# 1. Clone & prepare environment
-cp .env.example .env
+git clone https://github.com/your-username/ResearchSphere-AI.git
 
-# 2. Launch full stack container suite
-docker-compose up --build
+cd ResearchSphere-AI
 ```
-Access points:
-- **Frontend App**: `http://localhost:3000`
-- **FastAPI API & Docs**: `http://localhost:8000/docs`
-- **Qdrant Dashboard**: `http://localhost:6333/dashboard`
 
 ---
 
-### Option 2: Local Development
+## Backend
 
-#### 1. Backend Setup
 ```bash
 cd backend
-python -m venv venv
-# On Windows:
-venv\Scripts\activate
-# Install requirements
-pip install -r requirements.txt
-# Seed database
-python seed_data.py
-# Start server
-uvicorn main:app --reload --port 8000
-```
 
-#### 2. Frontend Setup
-```bash
-cd frontend
-npm install
-npm run dev
+python -m venv venv
+
+source venv/bin/activate
+# Windows
+venv\Scripts\activate
+
+pip install -r requirements.txt
+
+uvicorn main:app --reload
 ```
-Open `http://localhost:3000` in your browser.
 
 ---
 
-## License
+## Frontend
 
-Enterprise Proprietary License. Created for ResearchSphere AI.
+```bash
+cd frontend
+
+npm install
+
+npm run dev
+```
+
+---
+
+## Docker
+
+```bash
+docker-compose up --build
+```
+
+---
+
+# 🔧 Environment Variables
+
+Create a `.env` file from `.env.example`.
+
+Example:
+
+```env
+DATABASE_URL=
+JWT_SECRET=
+GEMINI_API_KEY=
+QDRANT_URL=
+REDIS_URL=
+```
+
+---
+
+# 📈 Development Status
+
+## ✅ Completed
+
+- Authentication
+- Dashboard
+- Document Upload
+- Document Processing
+- Chunking
+- Embeddings
+- Qdrant Integration
+- Streaming Chat
+- Citation Panel
+- LangGraph Multi-Agent Workflow
+- MCP Connectors
+- Report Generation
+- Analytics Dashboard
+- Admin Panel
+- Docker Support
+
+---
+
+## 🚧 Current Development
+
+Production Hardening
+
+Current focus:
+
+- Infrastructure
+- Security
+- Monitoring
+- Testing
+- CI/CD
+- Deployment Readiness
+
+---
+
+# 🛣️ Roadmap
+
+### Phase 1
+
+- Production Infrastructure
+- Middleware Hardening
+- Logging
+- Health Checks
+
+### Phase 2
+
+- Security
+- Rate Limiting
+- Upload Validation
+- Password Policies
+
+### Phase 3
+
+- Monitoring & Observability
+- Performance Optimization
+- Agent Metrics
+
+### Phase 4
+
+- Automated Testing
+- Integration Testing
+- End-to-End Testing
+
+### Phase 5
+
+- CI/CD Pipeline
+- Production Deployment
+- Kubernetes Support
+
+---
+
+# 🤝 Contributing
+
+Contributions, feature requests, and discussions are welcome.
+
+Please open an issue before submitting major changes.
+
+---
+
+# 📄 License
+
+This project is licensed under the MIT License.
+
+---
+
+# ⭐ Support
+
+If you find this project useful, consider giving it a ⭐ on GitHub.
+
+---
+
+<div align="center">
+
+**ResearchSphere AI — Building the Future of Enterprise AI Research**
+
+</div>
