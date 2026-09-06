@@ -19,32 +19,116 @@ import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { ApiService } from '../services/api';
+import { useAsyncData } from '../hooks/useAsyncData';
+import { useWorkspace } from '../contexts/WorkspaceContext';
+import {
+  EmptyState,
+  ErrorState,
+  ListSkeleton,
+  Skeleton,
+  StatCardSkeleton,
+} from '../components/common/States';
 import { Document, ResearchSession, MCPConnector, AnalyticsData } from '../types';
 
 export const DashboardPage: React.FC = () => {
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [sessions, setSessions] = useState<ResearchSession[]>([]);
-  const [connectors, setConnectors] = useState<MCPConnector[]>([]);
-  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
   const navigate = useNavigate();
+  const { activeWorkspace, isLoading: workspaceLoading } = useWorkspace();
+  const workspaceId = activeWorkspace?.id;
 
-  useEffect(() => {
-    const fetchData = async () => {
-      const [docs, sess, conn, aly] = await Promise.all([
-        ApiService.getDocuments(),
-        ApiService.getResearchSessions(),
-        ApiService.getMCPConnectors(),
-        ApiService.getAnalytics(),
-      ]);
-      setDocuments(docs);
-      setSessions(sess);
-      setConnectors(conn);
-      setAnalytics(aly);
-    };
-    fetchData();
-  }, []);
+  // Each panel loads independently so one failing endpoint no longer leaves
+  // the whole dashboard blank (and no longer silently renders mock data).
+  const documentsQuery = useAsyncData(
+    () => ApiService.getDocuments(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const sessionsQuery = useAsyncData(
+    () => ApiService.getResearchSessions(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const connectorsQuery = useAsyncData(
+    () => ApiService.getMCPConnectors(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const analyticsQuery = useAsyncData(
+    () => ApiService.getAnalytics(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const healthQuery = useAsyncData(() => ApiService.getHealth(), []);
+
+  const documents = documentsQuery.data ?? [];
+  const sessions = sessionsQuery.data ?? [];
+  const connectors = connectorsQuery.data ?? [];
+  const analytics = analyticsQuery.data;
+  const health = healthQuery.data as
+    | { status?: string; checks?: Record<string, string>; uptime_seconds?: number; version?: string }
+    | null;
+
+  const isLoading =
+    workspaceLoading ||
+    documentsQuery.isInitialLoading ||
+    analyticsQuery.isInitialLoading;
+
+  const loadError = documentsQuery.error ?? analyticsQuery.error;
+
+  const refreshAll = () => {
+    void documentsQuery.refresh();
+    void sessionsQuery.refresh();
+    void connectorsQuery.refresh();
+    void analyticsQuery.refresh();
+    void healthQuery.refresh();
+  };
 
   const connectedSourcesCount = connectors.filter((c) => c.status === 'connected').length;
+
+  // Recent activity, newest first.
+  const recentUploads = [...documents]
+    .sort((a, b) => (b.uploadedAt ?? '').localeCompare(a.uploadedAt ?? ''))
+    .slice(0, 5);
+
+  if (!workspaceLoading && !activeWorkspace) {
+    return (
+      <EmptyState
+        icon={<FileText className="h-6 w-6" />}
+        title="No workspace yet"
+        description="Create a workspace from the sidebar to start uploading documents and running research."
+      />
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-64" />
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <StatCardSkeleton key={i} />
+          ))}
+        </div>
+        <div className="grid gap-6 lg:grid-cols-12">
+          <div className="lg:col-span-8">
+            <ListSkeleton rows={4} />
+          </div>
+          <div className="lg:col-span-4">
+            <ListSkeleton rows={3} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <ErrorState
+        title="Could not load your dashboard"
+        message={loadError.message}
+        onRetry={refreshAll}
+      />
+    );
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -289,6 +373,143 @@ export const DashboardPage: React.FC = () => {
           ))}
         </div>
       </Card>
+
+      {/* Recent uploads + live system status */}
+      <div className="grid gap-6 lg:grid-cols-12">
+        <Card className="lg:col-span-7 p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-bold text-white flex items-center gap-2">
+              <FileText className="h-4 w-4 text-emerald-400" /> Recent Uploads
+            </h3>
+            <Button variant="ghost" size="sm" onClick={() => navigate('/documents')}>
+              View all
+            </Button>
+          </div>
+
+          {recentUploads.length === 0 ? (
+            <EmptyState
+              title="No documents yet"
+              description="Upload a PDF, DOCX, TXT, Markdown or CSV file to build your knowledge base."
+              action={{ label: 'Upload a document', onClick: () => navigate('/documents') }}
+            />
+          ) : (
+            <ul className="space-y-2">
+              {recentUploads.map((doc) => (
+                <li
+                  key={doc.id}
+                  className="flex items-center gap-3 rounded-lg border border-slate-800/60 bg-slate-900/40 p-3"
+                >
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-800 text-[10px] font-bold uppercase text-slate-400">
+                    {doc.fileType}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-xs font-medium text-slate-200">{doc.title}</p>
+                    <p className="text-[10px] text-slate-500">
+                      {doc.chunkCount} chunks · {Math.max(1, Math.round(doc.fileSizeKb))} KB
+                    </p>
+                  </div>
+                  <Badge
+                    size="sm"
+                    variant={
+                      doc.status === 'indexed'
+                        ? 'success'
+                        : doc.status === 'failed'
+                          ? 'error'
+                          : 'warning'
+                    }
+                  >
+                    {doc.status}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="lg:col-span-5 p-6 space-y-4">
+          <h3 className="text-base font-bold text-white flex items-center gap-2">
+            <Database className="h-4 w-4 text-brand-400" /> System Status
+          </h3>
+
+          {healthQuery.isInitialLoading ? (
+            <ListSkeleton rows={3} />
+          ) : healthQuery.error ? (
+            <ErrorState
+              title="Health unavailable"
+              message={healthQuery.error.message}
+              onRetry={healthQuery.refresh}
+            />
+          ) : (
+            <>
+              <ul className="space-y-2">
+                {Object.entries(health?.checks ?? {}).map(([name, status]) => {
+                  const healthy = status === 'ok' || status === 'configured';
+                  const optional = status === 'disabled' || status === 'unavailable';
+                  return (
+                    <li
+                      key={name}
+                      className="flex items-center justify-between rounded-lg border border-slate-800/60 bg-slate-900/40 px-3 py-2"
+                    >
+                      <span className="text-xs capitalize text-slate-300">{name}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span
+                          className={`h-1.5 w-1.5 rounded-full ${
+                            healthy
+                              ? 'bg-emerald-400'
+                              : optional
+                                ? 'bg-slate-500'
+                                : 'bg-rose-400'
+                          }`}
+                        />
+                        <span
+                          className={`font-mono text-[10px] ${
+                            healthy
+                              ? 'text-emerald-400'
+                              : optional
+                                ? 'text-slate-500'
+                                : 'text-rose-400'
+                          }`}
+                        >
+                          {status}
+                        </span>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              {health?.uptime_seconds !== undefined && (
+                <p className="text-[10px] text-slate-500">
+                  Uptime {Math.floor(health.uptime_seconds / 3600)}h{' '}
+                  {Math.floor((health.uptime_seconds % 3600) / 60)}m
+                  {health.version ? ` · v${health.version}` : ''}
+                </p>
+              )}
+            </>
+          )}
+
+          {analytics && (
+            <div className="border-t border-slate-800 pt-3">
+              <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                <span className="text-slate-400">Storage used</span>
+                <span className="font-mono text-slate-300">
+                  {analytics.storageUsageMb.toFixed(1)} / {analytics.storageCapacityMb} MB
+                </span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-brand-500 to-indigo-500"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (analytics.storageUsageMb / Math.max(1, analytics.storageCapacityMb)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   );
 };
