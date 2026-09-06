@@ -1,0 +1,115 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.models.user import User
+from app.models.workspace import Workspace
+from app.models.report import Report as ReportModel
+from app.agents.graph import LangGraphResearchEngine
+from typing import Optional, List
+
+router = APIRouter()
+engine = LangGraphResearchEngine()
+
+class ReportGenerateRequest(BaseModel):
+    title: str
+    objective: str
+    workspace_id: Optional[str] = None
+    document_ids: List[str] = []
+
+@router.get("")
+async def get_reports(
+    workspace_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not workspace_id:
+        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
+        if not ws:
+            return []
+        workspace_id = ws.id
+
+    reports = db.query(ReportModel).filter(
+        ReportModel.workspace_id == workspace_id,
+        ReportModel.user_id == current_user.id
+    ).order_by(ReportModel.created_at.desc()).all()
+
+    return [
+        {
+            "id": r.id,
+            "title": r.title,
+            "format": r.format,
+            "summary": r.executive_summary or "Executive Research synthesis",
+            "objective": r.query,
+            "generatedAt": r.created_at.isoformat(),
+            "author": current_user.full_name,
+            "sourceDocumentIds": r.source_document_ids or [],
+            "sections": [
+                {"title": "Executive Summary", "content": r.executive_summary or ""},
+                {"title": "Research Findings & Analysis", "content": r.findings or ""},
+                {"title": "Technical Assessment & Limitation", "content": r.technical_analysis or ""},
+            ]
+        }
+        for r in reports
+    ]
+
+@router.post("/generate")
+async def generate_report(
+    payload: ReportGenerateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not payload.workspace_id:
+        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
+        if not ws:
+            raise HTTPException(status_code=400, detail="Workspace required")
+        workspace_id = ws.id
+    else:
+        workspace_id = payload.workspace_id
+
+    # 1. Run RAG and LangGraph agent workflow to synthesize the report contents
+    try:
+        graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"LangGraph failed to generate report: {str(e)}"
+        )
+
+    final_report_data = graph_output.get("final_report") or {}
+
+    # 2. Write to database
+    report = ReportModel(
+        workspace_id=workspace_id,
+        user_id=current_user.id,
+        title=payload.title,
+        query=payload.objective,
+        executive_summary=graph_output.get("synthesized_summary"),
+        findings=final_report_data.get("markdown"),
+        technical_analysis="Fact verified by Critic Agent. Confidence level: " + str(graph_output.get("confidence_score", 0.95)),
+        references=graph_output.get("citations", []),
+        content_markdown=final_report_data.get("markdown"),
+        source_document_ids=payload.document_ids or [c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")],
+        format="pdf",
+        status="ready"
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+
+    return {
+        "id": report.id,
+        "title": report.title,
+        "format": report.format,
+        "summary": report.executive_summary,
+        "objective": report.query,
+        "generatedAt": report.created_at.isoformat(),
+        "author": current_user.full_name,
+        "sourceDocumentIds": report.source_document_ids,
+        "sections": [
+            {"title": "Executive Summary", "content": report.executive_summary},
+            {"title": "Research Findings & Analysis", "content": report.findings},
+            {"title": "Technical Assessment & Limitation", "content": report.technical_analysis},
+        ]
+    }

@@ -1,0 +1,52 @@
+# Python/General
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+
+# Virtual environments
+backend/venv/
+
+# Node.js
+node_modules/
+
+# Build artifacts
+build/
+Dist/
+Dist/**
+/dist/**
+
+# Test caches
+.pytest_cache/
+.coverage
+.coverage/**
+htmlcov/
+
+# MyPy cache
+.mypy_cache/
+
+# IDE/editor folders
+.idea/
+.vscode/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Environment files
+.env
+.env.*
+
+# Secrets and keys
+secrets/
+
+# Database files (SQLite etc.)
+*.db
+*.sqlite3
+
+# Docker dev file (optional)
+Dockerfile.dev
