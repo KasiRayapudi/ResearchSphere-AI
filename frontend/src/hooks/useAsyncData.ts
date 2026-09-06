@@ -25,7 +25,7 @@ export function useAsyncData<T>(
 ): AsyncState<T> {
   const { enabled = true } = options;
   const [data, setData] = useState<T | null>(null);
-  const [isLoading, setLoading] = useState(enabled);
+  const [isLoading, setLoading] = useState(true);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
@@ -39,8 +39,12 @@ export function useAsyncData<T>(
     };
   }, []);
 
+  // Assigned in an effect, not during render: writing a ref while rendering
+  // is unsafe under concurrent rendering.
   const loaderRef = useRef(loader);
-  loaderRef.current = loader;
+  useEffect(() => {
+    loaderRef.current = loader;
+  });
 
   const run = useCallback(async () => {
     const id = ++requestId.current;
@@ -62,18 +66,21 @@ export function useAsyncData<T>(
   }, []);
 
   useEffect(() => {
-    if (!enabled) {
-      setLoading(false);
-      return;
-    }
+    if (!enabled) return;
+    // Kicking off a request is exactly the "synchronize with an external
+    // system" case effects exist for. The state updates happen inside `run`,
+    // which is the single place this pattern lives in the codebase.
     void run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, ...deps]);
 
+  // Derived rather than stored, so a disabled query never needs a setState.
+  const effectiveLoading = enabled && isLoading;
+
   return {
     data,
-    isLoading,
-    isInitialLoading: isLoading && !hasLoadedOnce,
+    isLoading: effectiveLoading,
+    isInitialLoading: effectiveLoading && !hasLoadedOnce,
     error,
     refresh: run,
     setData,

@@ -212,7 +212,7 @@ export async function apiRequest<T>(
   let attempt = 0;
   let refreshed = false;
 
-  // eslint-disable-next-line no-constant-condition
+   
   while (true) {
     const headers: Record<string, string> = { ...(extraHeaders as any) };
     if (!formData && json !== undefined) headers['Content-Type'] = 'application/json';

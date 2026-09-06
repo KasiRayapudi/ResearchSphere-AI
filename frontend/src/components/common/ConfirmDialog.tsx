@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { Modal } from './Modal';
 import { Button } from './Button';
@@ -29,16 +29,29 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   onConfirm,
   onCancel,
 }) => {
-  const [typed, setTyped] = useState('');
+  // Rendered only while open, so the confirm-phrase input starts empty on each
+  // open without needing to reset state from an effect.
+  if (!isOpen) return null;
+  return <ConfirmDialogBody {...{ title, description, confirmLabel, cancelLabel, variant, confirmPhrase, isBusy, onConfirm, onCancel }} />;
+};
 
-  useEffect(() => {
-    if (isOpen) setTyped('');
-  }, [isOpen]);
+const ConfirmDialogBody: React.FC<Omit<ConfirmDialogProps, 'isOpen'>> = ({
+  title,
+  description,
+  confirmLabel = 'Confirm',
+  cancelLabel = 'Cancel',
+  variant = 'danger',
+  confirmPhrase,
+  isBusy = false,
+  onConfirm,
+  onCancel,
+}) => {
+  const [typed, setTyped] = useState('');
 
   const blocked = Boolean(confirmPhrase) && typed.trim() !== confirmPhrase;
 
   return (
-    <Modal isOpen={isOpen} onClose={onCancel} maxWidth="md">
+    <Modal isOpen onClose={onCancel} maxWidth="md">
       <div className="flex gap-4">
         <div
           className={`mt-0.5 h-10 w-10 shrink-0 rounded-full ${

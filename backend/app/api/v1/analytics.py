@@ -58,7 +58,7 @@ async def get_analytics(
             ChatMessage.role == "assistant",
             ChatMessage.response_time_ms > 0
         ).first()
-        avg_latency = int(avg_latency_row[0]) if avg_latency_row and avg_latency_row[0] else 184
+        avg_latency = int(avg_latency_row[0]) if avg_latency_row and avg_latency_row[0] else 0
 
     # 4. Storage used
     storage_bytes = db.query(func.sum(Document.file_size)).filter(Document.workspace_id == workspace_id).scalar() or 0
@@ -81,8 +81,10 @@ async def get_analytics(
             
         daily_queries.append({
             "date": day_str,
-            "queryCount": count if count > 0 else 5 + i * 2,  # Seed fallback for visual beauty if empty
-            "avgLatencyMs": avg_latency
+            # Real count. This used to fall back to a synthetic "5 + i * 2"
+            # series, so an empty workspace rendered an invented trend line.
+            "queryCount": count,
+            "avgLatencyMs": avg_latency,
         })
 
     # 6. Top Sources accessed
@@ -95,23 +97,19 @@ async def get_analytics(
             "category": d.file_type.upper() + " Document"
         })
         
-    if not top_sources:
-        top_sources = [
-            {"sourceName": "RAG_Architecture_Benchmark_2026.pdf", "accessCount": 420, "category": "PDF Document"},
-            {"sourceName": "LangGraph_MultiAgent_Workflow_Spec.md", "accessCount": 280, "category": "MD Document"}
-        ]
-
+    # Every value below is measured. The previous version substituted
+    # invented numbers whenever a real one was zero (42 questions, 180 ms,
+    # 12.8 MB), which made an empty workspace look busy.
     return {
-        "questionsAskedTotal": question_count or 42,
+        "questionsAskedTotal": question_count,
         "documentsIndexedTotal": doc_count,
         "embeddingsGeneratedTotal": chunk_count,
-        "avgResponseTimeMs": avg_latency or 180,
-        "storageUsageMb": storage_mb or 12.8,
+        "avgResponseTimeMs": avg_latency,
+        "storageUsageMb": storage_mb,
         "storageCapacityMb": 50000,
         "dailyQueries": daily_queries,
         "topSources": top_sources,
-        "modelUsageBreakdown": [
-            {"modelName": "Gemini 1.5 Flash", "percentage": 70},
-            {"modelName": "Local Embeddings", "percentage": 30}
-        ]
+        # Per-model usage is not tracked yet; returning an invented split
+        # would be worse than returning nothing.
+        "modelUsageBreakdown": []
     }

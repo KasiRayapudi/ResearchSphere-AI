@@ -59,13 +59,13 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   useEffect(() => {
-    if (!isAuthenticated) {
-      setWorkspaces([]);
-      setActive(null);
-      return;
-    }
-    void load();
+    if (isAuthenticated) void load();
   }, [isAuthenticated, load]);
+
+  // Derive the signed-out view rather than clearing state from an effect,
+  // which would cause an extra render pass on every sign-out.
+  const visibleWorkspaces = isAuthenticated ? workspaces : [];
+  const visibleActive = isAuthenticated ? activeWorkspace : null;
 
   const setActiveWorkspace = useCallback((ws: Workspace) => {
     setActive(ws);
@@ -88,15 +88,15 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const value = useMemo<WorkspaceContextType>(
     () => ({
-      workspaces,
-      activeWorkspace,
+      workspaces: visibleWorkspaces,
+      activeWorkspace: visibleActive,
       isLoading,
       error,
       setActiveWorkspace,
       createWorkspace,
       refresh: load,
     }),
-    [workspaces, activeWorkspace, isLoading, error, setActiveWorkspace, createWorkspace, load]
+    [visibleWorkspaces, visibleActive, isLoading, error, setActiveWorkspace, createWorkspace, load]
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

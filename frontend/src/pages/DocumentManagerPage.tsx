@@ -118,13 +118,11 @@ export const DocumentManagerPage: React.FC = () => {
     return sorted;
   }, [documents, searchQuery, selectedTag, statusFilter, sortKey]);
 
-  // Reset to the first page whenever the result set changes underneath us.
-  useEffect(() => {
-    setPage(1);
-  }, [searchQuery, selectedTag, statusFilter, sortKey, workspaceId]);
-
   const totalPages = Math.max(1, Math.ceil(filteredDocs.length / PAGE_SIZE));
-  const pagedDocs = filteredDocs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  // Clamp during render rather than resetting from an effect: when filters
+  // shrink the result set, the current page may no longer exist.
+  const currentPage = Math.min(page, totalPages);
+  const pagedDocs = filteredDocs.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const allTags = Array.from(new Set(documents.flatMap((d) => d.tags)));
 
@@ -343,26 +341,26 @@ export const DocumentManagerPage: React.FC = () => {
         {totalPages > 1 && (
           <div className="flex items-center justify-between border-t border-slate-800 px-4 py-3">
             <span className="text-[11px] text-slate-500">
-              Showing {(page - 1) * PAGE_SIZE + 1}-
-              {Math.min(page * PAGE_SIZE, filteredDocs.length)} of {filteredDocs.length}
+              Showing {(currentPage - 1) * PAGE_SIZE + 1}-
+              {Math.min(currentPage * PAGE_SIZE, filteredDocs.length)} of {filteredDocs.length}
             </span>
             <div className="flex items-center gap-2">
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={page === 1}
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                onClick={() => setPage(Math.max(1, currentPage - 1))}
               >
                 Previous
               </Button>
               <span className="font-mono text-[11px] text-slate-400">
-                {page} / {totalPages}
+                {currentPage} / {totalPages}
               </span>
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={page === totalPages}
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages}
+                onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
               >
                 Next
               </Button>

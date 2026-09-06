@@ -24,13 +24,15 @@ import { ApiService } from '../services/api';
 import { useAsyncData } from '../hooks/useAsyncData';
 import { useWorkspace } from '../contexts/WorkspaceContext';
 import { useToast } from '../contexts/ToastContext';
+import { useAuth } from '../contexts/AuthContext';
 import { EmptyState, ErrorState, ListSkeleton, Skeleton } from '../components/common/States';
 import { ResearchSession, AgentStep } from '../types';
 
 export const ResearchWorkspacePage: React.FC = () => {
   const [activeTab, setActiveTab] = useState('canvas');
-  const [sessions, setSessions] = useState<ResearchSession[]>([]);
-  const [activeSession, setActiveSession] = useState<ResearchSession | null>(null);
+  // Sessions are derived from the query rather than mirrored into local state,
+  // which previously required an effect to keep the two in sync.
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [newSessionModal, setNewSessionModal] = useState(false);
   const [titleInput, setTitleInput] = useState('');
   const [objectiveInput, setObjectiveInput] = useState('');
@@ -38,6 +40,7 @@ export const ResearchWorkspacePage: React.FC = () => {
   const { activeWorkspace } = useWorkspace();
   const workspaceId = activeWorkspace?.id;
   const toast = useToast();
+  const { user } = useAuth();
   const [isCreating, setIsCreating] = useState(false);
   const [search, setSearch] = useState('');
 
@@ -47,14 +50,11 @@ export const ResearchWorkspacePage: React.FC = () => {
     { enabled: Boolean(workspaceId) }
   );
 
-  useEffect(() => {
-    const rows = data ?? [];
-    setSessions(rows);
-    setActiveSession((current) => {
-      if (current && rows.some((r) => r.id === current.id)) return current;
-      return rows[0] ?? null;
-    });
-  }, [data]);
+  const sessions = useMemo(() => data ?? [], [data]);
+  const activeSession = useMemo(
+    () => sessions.find((item) => item.id === activeSessionId) ?? sessions[0] ?? null,
+    [sessions, activeSessionId]
+  );
 
   const visibleSessions = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -76,7 +76,7 @@ export const ResearchWorkspacePage: React.FC = () => {
         workspaceId
       );
       setData((prev) => [created, ...(prev ?? [])]);
-      setActiveSession(created);
+      setActiveSessionId(created.id);
       setNewSessionModal(false);
       setTitleInput('');
       setObjectiveInput('');
@@ -177,7 +177,7 @@ export const ResearchWorkspacePage: React.FC = () => {
               {visibleSessions.map((s) => (
                 <div
                   key={s.id}
-                  onClick={() => setActiveSession(s)}
+                  onClick={() => setActiveSessionId(s.id)}
                   className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
                     activeSession.id === s.id
                       ? 'bg-slate-900 border-brand-500/60 shadow-md'
@@ -265,26 +265,29 @@ export const ResearchWorkspacePage: React.FC = () => {
             <h3 className="text-base font-bold text-white flex items-center gap-2">
               <Users className="h-4 w-4 text-brand-400" /> Team Permissions & RBAC Matrix
             </h3>
-            <Button variant="outline" size="sm" icon={<Plus className="h-4 w-4" />}>
+            <Button variant="outline" size="sm" disabled icon={<Plus className="h-4 w-4" />}>
               Invite Member
             </Button>
           </div>
 
+          {/* The backend has no workspace-membership model yet, so the only
+              real member is the owner. This previously listed three invented
+              colleagues as though they were real accounts. */}
           <div className="divide-y divide-slate-800 text-xs">
-            {[
-              { name: 'Alex Vance', email: 'alex.vance@enterprise-ai.io', role: 'Workspace Owner' },
-              { name: 'Dr. Sarah Lin', email: 'sarah.lin@enterprise-ai.io', role: 'Admin & Lead Researcher' },
-              { name: 'Marcus Chen', email: 'marcus.chen@enterprise-ai.io', role: 'AI Solution Architect' },
-            ].map((m) => (
-              <div key={m.email} className="py-3.5 flex items-center justify-between">
+            {user && (
+              <div className="py-3.5 flex items-center justify-between">
                 <div>
-                  <div className="font-bold text-slate-200">{m.name}</div>
-                  <div className="text-[10px] text-slate-500 font-mono">{m.email}</div>
+                  <div className="font-bold text-slate-200">{user.name}</div>
+                  <div className="text-[10px] text-slate-500 font-mono">{user.email}</div>
                 </div>
-                <Badge variant="brand" size="sm">{m.role}</Badge>
+                <Badge variant="brand" size="sm">Workspace Owner</Badge>
               </div>
-            ))}
+            )}
           </div>
+          <p className="pt-3 text-[11px] leading-relaxed text-slate-500">
+            Shared workspaces are not available yet. Each workspace currently belongs to a single
+            owner, so invitations and member roles are disabled.
+          </p>
         </Card>
       )}
 

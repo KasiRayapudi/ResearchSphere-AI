@@ -9,9 +9,11 @@ import { ApiError } from '../services/apiClient';
 import { AlertCircle } from 'lucide-react';
 
 export const SignupPage: React.FC = () => {
-  const [name, setName] = useState('Alex Vance');
-  const [email, setEmail] = useState('alex.vance@enterprise-ai.io');
-  const [password, setPassword] = useState('••••••••••••');
+  // Demo prefills removed: they seeded a real-looking account and a
+  // bullet-character string that was never a usable password.
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const { signup } = useAuth();
   const navigate = useNavigate();
