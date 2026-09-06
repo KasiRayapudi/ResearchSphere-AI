@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_workspace_owner
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.document import Document
@@ -49,6 +49,26 @@ async def get_workspaces(
             )
         )
     return result
+
+@router.get("/{workspace_id}", response_model=WorkspaceResponse)
+async def get_workspace(
+    workspace_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Fetch a single workspace, enforcing ownership."""
+    ws = require_workspace_owner(workspace_id, request, db, current_user)
+    doc_count = db.query(Document).filter(Document.workspace_id == ws.id).count()
+    return WorkspaceResponse(
+        id=ws.id,
+        name=ws.name,
+        description=ws.description,
+        memberCount=1,
+        documentCount=doc_count,
+        role="owner",
+        createdAt=ws.created_at.strftime("%Y-%m-%d"),
+    )
 
 @router.post("", response_model=WorkspaceResponse)
 async def create_workspace(

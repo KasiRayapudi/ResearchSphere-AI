@@ -1,14 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, resolve_workspace
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.chat import ChatSession, ChatMessage
 from app.rag.pipeline import stream_rag_response
 from app.core.logging import get_logger
+from app.core.audit import audit, AuditAction, AuditOutcome
 import json
 import asyncio
 from typing import Optional, List
@@ -24,15 +25,15 @@ class ChatQuery(BaseModel):
 
 @router.get("/sessions")
 async def get_sessions(
+    request: Request,
     workspace_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return []
+    workspace_id = ws.id
 
     sessions = db.query(ChatSession).filter(
         ChatSession.workspace_id == workspace_id,
@@ -51,15 +52,15 @@ async def get_sessions(
 
 @router.post("/sessions")
 async def create_session(
+    request: Request,
     workspace_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="No active workspace found")
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="No active workspace found")
+    workspace_id = ws.id
         
     session = ChatSession(
         workspace_id=workspace_id,
@@ -73,17 +74,17 @@ async def create_session(
 
 @router.post("/stream")
 async def chat_stream(
+    request: Request,
     payload: ChatQuery,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     # 1. Determine active workspace
     workspace_id = payload.workspace_id
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Workspace required")
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Workspace required")
+    workspace_id = ws.id
 
     # 2. Get or create session
     session_id = payload.session_id
@@ -103,8 +104,24 @@ async def chat_stream(
             db.refresh(session)
         session_id = session.id
     else:
-        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-        if session and session.title == "New Chat Session":
+        # Never trust a client-supplied session id: it must belong to this
+        # user and to the resolved workspace.
+        session = db.query(ChatSession).filter(
+            ChatSession.id == session_id,
+            ChatSession.user_id == current_user.id,
+            ChatSession.workspace_id == workspace_id,
+        ).first()
+        if not session:
+            audit(
+                action=AuditAction.PERMISSION_DENIED,
+                actor=current_user,
+                outcome=AuditOutcome.DENIED,
+                resource=f"chat_session:{session_id}",
+                request=request,
+                metadata={"reason": "not_owner_or_not_found"},
+            )
+            raise HTTPException(status_code=404, detail="Chat session not found")
+        if session.title == "New Chat Session":
             session.title = payload.prompt[:40]
             db.commit()
 

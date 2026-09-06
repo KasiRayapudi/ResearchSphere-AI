@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, resolve_workspace
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.report import Report as ReportModel
@@ -23,15 +23,15 @@ class StartResearchRequest(BaseModel):
 
 @router.get("")
 async def get_sessions(
+    request: Request,
     workspace_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return []
+    workspace_id = ws.id
 
     # For MVP, we can return generated research sessions mapped to Reports or ChatSessions
     # Or query from DB. Let's fetch from Report table since report represents a compiled agent research session!
@@ -63,17 +63,15 @@ async def get_sessions(
 
 @router.post("/start")
 async def start_session(
+    request: Request,
     payload: StartResearchRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not payload.workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Workspace required")
-        workspace_id = ws.id
-    else:
-        workspace_id = payload.workspace_id
+    ws = resolve_workspace(payload.workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Workspace required")
+    workspace_id = ws.id
 
     # 1. Run multi-agent LangGraph workflow
     try:

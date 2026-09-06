@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, resolve_workspace
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.report import Report as ReportModel
@@ -21,15 +21,15 @@ class ReportGenerateRequest(BaseModel):
 
 @router.get("")
 async def get_reports(
+    request: Request,
     workspace_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return []
+    workspace_id = ws.id
 
     reports = db.query(ReportModel).filter(
         ReportModel.workspace_id == workspace_id,
@@ -62,13 +62,10 @@ async def generate_report(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not payload.workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Workspace required")
-        workspace_id = ws.id
-    else:
-        workspace_id = payload.workspace_id
+    ws = resolve_workspace(payload.workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Workspace required")
+    workspace_id = ws.id
 
     # 1. Run RAG and LangGraph agent workflow to synthesize the report contents
     try:

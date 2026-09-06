@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, resolve_workspace
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.document import Document, DocumentChunk
@@ -51,16 +51,16 @@ class DocumentResponse(BaseModel):
 
 @router.get("", response_model=List[dict])
 async def get_documents(
+    request: Request,
     workspace_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     # Find active workspace if not specified
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return []
+    workspace_id = ws.id
         
     documents = db.query(Document).filter(Document.workspace_id == workspace_id).all()
     
@@ -92,11 +92,10 @@ async def upload_document(
     current_user: User = Depends(get_current_user)
 ):
     # 1. Determine active workspace
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Create a workspace first.")
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Create a workspace first.")
+    workspace_id = ws.id
 
     # 2. Security pipeline: validate -> quarantine -> scan -> promote.
     #    Nothing reaches permanent storage until every check has passed.
@@ -379,7 +378,16 @@ async def delete_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    doc = db.query(Document).filter(Document.id == id).first()
+    # Ownership check: a document is reachable only through a workspace the
+    # caller owns. Previously any authenticated user could delete any document
+    # by id. A document that exists but belongs to someone else returns 404,
+    # so ids cannot be probed.
+    doc = (
+        db.query(Document)
+        .join(Workspace, Document.workspace_id == Workspace.id)
+        .filter(Document.id == id, Workspace.owner_id == current_user.id)
+        .first()
+    )
     if not doc:
         audit(
             action=AuditAction.DOCUMENT_DELETE,
