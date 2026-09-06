@@ -1,40 +1,105 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 import { Workspace } from '../types';
-import { initialWorkspacesMock } from '../services/mockData';
+import { ApiService } from '../services/api';
+import { useAuth } from './AuthContext';
+
+const ACTIVE_WORKSPACE_KEY = 'rs_active_workspace';
 
 interface WorkspaceContextType {
   workspaces: Workspace[];
-  activeWorkspace: Workspace;
+  /** Null until workspaces load, or when the account has none. */
+  activeWorkspace: Workspace | null;
+  isLoading: boolean;
+  error: string | null;
   setActiveWorkspace: (ws: Workspace) => void;
-  createWorkspace: (name: string, slug: string) => void;
+  createWorkspace: (name: string, description?: string) => Promise<Workspace>;
+  refresh: () => Promise<void>;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextType | undefined>(undefined);
 
 export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [workspaces, setWorkspaces] = useState<Workspace[]>(initialWorkspacesMock);
-  const [activeWorkspace, setActiveWorkspace] = useState<Workspace>(initialWorkspacesMock[0]);
+  const { isAuthenticated } = useAuth();
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspace, setActive] = useState<Workspace | null>(null);
+  const [isLoading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const createWorkspace = (name: string, slug: string) => {
-    const newWs: Workspace = {
-      id: `ws-${Date.now()}`,
-      name,
-      slug,
-      icon: 'Sparkles',
-      memberCount: 1,
-      documentCount: 0,
-      role: 'owner',
-      createdAt: new Date().toISOString().split('T')[0],
-    };
-    setWorkspaces((prev) => [...prev, newWs]);
-    setActiveWorkspace(newWs);
-  };
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const rows = await ApiService.getWorkspaces();
+      setWorkspaces(rows);
+      setActive((current) => {
+        if (current && rows.some((w) => w.id === current.id)) return current;
+        let remembered: string | null = null;
+        try {
+          remembered = localStorage.getItem(ACTIVE_WORKSPACE_KEY);
+        } catch {
+          /* storage unavailable */
+        }
+        return rows.find((w) => w.id === remembered) ?? rows[0] ?? null;
+      });
+    } catch (err) {
+      // Surfaced rather than silently replaced with fake workspaces.
+      setError(err instanceof Error ? err.message : 'Could not load workspaces');
+      setWorkspaces([]);
+      setActive(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
-  return (
-    <WorkspaceContext.Provider value={{ workspaces, activeWorkspace, setActiveWorkspace, createWorkspace }}>
-      {children}
-    </WorkspaceContext.Provider>
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setWorkspaces([]);
+      setActive(null);
+      return;
+    }
+    void load();
+  }, [isAuthenticated, load]);
+
+  const setActiveWorkspace = useCallback((ws: Workspace) => {
+    setActive(ws);
+    try {
+      localStorage.setItem(ACTIVE_WORKSPACE_KEY, ws.id);
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
+
+  const createWorkspace = useCallback(
+    async (name: string, description?: string) => {
+      const created = await ApiService.createWorkspace(name, description);
+      setWorkspaces((prev) => [...prev, created]);
+      setActiveWorkspace(created);
+      return created;
+    },
+    [setActiveWorkspace]
   );
+
+  const value = useMemo<WorkspaceContextType>(
+    () => ({
+      workspaces,
+      activeWorkspace,
+      isLoading,
+      error,
+      setActiveWorkspace,
+      createWorkspace,
+      refresh: load,
+    }),
+    [workspaces, activeWorkspace, isLoading, error, setActiveWorkspace, createWorkspace, load]
+  );
+
+  return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
 };
 
 export const useWorkspace = () => {

@@ -4,6 +4,9 @@ import { Sparkles, ArrowRight, Lock, Mail, User } from 'lucide-react';
 import { Button } from '../components/common/Button';
 import { Input } from '../components/common/Input';
 import { useAuth } from '../contexts/AuthContext';
+import { useToast } from '../contexts/ToastContext';
+import { ApiError } from '../services/apiClient';
+import { AlertCircle } from 'lucide-react';
 
 export const SignupPage: React.FC = () => {
   const [name, setName] = useState('Alex Vance');
@@ -13,12 +16,29 @@ export const SignupPage: React.FC = () => {
   const { signup } = useAuth();
   const navigate = useNavigate();
 
+  const [formErrors, setFormErrors] = useState<string[]>([]);
+  const toast = useToast();
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading) return;
+    setFormErrors([]);
     setIsLoading(true);
-    await signup(name, email, password);
-    setIsLoading(false);
-    navigate('/dashboard');
+    try {
+      await signup(name, email, password);
+      navigate('/dashboard', { replace: true });
+    } catch (err) {
+      // The backend password policy returns every violation, so show them all
+      // rather than only the first.
+      if (err instanceof ApiError && err.fieldMessages.length > 0) {
+        setFormErrors(err.fieldMessages);
+      } else {
+        setFormErrors([err instanceof Error ? err.message : 'Could not create your account.']);
+      }
+      toast.fromError(err, 'Could not create your account');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -33,6 +53,22 @@ export const SignupPage: React.FC = () => {
           <h2 className="text-2xl font-bold text-white">Create Enterprise Account</h2>
           <p className="text-xs text-slate-400">Start 14-day free trial with full RAG & Agent access</p>
         </div>
+
+        {formErrors.length > 0 && (
+          <div
+            role="alert"
+            className="mb-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200"
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <ul className="space-y-1">
+                {formErrors.map((m) => (
+                  <li key={m}>{m}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <Input

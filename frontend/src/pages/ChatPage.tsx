@@ -22,12 +22,11 @@ import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { Modal } from '../components/common/Modal';
-import { initialChatMessagesMock } from '../services/mockData';
 import { SSEService } from '../services/sseService';
 import { ChatMessage, SourceCitation, AgentStep } from '../types';
 
 export const ChatPage: React.FC = () => {
-  const [messages, setMessages] = useState<ChatMessage[]>(initialChatMessagesMock);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputPrompt, setInputPrompt] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [selectedCitation, setSelectedCitation] = useState<SourceCitation | null>(null);
