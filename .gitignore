@@ -40,6 +40,8 @@ htmlcov/
 # Environment files
 .env
 .env.*
+# ...but the committed template must be tracked
+!.env.example
 
 # Secrets and keys
 secrets/
@@ -47,6 +49,9 @@ secrets/
 # Database files (SQLite etc.)
 *.db
 *.sqlite3
+
+# User-uploaded documents must never be committed
+backend/uploads/
 
 # Docker dev file (optional)
 Dockerfile.dev

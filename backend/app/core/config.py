@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import List, Optional
 import os
 
 
@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "ResearchSphere AI"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
+    ENVIRONMENT: str = "development"  # development | staging | production
 
     # Security
     SECRET_KEY: str = "change-this-in-production-super-secret-key-32chars"
@@ -35,11 +36,48 @@ class Settings(BaseSettings):
 
     # CORS
     FRONTEND_URL: str = "http://localhost:3000"
+    # Comma-separated list of additional allowed origins, e.g.
+    # CORS_ORIGINS="http://localhost:3000,https://app.example.com"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
-    # Redis
+    # Trusted hosts (comma-separated). "*" is only permitted outside production.
+    TRUSTED_HOSTS: str = "localhost,127.0.0.1"
+
+    # Redis (optional - Redis checks are skipped when this is blank)
     REDIS_URL: str = "redis://localhost:6379"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @staticmethod
+    def _split_csv(raw: str) -> List[str]:
+        return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        """True only when ENVIRONMENT is explicitly 'production'.
+
+        Deliberately not derived from DEBUG: DEBUG defaults to False, so
+        deriving it would make every local run behave as production.
+        """
+        return self.ENVIRONMENT.strip().lower() == "production"
+
+    @property
+    def cors_origins(self) -> List[str]:
+        """Allowed CORS origins, always including FRONTEND_URL, de-duplicated."""
+        origins = self._split_csv(self.CORS_ORIGINS)
+        if self.FRONTEND_URL and self.FRONTEND_URL not in origins:
+            origins.append(self.FRONTEND_URL)
+        # Preserve order while removing duplicates
+        return list(dict.fromkeys(origins))
+
+    @property
+    def trusted_hosts(self) -> List[str]:
+        hosts = self._split_csv(self.TRUSTED_HOSTS)
+        return hosts or ["localhost", "127.0.0.1"]
+
+    @property
+    def redis_enabled(self) -> bool:
+        return bool((self.REDIS_URL or "").strip())
 
 
 settings = Settings()

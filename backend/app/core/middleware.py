@@ -5,6 +5,7 @@ FastAPI Middleware Stack for ResearchSphere AI:
 - SecurityHeadersMiddleware: HSTS, CSP, X-Frame-Options
 - RateLimitingMiddleware: In-memory token-bucket rate limiter
 """
+import re
 import uuid
 import time
 import logging
@@ -20,8 +21,17 @@ logger = get_logger("middleware")
 class RequestIDMiddleware(BaseHTTPMiddleware):
     """Injects and propagates X-Request-ID across requests."""
 
+    # Client-supplied IDs are echoed back and written to logs, so constrain them
+    # to a safe charset/length to prevent log injection.
+    _MAX_ID_LEN = 64
+    _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+
     async def dispatch(self, request: Request, call_next):
-        req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        incoming = request.headers.get("X-Request-ID", "")
+        if incoming and len(incoming) <= self._MAX_ID_LEN and self._SAFE_ID.match(incoming):
+            req_id = incoming
+        else:
+            req_id = str(uuid.uuid4())
         request.state.request_id = req_id
         token = request_id_var.set(req_id)
         try:
@@ -44,11 +54,15 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
         req_id = getattr(request.state, "request_id", "")
 
+        # Pass the ID explicitly: this middleware runs outside RequestIDMiddleware,
+        # so the request_id contextvar has already been reset by this point.
         logger.info(
             f"{request.method} {request.url.path} -> {response.status_code} ({duration_ms}ms)",
             extra={
                 "duration_ms": duration_ms,
                 "status_code": response.status_code,
+                "request_id": req_id,
+                "client_ip": client_ip,
             },
         )
         return response
