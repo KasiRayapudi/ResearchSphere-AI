@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
 from app.core.logging import request_id_var, get_logger
 from app.core.config import settings
+from app.core.redis_client import get_redis, mark_unavailable
 
 logger = get_logger("middleware")
 
@@ -123,38 +124,117 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitingMiddleware(BaseHTTPMiddleware):
+    """Distributed rate limiter with an in-memory fallback.
+
+    Redis holds a sliding-window counter per client and tier, so the limit is
+    shared across every backend instance. The window uses a sorted set updated
+    inside a MULTI/EXEC pipeline, which keeps the read-modify-write atomic
+    without needing a Lua script.
+
+    Degradation: when Redis is unavailable the limiter falls back to the
+    original per-process token bucket rather than failing the request. That is
+    weaker (each worker counts separately) but a Redis outage must not take the
+    API down. The fallback bucket store is bounded and swept, so it cannot grow
+    without limit the way the previous implementation could.
+
+    The constructor signature is unchanged, so registration in main.py did not
+    need to change.
     """
-    Simple in-memory token-bucket rate limiter.
-    Default: 100 requests/minute per IP. Auth/Upload: 20 requests/minute.
-    """
+
+    #: Cap on distinct in-memory buckets before the oldest are evicted.
+    _MAX_LOCAL_BUCKETS = 10_000
 
     def __init__(self, app, default_rpm: int = 100, auth_rpm: int = 20):
         super().__init__(app)
         self.default_rpm = default_rpm
         self.auth_rpm = auth_rpm
-        self._buckets: dict = defaultdict(lambda: {"tokens": default_rpm, "last_refill": time.time()})
+        self._buckets: dict = {}
+        self._last_sweep = time.time()
 
-    def _refill(self, bucket: dict, max_tokens: int):
+    # -- local fallback ---------------------------------------------------
+    def _sweep(self, now: float) -> None:
+        """Evict idle buckets so the fallback store stays bounded."""
+        if now - self._last_sweep < 60:
+            return
+        self._last_sweep = now
+        stale = [k for k, b in self._buckets.items() if now - b["last_refill"] > 300]
+        for key in stale:
+            self._buckets.pop(key, None)
+        if len(self._buckets) > self._MAX_LOCAL_BUCKETS:
+            for key in sorted(
+                self._buckets, key=lambda k: self._buckets[k]["last_refill"]
+            )[: len(self._buckets) - self._MAX_LOCAL_BUCKETS]:
+                self._buckets.pop(key, None)
+
+    def _check_local(self, key: str, max_rpm: int):
         now = time.time()
+        self._sweep(now)
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            bucket = {"tokens": float(max_rpm), "last_refill": now}
+            self._buckets[key] = bucket
         elapsed = now - bucket["last_refill"]
-        refill = elapsed * (max_tokens / 60.0)
-        bucket["tokens"] = min(max_tokens, bucket["tokens"] + refill)
+        bucket["tokens"] = min(max_rpm, bucket["tokens"] + elapsed * (max_rpm / 60.0))
         bucket["last_refill"] = now
+        if bucket["tokens"] < 1:
+            return False, 0, 60
+        bucket["tokens"] -= 1
+        return True, int(bucket["tokens"]), 60
+
+    # -- redis ------------------------------------------------------------
+    def _check_redis(self, client, key: str, max_rpm: int):
+        """Sliding-window counter. Returns (allowed, remaining, retry_after)."""
+        now = time.time()
+        window_start = now - 60
+        redis_key = f"ratelimit:{key}"
+        pipe = client.pipeline()
+        pipe.zremrangebyscore(redis_key, 0, window_start)
+        pipe.zadd(redis_key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
+        pipe.zcard(redis_key)
+        pipe.expire(redis_key, 120)
+        results = pipe.execute()
+        count = int(results[2])
+        if count > max_rpm:
+            # Remove the request we just recorded so a blocked caller does not
+            # keep extending its own window.
+            try:
+                client.zremrangebyrank(redis_key, -1, -1)
+            except Exception:
+                pass
+            return False, 0, 60
+        return True, max(0, max_rpm - count), 60
 
     async def dispatch(self, request: Request, call_next):
         client_ip = request.client.host if request.client else "unknown"
         path = request.url.path.lower()
 
-        # Determine rate limit tier
+        # Health probes must never be rate limited: an orchestrator polling
+        # them would otherwise mark a healthy instance as down.
+        if path in ("/api/live", "/api/health", "/api/ready", "/live", "/health", "/ready"):
+            return await call_next(request)
+
         is_sensitive = "/auth/" in path or "/upload" in path
         max_rpm = self.auth_rpm if is_sensitive else self.default_rpm
-
         bucket_key = f"{client_ip}:{max_rpm}"
-        bucket = self._buckets[bucket_key]
-        self._refill(bucket, max_rpm)
 
-        if bucket["tokens"] < 1:
-            logger.warning(f"Rate limit exceeded for {client_ip} on {path}")
+        backend = "local"
+        redis_conn = get_redis()
+        if redis_conn is not None:
+            try:
+                allowed, remaining, retry_after = self._check_redis(
+                    redis_conn, bucket_key, max_rpm
+                )
+                backend = "redis"
+            except Exception as exc:
+                mark_unavailable(exc)
+                allowed, remaining, retry_after = self._check_local(bucket_key, max_rpm)
+        else:
+            allowed, remaining, retry_after = self._check_local(bucket_key, max_rpm)
+
+        if not allowed:
+            logger.warning(
+                f"Rate limit exceeded for {client_ip} on {path} (backend={backend})"
+            )
             return JSONResponse(
                 status_code=429,
                 content={
@@ -163,9 +243,15 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
                         "message": "Too many requests. Please try again later.",
                     }
                 },
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-RateLimit-Limit": str(max_rpm),
+                    "X-RateLimit-Remaining": "0",
+                },
             )
 
-        bucket["tokens"] -= 1
         response = await call_next(request)
-        response.headers["X-RateLimit-Remaining"] = str(int(bucket["tokens"]))
+        response.headers["X-RateLimit-Limit"] = str(max_rpm)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        response.headers["X-RateLimit-Backend"] = backend
         return response

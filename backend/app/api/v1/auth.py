@@ -3,7 +3,22 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.config import settings
-from app.core.security import create_access_token, hash_password, verify_password, get_current_user
+from app.core.security import (
+    create_access_token,
+    hash_password,
+    verify_password,
+    get_current_user,
+    security,
+    decode_token,
+    TOKEN_TYPE_ACCESS,
+)
+from app.core.refresh_service import (
+    issue_refresh_token,
+    revoke_all_for_user,
+    rotate_refresh_token,
+)
+from app.core.token_store import revoke_token
+from fastapi.security import HTTPAuthorizationCredentials
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.core.audit import audit, AuditAction, AuditOutcome
@@ -62,6 +77,12 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
         )
 
     token = create_access_token({"sub": user.id, "role": user.role})
+    refresh_token, _ = issue_refresh_token(
+        db,
+        user,
+        user_agent=request.headers.get("User-Agent"),
+        client_ip=request.client.host if request.client else None,
+    )
     audit(
         action=AuditAction.LOGIN_SUCCESS,
         actor=user,
@@ -71,6 +92,7 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
     )
     return {
         "access_token": token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {
             "id": user.id,
@@ -149,8 +171,15 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
     )
 
     token = create_access_token({"sub": new_user.id, "role": new_user.role})
+    refresh_token, _ = issue_refresh_token(
+        db,
+        new_user,
+        user_agent=request.headers.get("User-Agent"),
+        client_ip=request.client.host if request.client else None,
+    )
     return {
         "access_token": token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {
             "id": new_user.id,
@@ -346,3 +375,101 @@ async def check_password_strength(payload: PasswordStrengthRequest):
         "valid": result.is_valid,
         "violations": result.violations,
     }
+
+
+# ---------------------------------------------------------------------------
+# Refresh tokens and session management
+# ---------------------------------------------------------------------------
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/refresh")
+async def refresh_access_token(
+    payload: RefreshRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Exchange a refresh token for a new access + refresh token pair.
+
+    The presented token is consumed (rotation). Presenting one that has
+    already been rotated is treated as theft: the whole token family is
+    revoked, ending the session for attacker and user alike.
+    """
+    result = rotate_refresh_token(
+        db,
+        payload.refresh_token,
+        user_agent=request.headers.get("User-Agent"),
+        client_ip=request.client.host if request.client else None,
+    )
+
+    if result.reuse_detected:
+        audit(
+            action=AuditAction.TOKEN_REUSE_DETECTED,
+            outcome=AuditOutcome.DENIED,
+            resource="auth:refresh_token",
+            request=request,
+            metadata={
+                "reason": result.reason,
+                "revoked_tokens": result.revoked_count,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This session has been terminated. Please sign in again.",
+        )
+
+    if not result.ok:
+        audit(
+            action=AuditAction.TOKEN_REFRESHED,
+            outcome=AuditOutcome.DENIED,
+            resource="auth:refresh_token",
+            request=request,
+            metadata={"reason": result.reason},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token.",
+        )
+
+    audit(
+        action=AuditAction.TOKEN_REFRESHED,
+        actor=result.user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{result.user.id}",
+        request=request,
+    )
+    return {
+        "access_token": result.access_token,
+        "refresh_token": result.refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/logout")
+async def logout(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Log out: blacklist the current access token and revoke all refresh
+    tokens for the user, invalidating every session."""
+    payload = decode_token(credentials.credentials, expected_type=TOKEN_TYPE_ACCESS)
+    blacklisted = revoke_token(payload.get("jti"), payload.get("exp"))
+    revoked = revoke_all_for_user(db, current_user.id, reason="logout")
+
+    audit(
+        action=AuditAction.LOGOUT,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{current_user.id}",
+        request=request,
+        metadata={
+            "refresh_tokens_revoked": revoked,
+            # False means Redis was unavailable, so the access token stays
+            # valid until it expires. Refresh tokens are revoked regardless.
+            "access_token_blacklisted": blacklisted,
+        },
+    )
+    return {"message": "Signed out successfully.", "sessionsRevoked": revoked}

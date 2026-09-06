@@ -14,7 +14,15 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = "change-this-in-production-super-secret-key-32chars"
     ALGORITHM: str = "HS256"
+    #: Default deliberately left at 7 days. The frontend has no refresh logic
+    #: or 401 interceptor yet, so shortening this would silently log users out
+    #: mid-session. Lower it once the client consumes /auth/refresh.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    JWT_ISSUER: str = "researchsphere-ai"
+    JWT_AUDIENCE: str = "researchsphere-api"
+    #: Clock skew tolerance when validating exp/nbf/iat.
+    JWT_CLOCK_SKEW_SECONDS: int = 30
 
     # Password policy (see app/core/password_policy.py)
     PASSWORD_MIN_LENGTH: int = 12

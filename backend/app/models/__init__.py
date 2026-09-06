@@ -4,6 +4,7 @@ from app.models.document import Document, DocumentChunk
 from app.models.chat import ChatSession, ChatMessage
 from app.models.report import Report, Connector
 from app.models.password_reset import PasswordResetToken
+from app.models.refresh_token import RefreshToken
 
 __all__ = [
     "User",
@@ -15,4 +16,5 @@ __all__ = [
     "Report",
     "Connector",
     "PasswordResetToken",
+    "RefreshToken",
 ]

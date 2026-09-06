@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -61,19 +62,73 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+TOKEN_TYPE_ACCESS = "access"
+TOKEN_TYPE_REFRESH = "refresh"
+
+
+def _base_claims(token_type: str, expires_delta: timedelta) -> dict:
+    """Standard registered claims shared by every token we issue."""
+    now = datetime.now(timezone.utc)
+    return {
+        "iat": now,                      # issued at
+        "nbf": now,                      # not valid before
+        "exp": now + expires_delta,      # expiry
+        "jti": str(uuid.uuid4()),        # unique id, enables revocation
+        "typ": token_type,               # access vs refresh - not interchangeable
+        "iss": settings.JWT_ISSUER,      # issuer
+        "aud": settings.JWT_AUDIENCE,    # audience
+    }
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (
-        expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update(
+        _base_claims(
+            TOKEN_TYPE_ACCESS,
+            expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
     )
-    to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def decode_token(token: str) -> dict:
+def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    to_encode.update(
+        _base_claims(
+            TOKEN_TYPE_REFRESH,
+            expires_delta or timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        )
+    )
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_token(
+    token: str,
+    expected_type: str = TOKEN_TYPE_ACCESS,
+    check_revocation: bool = True,
+) -> dict:
+    """Decode and fully validate a token.
+
+    Validates signature, expiry, not-before, issuer and audience, allows a
+    small clock skew, and enforces the token type so a refresh token can never
+    be presented as an access token.
+    """
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        return payload
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+            options={
+                "require_exp": True,
+                "require_iat": True,
+                "verify_aud": True,
+                "verify_iss": True,
+                # Tolerate small clock differences between issuer and verifier.
+                "leeway": settings.JWT_CLOCK_SKEW_SECONDS,
+            },
+        )
     except JWTError as exc:
         # The token itself is never logged - only the reason it was rejected.
         audit(
@@ -87,6 +142,48 @@ def decode_token(token: str) -> dict:
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Token type must match what the caller expects.
+    if expected_type and payload.get("typ") != expected_type:
+        audit(
+            action=AuditAction.INVALID_TOKEN,
+            outcome=AuditOutcome.DENIED,
+            resource="auth:token",
+            metadata={
+                "reason": "wrong_token_type",
+                "expected": expected_type,
+                "actual": payload.get("typ"),
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Revocation check (Redis-backed; degrades open when Redis is down).
+    #
+    # Callers that own a stronger source of truth skip this. Refresh rotation
+    # must: a consumed refresh token is blacklisted, and rejecting it here
+    # would short-circuit reuse detection before the database can revoke the
+    # token family - defeating theft detection exactly when Redis is up.
+    jti = payload.get("jti")
+    if check_revocation and jti:
+        from app.core.token_store import is_token_revoked
+
+        if is_token_revoked(jti):
+            audit(
+                action=AuditAction.INVALID_TOKEN,
+                outcome=AuditOutcome.DENIED,
+                resource="auth:token",
+                metadata={"reason": "revoked", "jti": jti},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return payload
 
 
 def get_current_user(

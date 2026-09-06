@@ -172,7 +172,14 @@ def redact(value: Any, _depth: int = 0) -> Any:
             if idx >= _MAX_ITEMS:
                 out["<truncated>"] = f"{len(value) - _MAX_ITEMS} more keys"
                 break
-            out[str(k)] = REDACTED if _is_sensitive_key(k) else redact(v, _depth + 1)
+            # A sensitive key name hides string values, but not numbers or
+            # booleans: counts and flags like {"revoked_tokens": 3} or
+            # {"access_token_blacklisted": True} are not secrets, and redacting
+            # them would strip useful signal out of the audit trail.
+            if _is_sensitive_key(k) and not isinstance(v, (int, float, bool)):
+                out[str(k)] = REDACTED
+            else:
+                out[str(k)] = redact(v, _depth + 1)
         return out
 
     if isinstance(value, (list, tuple, set)):
