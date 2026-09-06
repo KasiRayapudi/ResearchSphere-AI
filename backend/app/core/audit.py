@@ -71,6 +71,10 @@ class AuditAction(str, Enum):
     LOGIN_FAILURE = "auth.login.failure"
     LOGOUT = "auth.logout"
     USER_REGISTERED = "auth.register"
+    PASSWORD_RESET_REQUESTED = "auth.password_reset.requested"
+    PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"
+    TOKEN_REFRESHED = "auth.token.refreshed"
+    TOKEN_REUSE_DETECTED = "auth.token.reuse_detected"
 
     # Documents
     DOCUMENT_UPLOAD = "document.upload"

@@ -16,6 +16,20 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
 
+    # Password policy (see app/core/password_policy.py)
+    PASSWORD_MIN_LENGTH: int = 12
+    PASSWORD_MAX_LENGTH: int = 128
+    PASSWORD_REQUIRE_UPPERCASE: bool = True
+    PASSWORD_REQUIRE_LOWERCASE: bool = True
+    PASSWORD_REQUIRE_DIGIT: bool = True
+    PASSWORD_REQUIRE_SPECIAL: bool = True
+    PASSWORD_BLOCK_COMMON: bool = True
+
+    # Password reset (see app/core/password_reset.py)
+    PASSWORD_RESET_TOKEN_TTL_MINUTES: int = 30
+    #: Max active reset requests per account before further ones are ignored.
+    PASSWORD_RESET_MAX_ACTIVE: int = 3
+
     # Database
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/researchsphere_db"
 

@@ -2,12 +2,26 @@ from fastapi import APIRouter, HTTPException, Depends, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password, get_current_user
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.core.audit import audit, AuditAction, AuditOutcome
+from app.core.password_policy import (
+    PasswordPolicyError,
+    evaluate_password,
+    validate_password,
+)
+from app.core.password_reset import (
+    consume_reset_token,
+    generate_reset_token,
+    verify_reset_token,
+)
+from app.core.exceptions import ValidationException
+from app.core.logging import get_logger
 
 router = APIRouter()
+logger = get_logger("auth")
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -85,6 +99,26 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
             detail="Email already registered"
         )
     
+    # Enforce the password policy before anything is persisted.
+    try:
+        validate_password(
+            payload.password, email=payload.email, full_name=payload.name
+        )
+    except PasswordPolicyError as exc:
+        audit(
+            action=AuditAction.USER_REGISTERED,
+            actor=payload.email,
+            outcome=AuditOutcome.FAILURE,
+            resource="user:new",
+            request=request,
+            metadata={"reason": "weak_password", "violations": exc.violations},
+        )
+        raise ValidationException(
+            message="Password does not meet the security policy.",
+            details=[{"loc": ["body", "password"], "msg": v, "type": "password_policy"}
+                     for v in exc.violations],
+        )
+
     # Create new user
     new_user = User(
         full_name=payload.name,
@@ -135,4 +169,180 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "email": current_user.email,
         "role": current_user.role,
         "avatarUrl": current_user.avatar_url or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Password reset
+# ---------------------------------------------------------------------------
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
+
+class PasswordStrengthRequest(BaseModel):
+    password: str
+    email: str | None = None
+    name: str | None = None
+
+
+@router.post("/password-reset/request")
+async def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Begin a password reset.
+
+    Always returns the same response whether or not the address exists, so the
+    endpoint cannot be used to enumerate registered accounts.
+    """
+    generic_response = {
+        "message": "If an account exists for that address, a reset link has been sent.",
+    }
+
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user or not user.is_active:
+        audit(
+            action=AuditAction.PASSWORD_RESET_REQUESTED,
+            actor=payload.email,
+            outcome=AuditOutcome.FAILURE,
+            resource="user:unknown",
+            request=request,
+            metadata={"reason": "unknown_or_inactive_account"},
+        )
+        return generic_response
+
+    client_ip = request.client.host if request.client else None
+    raw_token, record = generate_reset_token(db, user.id, requested_ip=client_ip)
+
+    audit(
+        action=AuditAction.PASSWORD_RESET_REQUESTED,
+        actor=user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{user.id}",
+        request=request,
+        metadata={"token_id": record.id, "expires_at": record.expires_at.isoformat()},
+    )
+
+    # No email transport is configured yet. The raw token is deliberately NOT
+    # returned in production: doing so would let anyone who can call this
+    # endpoint reset any account. Outside production it is returned so the
+    # flow is testable end to end.
+    if not settings.is_production:
+        return {**generic_response, "debug_reset_token": raw_token}
+    logger.warning(
+        "Password reset requested but no email transport is configured; "
+        "the token was generated and discarded."
+    )
+    return generic_response
+
+
+@router.post("/password-reset/confirm")
+async def confirm_password_reset(
+    payload: PasswordResetConfirm,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Complete a password reset using a single-use token."""
+    record = verify_reset_token(db, payload.token)
+    if record is None:
+        # Unknown, expired, used and revoked tokens are indistinguishable here
+        # on purpose.
+        audit(
+            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            outcome=AuditOutcome.DENIED,
+            resource="password_reset:token",
+            request=request,
+            metadata={"reason": "invalid_or_expired_token"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link is invalid or has expired.",
+        )
+
+    user = db.query(User).filter(User.id == record.user_id).first()
+    if not user or not user.is_active:
+        audit(
+            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            outcome=AuditOutcome.DENIED,
+            resource=f"user:{record.user_id}",
+            request=request,
+            metadata={"reason": "unknown_or_inactive_account"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link is invalid or has expired.",
+        )
+
+    try:
+        validate_password(
+            payload.new_password, email=user.email, full_name=user.full_name
+        )
+    except PasswordPolicyError as exc:
+        audit(
+            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            actor=user,
+            outcome=AuditOutcome.FAILURE,
+            resource=f"user:{user.id}",
+            request=request,
+            metadata={"reason": "weak_password", "violations": exc.violations},
+        )
+        raise ValidationException(
+            message="Password does not meet the security policy.",
+            details=[{"loc": ["body", "new_password"], "msg": v, "type": "password_policy"}
+                     for v in exc.violations],
+        )
+
+    if verify_password(payload.new_password, user.hashed_password):
+        audit(
+            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            actor=user,
+            outcome=AuditOutcome.FAILURE,
+            resource=f"user:{user.id}",
+            request=request,
+            metadata={"reason": "password_reuse"},
+        )
+        raise ValidationException(
+            message="Password does not meet the security policy.",
+            details=[{"loc": ["body", "new_password"],
+                      "msg": "New password must differ from the current password.",
+                      "type": "password_reuse"}],
+        )
+
+    user.hashed_password = hash_password(payload.new_password)
+    # Single-use: mark consumed and revoke every other outstanding token.
+    consume_reset_token(db, record)
+    db.commit()
+
+    audit(
+        action=AuditAction.PASSWORD_RESET_COMPLETED,
+        actor=user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"user:{user.id}",
+        request=request,
+        metadata={"token_id": record.id},
+    )
+    return {"message": "Your password has been reset. Please sign in again."}
+
+
+@router.post("/password/strength")
+async def check_password_strength(payload: PasswordStrengthRequest):
+    """Score a password against the policy without creating anything.
+
+    Lets the UI give live feedback. The password is never stored or logged.
+    """
+    result = evaluate_password(
+        payload.password, email=payload.email, full_name=payload.name
+    )
+    return {
+        "score": result.score,
+        "label": result.label,
+        "entropyBits": result.entropy_bits,
+        "valid": result.is_valid,
+        "violations": result.violations,
     }
