@@ -1,46 +1,44 @@
-import os
-import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import text
 from fastapi import FastAPI, HTTPException
-from starlette.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
+from sqlalchemy import text
+from starlette.concurrency import run_in_threadpool
 
-from app.core.logging import setup_logging, get_logger
-from app.core.middleware import (
-    RequestIDMiddleware,
-    LoggingMiddleware,
-    SecurityHeadersMiddleware,
-    RateLimitingMiddleware,
+import app.models  # Ensure all models are imported for metadata creation
+from app.api.v1 import (
+    admin_router,
+    analytics_router,
+    auth_router,
+    chat_router,
+    documents_router,
+    mcp_router,
+    reports_router,
+    research_router,
+    workspaces_router,
 )
+from app.core.config import ConfigurationError, settings, validate_configuration
+from app.core.database import Base, engine
 from app.core.exception_handlers import (
     app_exception_handler,
+    generic_exception_handler,
     http_exception_handler,
     validation_exception_handler,
-    generic_exception_handler,
 )
 from app.core.exceptions import AppException
-from app.core.config import settings, validate_configuration, ConfigurationError
-from app.api.v1 import (
-    auth_router,
-    workspaces_router,
-    documents_router,
-    chat_router,
-    research_router,
-    reports_router,
-    mcp_router,
-    analytics_router,
-    admin_router,
+from app.core.logging import get_logger, setup_logging
+from app.core.middleware import (
+    LoggingMiddleware,
+    RateLimitingMiddleware,
+    RequestIDMiddleware,
+    SecurityHeadersMiddleware,
 )
-from app.core.database import Base, engine
-import app.models  # Ensure all models are imported for metadata creation
 
 # Optional external services imports for health checks
 try:
@@ -105,9 +103,7 @@ def check_redis() -> str:
     if redis is None:
         return "unavailable"
     try:
-        client = redis_client or redis.from_url(
-            settings.REDIS_URL, socket_connect_timeout=5
-        )
+        client = redis_client or redis.from_url(settings.REDIS_URL, socket_connect_timeout=5)
         client.ping()
         return "ok"
     except Exception as exc:
@@ -153,7 +149,7 @@ _HEALTHY_STATUSES = {"ok", "configured", "disabled", "unavailable"}
 def uptime_seconds() -> float:
     if START_TIME is None:
         return 0.0
-    return round((datetime.now(timezone.utc) - START_TIME).total_seconds(), 2)
+    return round((datetime.now(UTC) - START_TIME).total_seconds(), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +162,7 @@ async def lifespan(app: FastAPI):
 
     # --- Startup -----------------------------------------------------------
     setup_logging()  # idempotent; guarantees JSON logging even under Gunicorn
-    START_TIME = datetime.now(timezone.utc)
+    START_TIME = datetime.now(UTC)
     logger.info(
         f"Starting {settings.APP_NAME} v{settings.APP_VERSION} "
         f"(environment={settings.ENVIRONMENT})"
@@ -200,9 +196,7 @@ async def lifespan(app: FastAPI):
             qdrant_client = None
     if redis is not None and settings.redis_enabled:
         try:
-            redis_client = redis.from_url(
-                settings.REDIS_URL, socket_connect_timeout=5
-            )
+            redis_client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=5)
         except Exception as exc:
             logger.error(f"Could not construct Redis client: {exc}")
             redis_client = None
@@ -226,9 +220,7 @@ async def lifespan(app: FastAPI):
 
     degraded = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
     if degraded:
-        logger.warning(
-            f"Startup complete with degraded dependencies: {', '.join(degraded)}"
-        )
+        logger.warning(f"Startup complete with degraded dependencies: {', '.join(degraded)}")
     else:
         logger.info("Startup complete - all dependencies healthy")
 
@@ -264,16 +256,17 @@ async def lifespan(app: FastAPI):
 # FastAPI application with lifespan events
 # ---------------------------------------------------------------------------
 
+
 def create_app() -> FastAPI:
     """Factory that creates the FastAPI application.
 
     The function is kept separate to aid testing and to ensure a clean
-    module‑level namespace.
+    module-level namespace.
     """
 
     app = FastAPI(
         title="ResearchSphere AI - Enterprise Backend Gateway",
-        description="Production RAG pipeline, LangGraph Multi‑Agent Workflows, and MCP Connectors Engine",
+        description="Production RAG pipeline, LangGraph Multi-Agent Workflows, and MCP Connectors Engine",
         version=settings.APP_VERSION,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -364,7 +357,7 @@ def create_app() -> FastAPI:
             "environment": settings.ENVIRONMENT,
             "uptime_seconds": uptime_seconds(),
             "checks": checks,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     @app.get("/api/live", tags=["Health"])
@@ -386,9 +379,7 @@ def create_app() -> FastAPI:
         if failed:
             payload["failed"] = failed
             logger.warning(f"Readiness probe failed: {', '.join(failed)}")
-        return JSONResponse(
-            status_code=503 if failed else 200, content=payload
-        )
+        return JSONResponse(status_code=503 if failed else 200, content=payload)
 
     # Legacy unprefixed aliases - kept so existing probes keep working.
     app.add_api_route("/health", health, methods=["GET"], include_in_schema=False)
@@ -397,14 +388,18 @@ def create_app() -> FastAPI:
 
     return app
 
+
 # ---------------------------------------------------------------------------
 # Create the FastAPI instance
 # ---------------------------------------------------------------------------
 app = create_app()
 
 # ---------------------------------------------------------------------------
-# Development entry‑point
+# Development entry-point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    # nosec B104 - binding all interfaces is required inside a container; the
+    # edge proxy is what is actually exposed. This branch is development only.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)  # nosec B104

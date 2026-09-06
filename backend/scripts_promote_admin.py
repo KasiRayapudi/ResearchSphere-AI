@@ -5,6 +5,7 @@ Run this once to grant yourself access:
 
     python scripts_promote_admin.py you@example.com
 """
+
 import sys
 
 from app.core.database import SessionLocal

@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, Integer, Text, ForeignKey
+
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import relationship
+
 from app.core.database import Base
 
 
@@ -19,6 +21,8 @@ class Workspace(Base):
     # Relationships
     owner = relationship("User", back_populates="workspaces")
     documents = relationship("Document", back_populates="workspace", cascade="all, delete-orphan")
-    chat_sessions = relationship("ChatSession", back_populates="workspace", cascade="all, delete-orphan")
+    chat_sessions = relationship(
+        "ChatSession", back_populates="workspace", cascade="all, delete-orphan"
+    )
     reports = relationship("Report", back_populates="workspace", cascade="all, delete-orphan")
     connectors = relationship("Connector", back_populates="workspace", cascade="all, delete-orphan")

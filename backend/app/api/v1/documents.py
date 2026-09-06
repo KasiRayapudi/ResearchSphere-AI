@@ -1,18 +1,15 @@
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Request, status
-from sqlalchemy.orm import Session
-from typing import Optional, List
+import os
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
-from app.core.database import get_db
-from app.core.security import get_current_user, resolve_workspace
-from app.models.user import User
-from app.models.workspace import Workspace
-from app.models.document import Document, DocumentChunk
-from app.rag.document_processor import extract_text, clean_text, chunk_text
-from app.rag.embeddings import embed_texts
-from app.rag.vector_store import upsert_chunks, delete_document_vectors
+from sqlalchemy.orm import Session
+
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
-from app.core.audit import audit, AuditAction, AuditOutcome
+from app.core.database import get_db
 from app.core.logging import get_logger
+from app.core.security import get_current_user, resolve_workspace
 from app.core.upload_security import (
     UploadValidationError,
     discard_quarantined,
@@ -23,13 +20,17 @@ from app.core.upload_security import (
     validate_content,
     validate_extension,
 )
+from app.models.document import Document, DocumentChunk
+from app.models.user import User
+from app.models.workspace import Workspace
+from app.rag.document_processor import chunk_text, clean_text, extract_text
+from app.rag.embeddings import embed_texts
+from app.rag.vector_store import delete_document_vectors, upsert_chunks
 from app.services.antivirus import get_scanner
-import os
-import shutil
-from datetime import datetime
 
 router = APIRouter()
 logger = get_logger("documents")
+
 
 class DocumentResponse(BaseModel):
     id: str
@@ -39,7 +40,7 @@ class DocumentResponse(BaseModel):
     fileSizeKb: int
     status: str
     chunkCount: int
-    tags: List[str]
+    tags: list[str]
     uploadedBy: str
     uploadedAt: str
     version: int
@@ -49,21 +50,22 @@ class DocumentResponse(BaseModel):
     class Config:
         from_attributes = True
 
-@router.get("", response_model=List[dict])
+
+@router.get("", response_model=list[dict])
 async def get_documents(
     request: Request,
-    workspace_id: Optional[str] = None,
+    workspace_id: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     # Find active workspace if not specified
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         return []
     workspace_id = ws.id
-        
+
     documents = db.query(Document).filter(Document.workspace_id == workspace_id).all()
-    
+
     return [
         {
             "id": doc.id,
@@ -82,14 +84,15 @@ async def get_documents(
         for doc in documents
     ]
 
+
 @router.post("/upload")
 async def upload_document(
     request: Request,
     file: UploadFile = File(...),
-    workspace_id: Optional[str] = Form(None),
-    folder: Optional[str] = Form(None),
+    workspace_id: str | None = Form(None),
+    folder: str | None = Form(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     # 1. Determine active workspace
     ws = resolve_workspace(workspace_id, request, db, current_user)
@@ -132,7 +135,7 @@ async def upload_document(
     try:
         validate_extension(ext, settings.allowed_upload_extensions)
     except UploadValidationError as exc:
-        raise _reject(exc)
+        raise _reject(exc) from exc
 
     # 2b. Stream into quarantine, enforcing the size cap mid-write and
     #     computing SHA-256 in the same pass.
@@ -144,7 +147,7 @@ async def upload_document(
             max_bytes=settings.max_upload_bytes,
         )
     except UploadValidationError as exc:
-        raise _reject(exc)
+        raise _reject(exc) from exc
 
     quarantine_path = stored.path
     file_size = stored.size
@@ -156,7 +159,7 @@ async def upload_document(
         detected_kind, mime_type = validate_content(quarantine_path, ext)
     except UploadValidationError as exc:
         discard_quarantined(quarantine_path)
-        raise _reject(exc)
+        raise _reject(exc) from exc
 
     # 2d. Antivirus scan while still quarantined
     scan_result = get_scanner().scan_file(quarantine_path)
@@ -253,20 +256,19 @@ async def upload_document(
     db.add(doc)
     db.commit()
     db.refresh(doc)
-    
-    
+
     try:
         # 4. Extract and clean text
         text = extract_text(file_path, ext)
         cleaned = clean_text(text)
-        
+
         # 5. Chunk text
         chunks = chunk_text(cleaned)
-        
+
         # 6. Embed chunks
         contents = [c["content"] for c in chunks]
         embeddings = embed_texts(contents)
-        
+
         # 7. Write chunks to DB and Vector DB
         chunk_db_objects = []
         for idx, chunk in enumerate(chunks):
@@ -278,15 +280,14 @@ async def upload_document(
             )
             db.add(db_chunk)
             chunk_db_objects.append(db_chunk)
-            
+
         db.commit()
-        
-        # Update point payload mapping
-        qdrant_payloads = []
+
+        # Map each Qdrant point back to its stored chunk row.
         for idx, db_chunk in enumerate(chunk_db_objects):
             chunks[idx]["db_id"] = db_chunk.id
             db.refresh(db_chunk)
-            
+
         # 8. Upsert into Qdrant
         point_ids = upsert_chunks(
             chunks=chunks,
@@ -294,17 +295,17 @@ async def upload_document(
             document_id=doc.id,
             workspace_id=workspace_id,
         )
-        
+
         # Save Qdrant point IDs on chunks
         for idx, point_id in enumerate(point_ids):
             chunk_db_objects[idx].qdrant_point_id = point_id
-            
+
         # 9. Update Document status
         doc.status = "indexed"
         doc.chunk_count = len(chunks)
         doc.indexed_at = datetime.utcnow()
         db.commit()
-        
+
     except Exception as e:
         doc.status = "failed"
         doc.error_message = str(e)
@@ -332,10 +333,7 @@ async def upload_document(
                 "reason": str(e)[:200],
             },
         )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process document: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}") from e
 
     audit(
         action=AuditAction.DOCUMENT_UPLOAD,
@@ -355,7 +353,7 @@ async def upload_document(
             "antivirus": scan_result.to_metadata(),
         },
     )
-        
+
     return {
         "id": doc.id,
         "title": doc.original_filename,
@@ -371,12 +369,13 @@ async def upload_document(
         "folderPath": doc.folder_path,
     }
 
+
 @router.delete("/{id}")
 async def delete_document(
     id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     # Ownership check: a document is reachable only through a workspace the
     # caller owns. Previously any authenticated user could delete any document
@@ -398,20 +397,22 @@ async def delete_document(
             metadata={"reason": "not_found"},
         )
         raise HTTPException(status_code=404, detail="Document not found")
-        
+
     # Delete from Qdrant
     try:
         delete_document_vectors(doc.id)
     except Exception as e:
-        print(f"Failed to delete Qdrant vectors: {e}")
-        
+        # Orphaned vectors are recoverable; failing the delete is not, so this
+        # is logged rather than raised.
+        logger.error(f"Failed to delete Qdrant vectors for {doc.id}: {e}")
+
     # Clean file locally
     if os.path.exists(doc.file_path):
         try:
             os.remove(doc.file_path)
         except Exception as e:
-            print(f"Failed to remove local file: {e}")
-            
+            logger.error(f"Failed to remove local file for {doc.id}: {e}")
+
     deleted_meta = {
         "filename": doc.original_filename,
         "workspace_id": doc.workspace_id,

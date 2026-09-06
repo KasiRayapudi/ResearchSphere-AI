@@ -9,6 +9,7 @@ service checks. Exits non-zero when configuration is invalid for the current
 ENVIRONMENT, which makes a misconfigured production container fail fast and
 visibly instead of starting and serving broken requests.
 """
+
 import sys
 
 from app.core.config import settings, validate_configuration

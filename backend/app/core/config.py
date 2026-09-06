@@ -1,7 +1,6 @@
-from pydantic_settings import BaseSettings
 from pathlib import Path
-from typing import List, Optional
-import os
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -94,9 +93,7 @@ class Settings(BaseSettings):
     HEADER_X_CONTENT_TYPE_OPTIONS: str = "nosniff"
     HEADER_X_FRAME_OPTIONS: str = "DENY"
     HEADER_REFERRER_POLICY: str = "strict-origin-when-cross-origin"
-    HEADER_PERMISSIONS_POLICY: str = (
-        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
-    )
+    HEADER_PERMISSIONS_POLICY: str = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
     HEADER_CROSS_ORIGIN_RESOURCE_POLICY: str = "same-site"
     HEADER_CROSS_ORIGIN_OPENER_POLICY: str = "same-origin"
     #: Blank by default: require-corp breaks cross-origin resources that do not
@@ -128,7 +125,7 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "extra": "ignore"}
 
     @staticmethod
-    def _split_csv(raw: str) -> List[str]:
+    def _split_csv(raw: str) -> list[str]:
         return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
     @property
@@ -141,7 +138,7 @@ class Settings(BaseSettings):
         return self.ENVIRONMENT.strip().lower() == "production"
 
     @property
-    def cors_origins(self) -> List[str]:
+    def cors_origins(self) -> list[str]:
         """Allowed CORS origins, always including FRONTEND_URL, de-duplicated."""
         origins = self._split_csv(self.CORS_ORIGINS)
         if self.FRONTEND_URL and self.FRONTEND_URL not in origins:
@@ -150,7 +147,7 @@ class Settings(BaseSettings):
         return list(dict.fromkeys(origins))
 
     @property
-    def trusted_hosts(self) -> List[str]:
+    def trusted_hosts(self) -> list[str]:
         hosts = self._split_csv(self.TRUSTED_HOSTS)
         return hosts or ["localhost", "127.0.0.1"]
 
@@ -208,8 +205,8 @@ def validate_configuration(config: "Settings" = None) -> dict:
     findings are surfaced as warnings so local development stays frictionless.
     """
     cfg = config or settings
-    errors: List[str] = []
-    warnings: List[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
     production = cfg.is_production
 
     def fail(message: str) -> None:

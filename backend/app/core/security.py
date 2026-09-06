@@ -1,16 +1,15 @@
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from app.core.config import settings
-from app.core.database import get_db
-from app.core.audit import audit, AuditAction, AuditOutcome
+from datetime import UTC, datetime, timedelta
 
 import bcrypt
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+
+from app.core.audit import AuditAction, AuditOutcome, audit
+from app.core.config import settings
+from app.core.database import get_db
 
 
 class BearerAuth(HTTPBearer):
@@ -46,18 +45,15 @@ security = BearerAuth()
 
 
 def hash_password(password: str) -> str:
-    pwd_bytes = password.encode('utf-8')
+    pwd_bytes = password.encode("utf-8")
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(pwd_bytes, salt)
-    return hashed.decode('utf-8')
+    return hashed.decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
-        return bcrypt.checkpw(
-            plain_password.encode('utf-8'),
-            hashed_password.encode('utf-8')
-        )
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
     except Exception:
         return False
 
@@ -68,19 +64,19 @@ TOKEN_TYPE_REFRESH = "refresh"
 
 def _base_claims(token_type: str, expires_delta: timedelta) -> dict:
     """Standard registered claims shared by every token we issue."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return {
-        "iat": now,                      # issued at
-        "nbf": now,                      # not valid before
-        "exp": now + expires_delta,      # expiry
-        "jti": str(uuid.uuid4()),        # unique id, enables revocation
-        "typ": token_type,               # access vs refresh - not interchangeable
-        "iss": settings.JWT_ISSUER,      # issuer
-        "aud": settings.JWT_AUDIENCE,    # audience
+        "iat": now,  # issued at
+        "nbf": now,  # not valid before
+        "exp": now + expires_delta,  # expiry
+        "jti": str(uuid.uuid4()),  # unique id, enables revocation
+        "typ": token_type,  # access vs refresh - not interchangeable
+        "iss": settings.JWT_ISSUER,  # issuer
+        "aud": settings.JWT_AUDIENCE,  # audience
     }
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
     to_encode.update(
         _base_claims(
@@ -91,7 +87,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_refresh_token(data: dict, expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
     to_encode.update(
         _base_claims(
@@ -141,7 +137,7 @@ def decode_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
-        )
+        ) from exc
 
     # Token type must match what the caller expects.
     if expected_type and payload.get("typ") != expected_type:
@@ -316,9 +312,10 @@ def require_workspace_owner(
 
     if workspace is None or workspace.owner_id != current_user.id:
         # Admins may access any workspace, but only one that exists.
-        if workspace is not None and role_rank(
-            (getattr(current_user, "role", "") or "").lower()
-        ) >= ROLE_RANKS["admin"]:
+        if (
+            workspace is not None
+            and role_rank((getattr(current_user, "role", "") or "").lower()) >= ROLE_RANKS["admin"]
+        ):
             return workspace
         audit(
             action=AuditAction.PERMISSION_DENIED,
@@ -336,7 +333,7 @@ def require_workspace_owner(
 
 
 def resolve_workspace(
-    workspace_id: Optional[str],
+    workspace_id: str | None,
     request: Request,
     db: Session,
     current_user,

@@ -15,8 +15,8 @@ a total authentication outage. Refresh tokens are unaffected, because their
 state lives in the database - so a stolen refresh token is still detected and
 a compromised session can still be terminated even with Redis down.
 """
-from datetime import datetime, timezone
-from typing import Optional
+
+from datetime import UTC, datetime
 
 from app.core.logging import get_logger
 from app.core.redis_client import get_redis, mark_unavailable
@@ -34,10 +34,10 @@ def _ttl_from_exp(exp) -> int:
         return DEFAULT_TTL_SECONDS
     try:
         if isinstance(exp, (int, float)):
-            expiry = datetime.fromtimestamp(exp, tz=timezone.utc)
+            expiry = datetime.fromtimestamp(exp, tz=UTC)
         else:
-            expiry = exp if exp.tzinfo else exp.replace(tzinfo=timezone.utc)
-        remaining = int((expiry - datetime.now(timezone.utc)).total_seconds())
+            expiry = exp if exp.tzinfo else exp.replace(tzinfo=UTC)
+        remaining = int((expiry - datetime.now(UTC)).total_seconds())
         return max(1, remaining)
     except Exception:
         return DEFAULT_TTL_SECONDS
@@ -84,7 +84,7 @@ def revoke_many(jtis, exp=None) -> int:
     return sum(1 for jti in jtis if revoke_token(jti, exp))
 
 
-def blacklist_size() -> Optional[int]:
+def blacklist_size() -> int | None:
     """Number of blacklisted tokens, or None when Redis is unavailable."""
     client = get_redis()
     if client is None:

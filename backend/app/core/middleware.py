@@ -5,16 +5,17 @@ FastAPI Middleware Stack for ResearchSphere AI:
 - SecurityHeadersMiddleware: HSTS, CSP, X-Frame-Options
 - RateLimitingMiddleware: In-memory token-bucket rate limiter
 """
+
 import re
-import uuid
 import time
-import logging
-from collections import defaultdict
+import uuid
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
-from app.core.logging import request_id_var, get_logger
+from starlette.responses import JSONResponse
+
 from app.core.config import settings
+from app.core.logging import get_logger, request_id_var
 from app.core.redis_client import get_redis, mark_unavailable
 
 logger = get_logger("middleware")
@@ -101,13 +102,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = settings.HEADER_X_FRAME_OPTIONS
         response.headers["Referrer-Policy"] = settings.HEADER_REFERRER_POLICY
         response.headers["Permissions-Policy"] = settings.HEADER_PERMISSIONS_POLICY
-        response.headers["Cross-Origin-Resource-Policy"] = settings.HEADER_CROSS_ORIGIN_RESOURCE_POLICY
+        response.headers["Cross-Origin-Resource-Policy"] = (
+            settings.HEADER_CROSS_ORIGIN_RESOURCE_POLICY
+        )
         response.headers["Cross-Origin-Opener-Policy"] = settings.HEADER_CROSS_ORIGIN_OPENER_POLICY
 
         # COEP is opt-in: require-corp breaks any cross-origin resource that
         # does not opt in (including the docs CDN), so it stays off by default.
         if settings.HEADER_CROSS_ORIGIN_EMBEDDER_POLICY:
-            response.headers["Cross-Origin-Embedder-Policy"] = settings.HEADER_CROSS_ORIGIN_EMBEDDER_POLICY
+            response.headers["Cross-Origin-Embedder-Policy"] = (
+                settings.HEADER_CROSS_ORIGIN_EMBEDDER_POLICY
+            )
 
         if path.startswith(self._DOCS_PATHS):
             csp = settings.CSP_DOCS
@@ -161,9 +166,9 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
         for key in stale:
             self._buckets.pop(key, None)
         if len(self._buckets) > self._MAX_LOCAL_BUCKETS:
-            for key in sorted(
-                self._buckets, key=lambda k: self._buckets[k]["last_refill"]
-            )[: len(self._buckets) - self._MAX_LOCAL_BUCKETS]:
+            for key in sorted(self._buckets, key=lambda k: self._buckets[k]["last_refill"])[
+                : len(self._buckets) - self._MAX_LOCAL_BUCKETS
+            ]:
                 self._buckets.pop(key, None)
 
     def _check_local(self, key: str, max_rpm: int):
@@ -221,9 +226,7 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
         redis_conn = get_redis()
         if redis_conn is not None:
             try:
-                allowed, remaining, retry_after = self._check_redis(
-                    redis_conn, bucket_key, max_rpm
-                )
+                allowed, remaining, retry_after = self._check_redis(redis_conn, bucket_key, max_rpm)
                 backend = "redis"
             except Exception as exc:
                 mark_unavailable(exc)
@@ -232,9 +235,7 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
             allowed, remaining, retry_after = self._check_local(bucket_key, max_rpm)
 
         if not allowed:
-            logger.warning(
-                f"Rate limit exceeded for {client_ip} on {path} (backend={backend})"
-            )
+            logger.warning(f"Rate limit exceeded for {client_ip} on {path} (backend={backend})")
             return JSONResponse(
                 status_code=429,
                 content={

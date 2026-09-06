@@ -1,45 +1,49 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
-from app.core.security import get_current_user, resolve_workspace
-from app.models.user import User
-from app.models.workspace import Workspace
-from app.models.chat import ChatSession, ChatMessage
-from app.rag.pipeline import stream_rag_response
 from app.core.logging import get_logger
-from app.core.audit import audit, AuditAction, AuditOutcome
-import json
-import asyncio
-from typing import Optional, List
+from app.core.security import get_current_user, resolve_workspace
+from app.models.chat import ChatMessage, ChatSession
+from app.models.user import User
+from app.rag.pipeline import stream_rag_response
 
 router = APIRouter()
 logger = get_logger("chat")
 
+
 class ChatQuery(BaseModel):
     prompt: str
-    workspace_id: Optional[str] = None
-    session_id: Optional[str] = None
+    workspace_id: str | None = None
+    session_id: str | None = None
     model: str = "Gemini 1.5 Pro"
+
 
 @router.get("/sessions")
 async def get_sessions(
     request: Request,
-    workspace_id: Optional[str] = None,
+    workspace_id: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         return []
     workspace_id = ws.id
 
-    sessions = db.query(ChatSession).filter(
-        ChatSession.workspace_id == workspace_id,
-        ChatSession.user_id == current_user.id
-    ).order_by(ChatSession.updated_at.desc()).all()
-    
+    sessions = (
+        db.query(ChatSession)
+        .filter(ChatSession.workspace_id == workspace_id, ChatSession.user_id == current_user.id)
+        .order_by(ChatSession.updated_at.desc())
+        .all()
+    )
+
     return [
         {
             "id": s.id,
@@ -50,34 +54,34 @@ async def get_sessions(
         for s in sessions
     ]
 
+
 @router.post("/sessions")
 async def create_session(
     request: Request,
-    workspace_id: Optional[str] = None,
+    workspace_id: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         raise HTTPException(status_code=400, detail="No active workspace found")
     workspace_id = ws.id
-        
+
     session = ChatSession(
-        workspace_id=workspace_id,
-        user_id=current_user.id,
-        title="New Chat Session"
+        workspace_id=workspace_id, user_id=current_user.id, title="New Chat Session"
     )
     db.add(session)
     db.commit()
     db.refresh(session)
     return {"id": session.id, "title": session.title}
 
+
 @router.post("/stream")
 async def chat_stream(
     request: Request,
     payload: ChatQuery,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     # 1. Determine active workspace
     workspace_id = payload.workspace_id
@@ -89,15 +93,16 @@ async def chat_stream(
     # 2. Get or create session
     session_id = payload.session_id
     if not session_id:
-        session = db.query(ChatSession).filter(
-            ChatSession.workspace_id == workspace_id,
-            ChatSession.user_id == current_user.id
-        ).first()
+        session = (
+            db.query(ChatSession)
+            .filter(
+                ChatSession.workspace_id == workspace_id, ChatSession.user_id == current_user.id
+            )
+            .first()
+        )
         if not session:
             session = ChatSession(
-                workspace_id=workspace_id,
-                user_id=current_user.id,
-                title=payload.prompt[:40]
+                workspace_id=workspace_id, user_id=current_user.id, title=payload.prompt[:40]
             )
             db.add(session)
             db.commit()
@@ -106,11 +111,15 @@ async def chat_stream(
     else:
         # Never trust a client-supplied session id: it must belong to this
         # user and to the resolved workspace.
-        session = db.query(ChatSession).filter(
-            ChatSession.id == session_id,
-            ChatSession.user_id == current_user.id,
-            ChatSession.workspace_id == workspace_id,
-        ).first()
+        session = (
+            db.query(ChatSession)
+            .filter(
+                ChatSession.id == session_id,
+                ChatSession.user_id == current_user.id,
+                ChatSession.workspace_id == workspace_id,
+            )
+            .first()
+        )
         if not session:
             audit(
                 action=AuditAction.PERMISSION_DENIED,
@@ -127,10 +136,7 @@ async def chat_stream(
 
     # 3. Add User message to DB
     user_msg = ChatMessage(
-        session_id=session_id,
-        role="user",
-        content=payload.prompt,
-        model_used=payload.model
+        session_id=session_id, role="user", content=payload.prompt, model_used=payload.model
     )
     db.add(user_msg)
     db.commit()
@@ -143,8 +149,7 @@ async def chat_stream(
         try:
             # Stream real RAG pipeline output
             async for chunk in stream_rag_response(
-                question=payload.prompt,
-                workspace_id=workspace_id
+                question=payload.prompt, workspace_id=workspace_id
             ):
                 if "__SOURCES_JSON__" in chunk:
                     # Parse metadata JSON payload
@@ -184,7 +189,7 @@ async def chat_stream(
                 content=accumulated_text,
                 sources=sources_meta,
                 model_used=payload.model,
-                response_time_ms=response_time
+                response_time_ms=response_time,
             )
             db.add(assistant_msg)
             db.commit()
@@ -193,6 +198,6 @@ async def chat_stream(
             db.rollback()
 
         # Send completed session marker
-        yield f"data: [DONE]\n\n"
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

@@ -9,11 +9,11 @@ length carries most of the strength, and a password is also checked against
 common-password and context (email/name) lists rather than relying purely on
 character-class rules.
 """
+
 import hashlib
 import math
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 from app.core.config import settings
 
@@ -24,17 +24,72 @@ from app.core.config import settings
 #: Kept in-process deliberately: a network call in the signup path would be a
 #: latency and availability dependency on a security check.
 COMMON_PASSWORDS = {
-    "123456", "123456789", "12345678", "12345", "1234567", "1234567890",
-    "password", "password1", "password123", "passw0rd", "p@ssw0rd", "p@ssword",
-    "qwerty", "qwerty123", "qwertyuiop", "abc123", "111111", "123123",
-    "iloveyou", "admin", "administrator", "welcome", "welcome1", "monkey",
-    "letmein", "login", "dragon", "sunshine", "princess", "football",
-    "baseball", "master", "superman", "trustno1", "shadow", "michael",
-    "ashley", "qazwsx", "zaq12wsx", "starwars", "whatever", "freedom",
-    "changeme", "secret", "test123", "testing", "default", "guest",
-    "root", "toor", "pass", "pass123", "hello123", "summer2024", "winter2024",
-    "spring2024", "autumn2024", "companyname", "letmein123", "access",
-    "azerty", "1q2w3e4r", "1qaz2wsx", "qwe123", "asdfgh", "zxcvbn",
+    "123456",
+    "123456789",
+    "12345678",
+    "12345",
+    "1234567",
+    "1234567890",
+    "password",
+    "password1",
+    "password123",
+    "passw0rd",
+    "p@ssw0rd",
+    "p@ssword",
+    "qwerty",
+    "qwerty123",
+    "qwertyuiop",
+    "abc123",
+    "111111",
+    "123123",
+    "iloveyou",
+    "admin",
+    "administrator",
+    "welcome",
+    "welcome1",
+    "monkey",
+    "letmein",
+    "login",
+    "dragon",
+    "sunshine",
+    "princess",
+    "football",
+    "baseball",
+    "master",
+    "superman",
+    "trustno1",
+    "shadow",
+    "michael",
+    "ashley",
+    "qazwsx",
+    "zaq12wsx",
+    "starwars",
+    "whatever",
+    "freedom",
+    "changeme",
+    "secret",
+    "test123",
+    "testing",
+    "default",
+    "guest",
+    "root",
+    "toor",
+    "pass",
+    "pass123",
+    "hello123",
+    "summer2024",
+    "winter2024",
+    "spring2024",
+    "autumn2024",
+    "companyname",
+    "letmein123",
+    "access",
+    "azerty",
+    "1q2w3e4r",
+    "1qaz2wsx",
+    "qwe123",
+    "asdfgh",
+    "zxcvbn",
 }
 
 #: Sequences used for the "predictable pattern" check.
@@ -56,7 +111,7 @@ _REPEAT = re.compile(r"(.)\1{2,}")  # three or more identical characters
 class PasswordPolicyError(Exception):
     """Raised when a password fails policy. ``violations`` lists every reason."""
 
-    def __init__(self, violations: List[str]):
+    def __init__(self, violations: list[str]):
         self.violations = violations
         super().__init__("; ".join(violations))
 
@@ -65,10 +120,10 @@ class PasswordPolicyError(Exception):
 class PasswordStrength:
     """Result of scoring a password."""
 
-    score: int                      # 0-100
-    label: str                      # very_weak | weak | fair | strong | very_strong
+    score: int  # 0-100
+    label: str  # very_weak | weak | fair | strong | very_strong
     entropy_bits: float
-    violations: List[str] = field(default_factory=list)
+    violations: list[str] = field(default_factory=list)
 
     @property
     def is_valid(self) -> bool:
@@ -112,7 +167,7 @@ def estimate_entropy_bits(password: str) -> float:
     return round(len(password) * math.log2(_charset_size(password)), 1)
 
 
-def _context_terms(email: Optional[str], full_name: Optional[str]) -> List[str]:
+def _context_terms(email: str | None, full_name: str | None) -> list[str]:
     terms = []
     if email:
         local = email.split("@")[0]
@@ -130,15 +185,15 @@ def _context_terms(email: Optional[str], full_name: Optional[str]) -> List[str]:
 # ---------------------------------------------------------------------------
 def evaluate_password(
     password: str,
-    email: Optional[str] = None,
-    full_name: Optional[str] = None,
+    email: str | None = None,
+    full_name: str | None = None,
 ) -> PasswordStrength:
     """Evaluate a password against policy and score its strength.
 
     Never raises - returns a ``PasswordStrength`` whose ``violations`` list is
     empty when the password is acceptable.
     """
-    violations: List[str] = []
+    violations: list[str] = []
     password = password or ""
 
     if len(password) < settings.PASSWORD_MIN_LENGTH:
@@ -173,7 +228,9 @@ def evaluate_password(
     if _REPEAT.search(password):
         violations.append("Password must not contain a character repeated three or more times.")
     if _has_sequence(password):
-        violations.append("Password must not contain predictable sequences such as 'abcd' or '1234'.")
+        violations.append(
+            "Password must not contain predictable sequences such as 'abcd' or '1234'."
+        )
 
     for term in _context_terms(email, full_name):
         if term and term in normalized:
@@ -183,9 +240,7 @@ def evaluate_password(
     # --- scoring -----------------------------------------------------------
     entropy = estimate_entropy_bits(password)
     score = int(min(100, (entropy / 100) * 100))
-    classes = sum(
-        bool(rx.search(password)) for rx in (_UPPER, _LOWER, _DIGIT, _SPECIAL)
-    )
+    classes = sum(bool(rx.search(password)) for rx in (_UPPER, _LOWER, _DIGIT, _SPECIAL))
     score = int(min(100, score * 0.7 + (classes / 4) * 30))
     if violations:
         score = min(score, 40)
@@ -201,15 +256,13 @@ def evaluate_password(
     else:
         label = "very_strong"
 
-    return PasswordStrength(
-        score=score, label=label, entropy_bits=entropy, violations=violations
-    )
+    return PasswordStrength(score=score, label=label, entropy_bits=entropy, violations=violations)
 
 
 def validate_password(
     password: str,
-    email: Optional[str] = None,
-    full_name: Optional[str] = None,
+    email: str | None = None,
+    full_name: str | None = None,
 ) -> PasswordStrength:
     """Validate a password, raising ``PasswordPolicyError`` when it fails."""
     result = evaluate_password(password, email=email, full_name=full_name)

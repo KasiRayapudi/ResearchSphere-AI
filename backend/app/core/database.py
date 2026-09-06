@@ -1,9 +1,9 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
-from app.core.config import settings
-
 import logging
-import os
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+from app.core.config import settings
 
 logger = logging.getLogger("researchsphere.database")
 
@@ -24,12 +24,9 @@ except Exception as e:
     if settings.is_production:
         logger.error(f"Database connection failed and SQLite fallback is disabled: {e}")
         raise
-    logger.warning(
-        f"Database connection failed: {e}. Falling back to SQLite (development only)."
-    )
+    logger.warning(f"Database connection failed: {e}. Falling back to SQLite (development only).")
     engine = create_engine(
-        "sqlite:///./researchsphere.db",
-        connect_args={"check_same_thread": False}
+        "sqlite:///./researchsphere.db", connect_args={"check_same_thread": False}
     )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

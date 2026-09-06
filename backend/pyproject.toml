@@ -1,0 +1,136 @@
+###############################################################################
+# Tooling configuration for the ResearchSphere AI backend.
+#
+# Kept in one file so CI and a developer's machine run identical settings.
+# No build-system section: the backend is deployed as a container, not
+# published as a package.
+###############################################################################
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+# Generated and vendored trees are never formatted.
+extend-exclude = '''
+/(
+    venv
+  | \.venv
+  | __pycache__
+  | uploads
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["app"]
+skip = ["venv", ".venv", "__pycache__"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["venv", ".venv", "__pycache__", "uploads"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "UP",   # pyupgrade
+    "S",    # bandit-equivalent security rules
+    "T20",  # flake8-print: no stray print() in application code
+]
+ignore = [
+    "E501",   # line length is enforced by black
+    "B008",   # FastAPI's Depends() in defaults is the documented pattern
+    "S101",   # assert is legitimate in tests
+    "UP038",  # removed upstream; kept out of the select list
+    # S105 flags any constant whose *name* contains "token"/"secret". Every
+    # occurrence here is a claim name (TOKEN_TYPE_ACCESS = "access"), a
+    # settings field name (SECRET_KEY) or an audit action string - none are
+    # credentials. Enforced properly by the secret-scanning job instead.
+    "S105",
+    # `class X(str, Enum)` is deliberate: StrEnum changes format() semantics
+    # and these values are serialised into JSON and compared as plain strings.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Deliberate silent-failure paths: auditing, storage cleanup and the toast
+# listener must never break the request they are attached to. Each site has an
+# explanatory comment in place.
+"app/core/audit.py" = ["S110"]
+"app/core/config.py" = ["S110"]
+"app/core/middleware.py" = ["S110"]
+# Binding 0.0.0.0 is correct for a containerised dev server.
+"main.py" = ["S104"]
+# Tests may use assert, hardcoded credentials and requests without timeouts.
+"tests/*" = ["S", "T20"]
+# The CLI and seed script are meant to print to stdout.
+"app/cli/*" = ["T20"]
+"seed_data.py" = ["T20", "S"]
+"scripts_promote_admin.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+# The codebase predates type annotations; these stay off until the annotation
+# backlog is worked through, so mypy reports real errors rather than noise.
+disallow_untyped_defs = false
+check_untyped_defs = false
+exclude = ["venv/", "\\.venv/", "uploads/", "tests/"]
+
+[[tool.mypy.overrides]]
+module = ["qdrant_client.*", "sentence_transformers.*", "google.generativeai.*", "langgraph.*", "jose.*", "fitz.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-q",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "integration: exercises the app through the API (no external services required)",
+    "unit: pure unit test with no I/O",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    "venv/*",
+    "*/__pycache__/*",
+    "tests/*",
+    # Orphaned duplicate model module, kept for reference but never imported.
+    "app/models/models.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.bandit]
+exclude_dirs = ["venv", ".venv", "tests", "__pycache__"]
+# B101 assert_used: asserts are used in tests only (already excluded).
+skips = ["B101"]

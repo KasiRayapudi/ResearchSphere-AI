@@ -1,12 +1,12 @@
 """
 Structured JSON Logging with Request ID correlation for ResearchSphere AI.
 """
-import logging
+
 import json
+import logging
 import sys
-import uuid
-from datetime import datetime
 from contextvars import ContextVar
+from datetime import datetime
 
 # Context var for request ID propagation
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")

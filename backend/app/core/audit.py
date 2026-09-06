@@ -28,11 +28,13 @@ Usage::
         metadata={"method": "password"},
     )
 """
+
 import logging
 import sys
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from app.core.logging import JSONFormatter, request_id_var
 
@@ -151,9 +153,7 @@ def _looks_like_token(value: str) -> bool:
     parts = stripped.split(".")
     if len(parts) == 3 and all(parts) and len(stripped) > 60:
         # Header/payload/signature shaped and long enough to be a real JWT.
-        return all(
-            all(c.isalnum() or c in "-_=" for c in segment) for segment in parts
-        )
+        return all(all(c.isalnum() or c in "-_=" for c in segment) for segment in parts)
     return False
 
 
@@ -229,15 +229,14 @@ def _describe_actor(actor: Any) -> dict:
     try:
         return {
             "user_id": getattr(actor, "id", None),
-            "username": getattr(actor, "email", None)
-            or getattr(actor, "full_name", None),
+            "username": getattr(actor, "email", None) or getattr(actor, "full_name", None),
             "role": getattr(actor, "role", None),
         }
     except Exception:
         return {"user_id": None, "username": "<unresolvable-actor>", "role": None}
 
 
-def _client_ip_from_request(request: Any) -> Optional[str]:
+def _client_ip_from_request(request: Any) -> str | None:
     """Best-effort client IP.
 
     ``X-Forwarded-For`` is honoured only for its first entry and is
@@ -261,14 +260,14 @@ def _client_ip_from_request(request: Any) -> Optional[str]:
 def audit(
     action: "AuditAction | str",
     actor: Any = None,
-    resource: Optional[str] = None,
+    resource: str | None = None,
     outcome: "AuditOutcome | str" = AuditOutcome.SUCCESS,
     request: Any = None,
-    client_ip: Optional[str] = None,
-    request_id: Optional[str] = None,
-    http_method: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    metadata: Optional[Mapping[str, Any]] = None,
+    client_ip: str | None = None,
+    request_id: str | None = None,
+    http_method: str | None = None,
+    endpoint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> None:
     """Emit one structured audit record.
 
@@ -281,18 +280,14 @@ def audit(
     """
     try:
         action_value = action.value if isinstance(action, AuditAction) else str(action)
-        outcome_value = (
-            outcome.value if isinstance(outcome, AuditOutcome) else str(outcome)
-        )
+        outcome_value = outcome.value if isinstance(outcome, AuditOutcome) else str(outcome)
 
         actor_info = _describe_actor(actor)
 
         resolved_ip = client_ip or _client_ip_from_request(request)
         resolved_request_id = request_id or request_id_var.get("") or None
         if not resolved_request_id and request is not None:
-            resolved_request_id = getattr(
-                getattr(request, "state", None), "request_id", None
-            )
+            resolved_request_id = getattr(getattr(request, "state", None), "request_id", None)
 
         resolved_method = http_method
         resolved_endpoint = endpoint
@@ -304,7 +299,7 @@ def audit(
                 pass
 
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "action": action_value,
             "outcome": outcome_value,
             "user_id": actor_info["user_id"],

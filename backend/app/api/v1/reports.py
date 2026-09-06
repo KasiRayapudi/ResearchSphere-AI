@@ -1,40 +1,43 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+from app.agents.graph import LangGraphResearchEngine
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
-from app.models.user import User
-from app.models.workspace import Workspace
 from app.models.report import Report as ReportModel
-from app.agents.graph import LangGraphResearchEngine
-from app.core.audit import audit, AuditAction, AuditOutcome
-from typing import Optional, List
+from app.models.user import User
 
 router = APIRouter()
 engine = LangGraphResearchEngine()
 
+
 class ReportGenerateRequest(BaseModel):
     title: str
     objective: str
-    workspace_id: Optional[str] = None
-    document_ids: List[str] = []
+    workspace_id: str | None = None
+    document_ids: list[str] = []
+
 
 @router.get("")
 async def get_reports(
     request: Request,
-    workspace_id: Optional[str] = None,
+    workspace_id: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         return []
     workspace_id = ws.id
 
-    reports = db.query(ReportModel).filter(
-        ReportModel.workspace_id == workspace_id,
-        ReportModel.user_id == current_user.id
-    ).order_by(ReportModel.created_at.desc()).all()
+    reports = (
+        db.query(ReportModel)
+        .filter(ReportModel.workspace_id == workspace_id, ReportModel.user_id == current_user.id)
+        .order_by(ReportModel.created_at.desc())
+        .all()
+    )
 
     return [
         {
@@ -49,18 +52,22 @@ async def get_reports(
             "sections": [
                 {"title": "Executive Summary", "content": r.executive_summary or ""},
                 {"title": "Research Findings & Analysis", "content": r.findings or ""},
-                {"title": "Technical Assessment & Limitation", "content": r.technical_analysis or ""},
-            ]
+                {
+                    "title": "Technical Assessment & Limitation",
+                    "content": r.technical_analysis or "",
+                },
+            ],
         }
         for r in reports
     ]
+
 
 @router.post("/generate")
 async def generate_report(
     payload: ReportGenerateRequest,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(payload.workspace_id, request, db, current_user)
     if not ws:
@@ -84,9 +91,8 @@ async def generate_report(
             },
         )
         raise HTTPException(
-            status_code=500,
-            detail=f"LangGraph failed to generate report: {str(e)}"
-        )
+            status_code=500, detail=f"LangGraph failed to generate report: {str(e)}"
+        ) from e
 
     final_report_data = graph_output.get("final_report") or {}
 
@@ -98,12 +104,16 @@ async def generate_report(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact verified by Critic Agent. Confidence level: " + str(graph_output.get("confidence_score", 0.95)),
+        technical_analysis="Fact verified by Critic Agent. Confidence level: "
+        + str(graph_output.get("confidence_score", 0.95)),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
-        source_document_ids=payload.document_ids or [c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")],
+        source_document_ids=payload.document_ids
+        or [
+            c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")
+        ],
         format="pdf",
-        status="ready"
+        status="ready",
     )
     db.add(report)
     db.commit()
@@ -135,5 +145,5 @@ async def generate_report(
             {"title": "Executive Summary", "content": report.executive_summary},
             {"title": "Research Findings & Analysis", "content": report.findings},
             {"title": "Technical Assessment & Limitation", "content": report.technical_analysis},
-        ]
+        ],
     }

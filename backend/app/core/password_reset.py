@@ -11,10 +11,10 @@ Design notes:
   other outstanding token for that user.
 * Verification is constant-time via ``secrets.compare_digest`` on the digest.
 """
+
 import hashlib
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -35,8 +35,8 @@ def hash_token(raw_token: str) -> str:
 def generate_reset_token(
     db: Session,
     user_id: str,
-    requested_ip: Optional[str] = None,
-) -> Tuple[str, PasswordResetToken]:
+    requested_ip: str | None = None,
+) -> tuple[str, PasswordResetToken]:
     """Create a reset token, returning ``(raw_token, record)``.
 
     The raw token is returned exactly once, for delivery to the user. Only its
@@ -63,8 +63,7 @@ def generate_reset_token(
     record = PasswordResetToken(
         user_id=user_id,
         token_hash=hash_token(raw_token),
-        expires_at=datetime.utcnow()
-        + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_TTL_MINUTES),
+        expires_at=datetime.utcnow() + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_TTL_MINUTES),
         requested_ip=requested_ip,
     )
     db.add(record)
@@ -73,7 +72,7 @@ def generate_reset_token(
     return raw_token, record
 
 
-def verify_reset_token(db: Session, raw_token: str) -> Optional[PasswordResetToken]:
+def verify_reset_token(db: Session, raw_token: str) -> PasswordResetToken | None:
     """Return the usable token record for ``raw_token``, or ``None``.
 
     ``None`` covers unknown, expired, already-used and revoked tokens alike -
@@ -83,11 +82,7 @@ def verify_reset_token(db: Session, raw_token: str) -> Optional[PasswordResetTok
         return None
 
     digest = hash_token(raw_token)
-    record = (
-        db.query(PasswordResetToken)
-        .filter(PasswordResetToken.token_hash == digest)
-        .first()
-    )
+    record = db.query(PasswordResetToken).filter(PasswordResetToken.token_hash == digest).first()
     if record is None:
         return None
     # Constant-time comparison on the digest; the DB lookup above is the fast

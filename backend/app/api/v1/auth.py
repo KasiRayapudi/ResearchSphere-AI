@@ -1,27 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from app.core.database import get_db
+
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
-from app.core.security import (
-    create_access_token,
-    hash_password,
-    verify_password,
-    get_current_user,
-    security,
-    decode_token,
-    TOKEN_TYPE_ACCESS,
-)
-from app.core.refresh_service import (
-    issue_refresh_token,
-    revoke_all_for_user,
-    rotate_refresh_token,
-)
-from app.core.token_store import revoke_token
-from fastapi.security import HTTPAuthorizationCredentials
-from app.models.user import User
-from app.models.workspace import Workspace
-from app.core.audit import audit, AuditAction, AuditOutcome
+from app.core.database import get_db
+from app.core.exceptions import ValidationException
+from app.core.logging import get_logger
 from app.core.password_policy import (
     PasswordPolicyError,
     evaluate_password,
@@ -32,20 +18,38 @@ from app.core.password_reset import (
     generate_reset_token,
     verify_reset_token,
 )
-from app.core.exceptions import ValidationException
-from app.core.logging import get_logger
+from app.core.refresh_service import (
+    issue_refresh_token,
+    revoke_all_for_user,
+    rotate_refresh_token,
+)
+from app.core.security import (
+    TOKEN_TYPE_ACCESS,
+    create_access_token,
+    decode_token,
+    get_current_user,
+    hash_password,
+    security,
+    verify_password,
+)
+from app.core.token_store import revoke_token
+from app.models.user import User
+from app.models.workspace import Workspace
 
 router = APIRouter()
 logger = get_logger("auth")
+
 
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+
 class UserSignup(BaseModel):
     name: str
     email: EmailStr
     password: str
+
 
 class UserResponse(BaseModel):
     id: str
@@ -56,6 +60,7 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 @router.post("/login")
 async def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)):
@@ -72,8 +77,7 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
             metadata={"reason": "bad_password" if user else "unknown_email"},
         )
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password"
         )
 
     token = create_access_token({"sub": user.id, "role": user.role})
@@ -99,9 +103,11 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
             "name": user.full_name,
             "email": user.email,
             "role": user.role,
-            "avatarUrl": user.avatar_url or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
-        }
+            "avatarUrl": user.avatar_url
+            or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+        },
     }
+
 
 @router.post("/signup")
 async def signup(payload: UserSignup, request: Request, db: Session = Depends(get_db)):
@@ -117,15 +123,12 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
             metadata={"reason": "email_already_registered"},
         )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
         )
-    
+
     # Enforce the password policy before anything is persisted.
     try:
-        validate_password(
-            payload.password, email=payload.email, full_name=payload.name
-        )
+        validate_password(payload.password, email=payload.email, full_name=payload.name)
     except PasswordPolicyError as exc:
         audit(
             action=AuditAction.USER_REGISTERED,
@@ -137,16 +140,18 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
         )
         raise ValidationException(
             message="Password does not meet the security policy.",
-            details=[{"loc": ["body", "password"], "msg": v, "type": "password_policy"}
-                     for v in exc.violations],
-        )
+            details=[
+                {"loc": ["body", "password"], "msg": v, "type": "password_policy"}
+                for v in exc.violations
+            ],
+        ) from exc
 
     # Create new user
     new_user = User(
         full_name=payload.name,
         email=payload.email,
         hashed_password=hash_password(payload.password),
-        role="member"
+        role="member",
     )
     db.add(new_user)
     db.commit()
@@ -156,7 +161,7 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
     default_ws = Workspace(
         name=f"{payload.name}'s Workspace",
         description="Default workspace created automatically on sign up.",
-        owner_id=new_user.id
+        owner_id=new_user.id,
     )
     db.add(default_ws)
     db.commit()
@@ -186,9 +191,11 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
             "name": new_user.full_name,
             "email": new_user.email,
             "role": new_user.role,
-            "avatarUrl": new_user.avatar_url or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
-        }
+            "avatarUrl": new_user.avatar_url
+            or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+        },
     }
+
 
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
@@ -197,7 +204,8 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "name": current_user.full_name,
         "email": current_user.email,
         "role": current_user.role,
-        "avatarUrl": current_user.avatar_url or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+        "avatarUrl": current_user.avatar_url
+        or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
     }
 
 
@@ -309,9 +317,7 @@ async def confirm_password_reset(
         )
 
     try:
-        validate_password(
-            payload.new_password, email=user.email, full_name=user.full_name
-        )
+        validate_password(payload.new_password, email=user.email, full_name=user.full_name)
     except PasswordPolicyError as exc:
         audit(
             action=AuditAction.PASSWORD_RESET_COMPLETED,
@@ -323,9 +329,11 @@ async def confirm_password_reset(
         )
         raise ValidationException(
             message="Password does not meet the security policy.",
-            details=[{"loc": ["body", "new_password"], "msg": v, "type": "password_policy"}
-                     for v in exc.violations],
-        )
+            details=[
+                {"loc": ["body", "new_password"], "msg": v, "type": "password_policy"}
+                for v in exc.violations
+            ],
+        ) from exc
 
     if verify_password(payload.new_password, user.hashed_password):
         audit(
@@ -338,9 +346,13 @@ async def confirm_password_reset(
         )
         raise ValidationException(
             message="Password does not meet the security policy.",
-            details=[{"loc": ["body", "new_password"],
-                      "msg": "New password must differ from the current password.",
-                      "type": "password_reuse"}],
+            details=[
+                {
+                    "loc": ["body", "new_password"],
+                    "msg": "New password must differ from the current password.",
+                    "type": "password_reuse",
+                }
+            ],
         )
 
     user.hashed_password = hash_password(payload.new_password)
@@ -365,9 +377,7 @@ async def check_password_strength(payload: PasswordStrengthRequest):
 
     Lets the UI give live feedback. The password is never stored or logged.
     """
-    result = evaluate_password(
-        payload.password, email=payload.email, full_name=payload.name
-    )
+    result = evaluate_password(payload.password, email=payload.email, full_name=payload.name)
     return {
         "score": result.score,
         "label": result.label,

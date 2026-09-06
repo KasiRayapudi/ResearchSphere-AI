@@ -16,6 +16,7 @@ full, and the SHA-256 is computed in the same pass to avoid re-reading the file.
 Nothing here writes to permanent storage: uploads land in the quarantine
 directory and are promoted only after validation and scanning succeed.
 """
+
 import hashlib
 import os
 import re
@@ -24,7 +25,6 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -71,7 +71,7 @@ _DOT_RUN = re.compile(r"\.{2,}")
 _MAX_ORIGINAL_NAME = 255
 
 
-def sanitize_filename(raw: Optional[str]) -> str:
+def sanitize_filename(raw: str | None) -> str:
     """Reduce a client-supplied filename to a safe, display-only string.
 
     This value is stored as metadata and never used to build a filesystem path
@@ -91,8 +91,8 @@ def sanitize_filename(raw: Optional[str]) -> str:
     candidate = "".join(ch for ch in candidate if ch.isprintable())
 
     candidate = _UNSAFE_CHARS.sub("_", candidate)
-    candidate = _DOT_RUN.sub(".", candidate)          # defeat "..", "...."
-    candidate = candidate.strip(". ").strip()          # no leading/trailing dots
+    candidate = _DOT_RUN.sub(".", candidate)  # defeat "..", "...."
+    candidate = candidate.strip(". ").strip()  # no leading/trailing dots
 
     if not candidate:
         return "unnamed"
@@ -103,7 +103,7 @@ def sanitize_filename(raw: Optional[str]) -> str:
     return candidate
 
 
-def extract_extension(filename: Optional[str]) -> str:
+def extract_extension(filename: str | None) -> str:
     """Lowercase extension without the dot, derived from a sanitized name."""
     safe = sanitize_filename(filename)
     if "." not in safe:
@@ -142,13 +142,13 @@ def resolve_within(directory: str, filename: str) -> str:
 # Content sniffing
 # ---------------------------------------------------------------------------
 #: Signatures that must never be accepted, whatever the extension claims.
-_EXECUTABLE_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
-    (b"MZ", "windows_executable"),            # .exe / .dll
-    (b"\x7fELF", "elf_executable"),           # Linux binaries
-    (b"\xca\xfe\xba\xbe", "java_class"),      # .class / Mach-O fat
+_EXECUTABLE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"MZ", "windows_executable"),  # .exe / .dll
+    (b"\x7fELF", "elf_executable"),  # Linux binaries
+    (b"\xca\xfe\xba\xbe", "java_class"),  # .class / Mach-O fat
     (b"\xfe\xed\xfa\xce", "mach_o"),
     (b"\xfe\xed\xfa\xcf", "mach_o"),
-    (b"#!", "script_shebang"),                # .sh and friends
+    (b"#!", "script_shebang"),  # .sh and friends
     (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "ole_compound_file"),  # legacy .doc/.xls
 )
 
@@ -331,8 +331,7 @@ class ValidatedUpload:
 def validate_extension(extension: str, allowed: set) -> None:
     if not extension:
         raise UnsupportedFileTypeError(
-            message="File has no extension. Supported types: "
-            + ", ".join(sorted(allowed)),
+            message="File has no extension. Supported types: " + ", ".join(sorted(allowed)),
             reason="missing_extension",
         )
     if extension in settings.blocked_upload_extensions:
@@ -348,7 +347,7 @@ def validate_extension(extension: str, allowed: set) -> None:
         )
 
 
-def validate_content(path: str, extension: str) -> Tuple[str, str]:
+def validate_content(path: str, extension: str) -> tuple[str, str]:
     """Validate real content against the declared extension.
 
     Returns ``(detected_kind, mime_type)``.
@@ -383,8 +382,7 @@ def validate_content(path: str, extension: str) -> Tuple[str, str]:
     if kind != normalized_ext:
         raise UnsupportedFileTypeError(
             message=(
-                f"File content does not match its '.{extension}' extension "
-                f"(detected: {kind})."
+                f"File content does not match its '.{extension}' extension " f"(detected: {kind})."
             ),
             reason=f"content_mismatch:{kind}",
         )

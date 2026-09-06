@@ -1,32 +1,29 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+from app.agents.graph import LangGraphResearchEngine
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
-from app.models.user import User
-from app.models.workspace import Workspace
 from app.models.report import Report as ReportModel
-from app.models.document import Document
-from app.models.chat import ChatSession
-from app.agents.graph import LangGraphResearchEngine
-from typing import Optional, List
-import uuid
-from datetime import datetime
+from app.models.user import User
 
 router = APIRouter()
 engine = LangGraphResearchEngine()
 
+
 class StartResearchRequest(BaseModel):
     title: str
     objective: str
-    workspace_id: Optional[str] = None
+    workspace_id: str | None = None
+
 
 @router.get("")
 async def get_sessions(
     request: Request,
-    workspace_id: Optional[str] = None,
+    workspace_id: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
@@ -35,10 +32,12 @@ async def get_sessions(
 
     # For MVP, we can return generated research sessions mapped to Reports or ChatSessions
     # Or query from DB. Let's fetch from Report table since report represents a compiled agent research session!
-    reports = db.query(ReportModel).filter(
-        ReportModel.workspace_id == workspace_id,
-        ReportModel.user_id == current_user.id
-    ).order_by(ReportModel.created_at.desc()).all()
+    reports = (
+        db.query(ReportModel)
+        .filter(ReportModel.workspace_id == workspace_id, ReportModel.user_id == current_user.id)
+        .order_by(ReportModel.created_at.desc())
+        .all()
+    )
 
     return [
         {
@@ -52,21 +51,50 @@ async def get_sessions(
             "createdAt": r.created_at.isoformat(),
             "updatedAt": r.updated_at.isoformat(),
             "agentSteps": [
-                {"id": "s-1", "agentName": "Planner", "status": "completed", "task": "Decomposed objective into 4 subtasks", "executionTimeMs": 75, "timestamp": "1 min ago"},
-                {"id": "s-2", "agentName": "Retriever", "status": "completed", "task": f"Fetched references from knowledge base", "executionTimeMs": 120, "timestamp": "1 min ago"},
-                {"id": "s-3", "agentName": "Researcher", "status": "completed", "task": "Synthesized summary review", "executionTimeMs": 450, "timestamp": "Just now"},
-                {"id": "s-4", "agentName": "Critic", "status": "completed", "task": "Factual verification check passed", "executionTimeMs": 110, "timestamp": "Just now"},
-            ]
+                {
+                    "id": "s-1",
+                    "agentName": "Planner",
+                    "status": "completed",
+                    "task": "Decomposed objective into 4 subtasks",
+                    "executionTimeMs": 75,
+                    "timestamp": "1 min ago",
+                },
+                {
+                    "id": "s-2",
+                    "agentName": "Retriever",
+                    "status": "completed",
+                    "task": "Fetched references from knowledge base",
+                    "executionTimeMs": 120,
+                    "timestamp": "1 min ago",
+                },
+                {
+                    "id": "s-3",
+                    "agentName": "Researcher",
+                    "status": "completed",
+                    "task": "Synthesized summary review",
+                    "executionTimeMs": 450,
+                    "timestamp": "Just now",
+                },
+                {
+                    "id": "s-4",
+                    "agentName": "Critic",
+                    "status": "completed",
+                    "task": "Factual verification check passed",
+                    "executionTimeMs": 110,
+                    "timestamp": "Just now",
+                },
+            ],
         }
         for r in reports
     ]
+
 
 @router.post("/start")
 async def start_session(
     request: Request,
     payload: StartResearchRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(payload.workspace_id, request, db, current_user)
     if not ws:
@@ -77,13 +105,10 @@ async def start_session(
     try:
         graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LangGraph execution failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"LangGraph execution failed: {str(e)}") from e
 
     final_report_data = graph_output.get("final_report") or {}
-    
+
     # 2. Save final synthesized report in database
     report = ReportModel(
         workspace_id=workspace_id,
@@ -92,12 +117,15 @@ async def start_session(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact checked by Critic Agent. Confidence score: " + str(graph_output.get("confidence_score", 0.95)),
+        technical_analysis="Fact checked by Critic Agent. Confidence score: "
+        + str(graph_output.get("confidence_score", 0.95)),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
-        source_document_ids=[c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")],
+        source_document_ids=[
+            c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")
+        ],
         format="markdown",
-        status="ready"
+        status="ready",
     )
     db.add(report)
     db.commit()
@@ -121,8 +149,8 @@ async def start_session(
                 "status": trace.get("status"),
                 "task": trace.get("task"),
                 "executionTimeMs": trace.get("time_ms"),
-                "timestamp": "Just now"
+                "timestamp": "Just now",
             }
             for idx, trace in enumerate(graph_output.get("agent_trace", []))
-        ]
+        ],
     }

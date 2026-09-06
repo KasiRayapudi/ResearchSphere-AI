@@ -10,9 +10,9 @@ revoked, terminating the session for both the attacker and the legitimate user.
 Refresh state lives in the database, so this all keeps working when Redis is
 unavailable; Redis only accelerates access-token revocation.
 """
+
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -28,14 +28,14 @@ logger = get_logger("refresh_service")
 def issue_refresh_token(
     db: Session,
     user,
-    family_id: Optional[str] = None,
-    user_agent: Optional[str] = None,
-    client_ip: Optional[str] = None,
-) -> Tuple[str, RefreshToken]:
+    family_id: str | None = None,
+    user_agent: str | None = None,
+    client_ip: str | None = None,
+) -> tuple[str, RefreshToken]:
     """Create a refresh token and its database record."""
     token = create_refresh_token({"sub": user.id, "role": user.role})
 
-    from app.core.security import decode_token, TOKEN_TYPE_REFRESH
+    from app.core.security import TOKEN_TYPE_REFRESH, decode_token
 
     payload = decode_token(token, expected_type=TOKEN_TYPE_REFRESH)
 
@@ -43,8 +43,7 @@ def issue_refresh_token(
         user_id=user.id,
         jti=payload["jti"],
         family_id=family_id or str(uuid.uuid4()),
-        expires_at=datetime.utcnow()
-        + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
         user_agent=(user_agent or "")[:256] or None,
         client_ip=(client_ip or "")[:64] or None,
     )
@@ -117,8 +116,8 @@ class RefreshResult:
 def rotate_refresh_token(
     db: Session,
     presented_token: str,
-    user_agent: Optional[str] = None,
-    client_ip: Optional[str] = None,
+    user_agent: str | None = None,
+    client_ip: str | None = None,
 ) -> RefreshResult:
     """Validate, rotate and reissue. Detects reuse of a rotated token."""
     from app.core.security import (
@@ -148,9 +147,7 @@ def rotate_refresh_token(
 
     # --- reuse detection -------------------------------------------------
     if record.is_rotated or record.is_revoked:
-        revoked = revoke_family(
-            db, record.family_id, reason="refresh_token_reuse_detected"
-        )
+        revoked = revoke_family(db, record.family_id, reason="refresh_token_reuse_detected")
         logger.error(
             f"Refresh token reuse detected for user {record.user_id}; "
             f"revoked {revoked} token(s) in family {record.family_id}."
@@ -186,6 +183,4 @@ def rotate_refresh_token(
     db.commit()
 
     access = create_access_token({"sub": user.id, "role": user.role})
-    return RefreshResult(
-        True, access_token=access, refresh_token=new_token, user=user
-    )
+    return RefreshResult(True, access_token=access, refresh_token=new_token, user=user)

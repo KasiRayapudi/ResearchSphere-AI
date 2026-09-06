@@ -6,9 +6,9 @@ so this module never raises on connection failure: it returns ``None`` and
 records the outage. Availability is re-probed periodically rather than on every
 call, so a Redis outage does not add a connection attempt to every request.
 """
+
 import threading
 import time
-from typing import Optional
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -26,7 +26,7 @@ RETRY_INTERVAL_SECONDS = 30
 _lock = threading.Lock()
 _client = None
 _unavailable_until = 0.0
-_last_error: Optional[str] = None
+_last_error: str | None = None
 
 
 def _now() -> float:

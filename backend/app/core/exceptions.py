@@ -1,7 +1,7 @@
 """
 Application-specific exceptions with structured error response formatting.
 """
-from typing import Any, Optional, List
+
 from datetime import datetime
 
 
@@ -13,7 +13,7 @@ class AppException(Exception):
         message: str = "An unexpected error occurred",
         code: str = "INTERNAL_ERROR",
         status_code: int = 500,
-        details: Optional[List[dict]] = None,
+        details: list[dict] | None = None,
     ):
         self.message = message
         self.code = code
@@ -50,7 +50,7 @@ class AuthorizationException(AppException):
 
 
 class ValidationException(AppException):
-    def __init__(self, message: str = "Validation error", details: Optional[List[dict]] = None):
+    def __init__(self, message: str = "Validation error", details: list[dict] | None = None):
         super().__init__(
             message=message,
             code="VALIDATION_ERROR",

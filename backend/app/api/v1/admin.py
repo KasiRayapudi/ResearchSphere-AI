@@ -6,13 +6,14 @@ reports real system state - there are no hardcoded values. Where a subsystem
 genuinely does not exist yet (Celery), it is reported as ``not_configured``
 rather than being invented.
 """
-from datetime import datetime, timedelta, timezone
+
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.audit import audit, AuditAction, AuditOutcome
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import require_admin
@@ -122,7 +123,7 @@ async def get_system_stats(
             "total": db.query(Connector).count(),
             "active": db.query(Connector).filter(Connector.status == "active").count(),
         },
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "generatedAt": datetime.now(UTC).isoformat(),
     }
 
     audit(
@@ -147,11 +148,7 @@ async def list_users(
     limit = max(1, min(limit, 200))
     total = db.query(User).count()
     users = (
-        db.query(User)
-        .order_by(User.created_at.desc())
-        .offset(max(0, offset))
-        .limit(limit)
-        .all()
+        db.query(User).order_by(User.created_at.desc()).offset(max(0, offset)).limit(limit).all()
     )
 
     audit(

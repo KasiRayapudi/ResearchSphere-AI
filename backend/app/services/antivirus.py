@@ -16,9 +16,9 @@ real scanner is configured. It reports ``scanned=False`` so the upload pipeline
 can record in the audit trail that no actual scanning took place - a "clean"
 result from the no-op scanner must never be mistaken for a real verdict.
 """
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -34,8 +34,8 @@ class ScanResult:
     scanner: str
     #: False when no real scanning occurred (e.g. the no-op scanner).
     scanned: bool = False
-    threat: Optional[str] = None
-    details: Optional[str] = None
+    threat: str | None = None
+    details: str | None = None
 
     @property
     def is_infected(self) -> bool:
@@ -104,7 +104,7 @@ _SCANNERS = {
     "disabled": NoOpScanner,
 }
 
-_instance: Optional[VirusScanner] = None
+_instance: VirusScanner | None = None
 
 
 def get_scanner() -> VirusScanner:
@@ -118,9 +118,7 @@ def get_scanner() -> VirusScanner:
         configured = (getattr(settings, "VIRUS_SCANNER", "noop") or "noop").lower()
         scanner_cls = _SCANNERS.get(configured)
         if scanner_cls is None:
-            logger.warning(
-                f"Unknown VIRUS_SCANNER '{configured}'; falling back to no-op scanner."
-            )
+            logger.warning(f"Unknown VIRUS_SCANNER '{configured}'; falling back to no-op scanner.")
             scanner_cls = NoOpScanner
         _instance = scanner_cls()
         logger.info(f"Antivirus scanner initialised: {_instance.name}")

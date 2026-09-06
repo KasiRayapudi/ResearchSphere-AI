@@ -1,18 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
 from app.core.database import get_db
 from app.core.security import get_current_user, require_workspace_owner
+from app.models.document import Document
 from app.models.user import User
 from app.models.workspace import Workspace
-from app.models.document import Document
-from typing import List
 
 router = APIRouter()
+
 
 class WorkspaceCreate(BaseModel):
     name: str
     description: str | None = None
+
 
 class WorkspaceResponse(BaseModel):
     id: str
@@ -26,13 +28,13 @@ class WorkspaceResponse(BaseModel):
     class Config:
         from_attributes = True
 
-@router.get("", response_model=List[WorkspaceResponse])
+
+@router.get("", response_model=list[WorkspaceResponse])
 async def get_workspaces(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
     workspaces = db.query(Workspace).filter(Workspace.owner_id == current_user.id).all()
-    
+
     # Map to schema with counts
     result = []
     for ws in workspaces:
@@ -45,17 +47,18 @@ async def get_workspaces(
                 memberCount=1,  # Default member count for MVP
                 documentCount=doc_count,
                 role="owner",
-                createdAt=ws.created_at.strftime("%Y-%m-%d")
+                createdAt=ws.created_at.strftime("%Y-%m-%d"),
             )
         )
     return result
+
 
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
     workspace_id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Fetch a single workspace, enforcing ownership."""
     ws = require_workspace_owner(workspace_id, request, db, current_user)
@@ -70,21 +73,18 @@ async def get_workspace(
         createdAt=ws.created_at.strftime("%Y-%m-%d"),
     )
 
+
 @router.post("", response_model=WorkspaceResponse)
 async def create_workspace(
     payload: WorkspaceCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    new_ws = Workspace(
-        name=payload.name,
-        description=payload.description,
-        owner_id=current_user.id
-    )
+    new_ws = Workspace(name=payload.name, description=payload.description, owner_id=current_user.id)
     db.add(new_ws)
     db.commit()
     db.refresh(new_ws)
-    
+
     return WorkspaceResponse(
         id=new_ws.id,
         name=new_ws.name,
@@ -92,5 +92,5 @@ async def create_workspace(
         memberCount=1,
         documentCount=0,
         role="owner",
-        createdAt=new_ws.created_at.strftime("%Y-%m-%d")
+        createdAt=new_ws.created_at.strftime("%Y-%m-%d"),
     )
