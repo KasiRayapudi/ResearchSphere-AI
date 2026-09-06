@@ -75,6 +75,9 @@ class AuditAction(str, Enum):
     # Documents
     DOCUMENT_UPLOAD = "document.upload"
     DOCUMENT_DELETE = "document.delete"
+    DOCUMENT_UPLOAD_REJECTED = "document.upload.rejected"
+    DOCUMENT_DUPLICATE = "document.upload.duplicate"
+    DOCUMENT_QUARANTINE = "document.quarantine"
 
     # Reports
     REPORT_GENERATE = "report.generate"

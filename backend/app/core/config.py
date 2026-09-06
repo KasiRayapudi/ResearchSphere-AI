@@ -33,6 +33,24 @@ class Settings(BaseSettings):
     # File Storage
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
+    #: Uploads land here first and are promoted only after validation+scanning.
+    QUARANTINE_DIR: str = "./uploads/.quarantine"
+
+    # Upload security
+    #: Comma-separated allowlist. Defaults to the formats the extraction
+    #: pipeline actually supports (see app/rag/document_processor.py) - adding
+    #: an extension here without extraction support means accepting files that
+    #: fail during processing.
+    ALLOWED_UPLOAD_EXTENSIONS: str = "pdf,docx,txt,md,markdown,csv"
+    #: Always rejected, even if someone adds them to the allowlist.
+    BLOCKED_UPLOAD_EXTENSIONS: str = (
+        "exe,dll,bat,cmd,com,sh,bash,ps1,js,mjs,py,rb,pl,jar,class,msi,scr,"
+        "vbs,app,deb,rpm,so,dylib,zip,rar,7z,tar,gz,iso,img"
+    )
+    #: Reject a second upload of identical content (matched on SHA-256).
+    ENABLE_DUPLICATE_DETECTION: bool = True
+    #: Registered scanner name from app/services/antivirus.py.
+    VIRUS_SCANNER: str = "noop"
 
     # CORS
     FRONTEND_URL: str = "http://localhost:3000"
@@ -78,6 +96,20 @@ class Settings(BaseSettings):
     @property
     def redis_enabled(self) -> bool:
         return bool((self.REDIS_URL or "").strip())
+
+    @property
+    def allowed_upload_extensions(self) -> set:
+        """Allowlist minus anything on the blocklist (blocklist always wins)."""
+        allowed = {e.lower().lstrip(".") for e in self._split_csv(self.ALLOWED_UPLOAD_EXTENSIONS)}
+        return allowed - self.blocked_upload_extensions
+
+    @property
+    def blocked_upload_extensions(self) -> set:
+        return {e.lower().lstrip(".") for e in self._split_csv(self.BLOCKED_UPLOAD_EXTENSIONS)}
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return max(1, self.MAX_UPLOAD_SIZE_MB) * 1024 * 1024
 
 
 settings = Settings()

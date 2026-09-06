@@ -66,7 +66,7 @@ def extract_text(file_path: str, file_type: str) -> str:
         return text
     elif file_type == "docx":
         return extract_text_from_docx(file_path)
-    elif file_type in ("txt", "md", "markdown"):
+    elif file_type in ("txt", "md", "markdown", "csv"):
         return extract_text_from_txt(file_path)
     else:
         raise ValueError(f"Unsupported file type: {file_type}")

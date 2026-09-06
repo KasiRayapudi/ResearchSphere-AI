@@ -25,6 +25,11 @@ class Document(Base):
     file_type = Column(String(20), nullable=False)  # pdf, docx, txt, md
     file_size = Column(Integer, nullable=False)  # bytes
     file_path = Column(String(1000), nullable=False)
+    # SHA-256 of the file content: duplicate detection and integrity checks.
+    # Indexed but not unique - the same content may legitimately exist in
+    # different workspaces; uniqueness is enforced per workspace in the query.
+    content_hash = Column(String(64), nullable=True, index=True)
+    mime_type = Column(String(120), nullable=True)
     
     # Processing status
     status = Column(String(20), default="pending")  # pending, processing, indexed, failed

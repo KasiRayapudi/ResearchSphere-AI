@@ -12,11 +12,24 @@ from app.rag.embeddings import embed_texts
 from app.rag.vector_store import upsert_chunks, delete_document_vectors
 from app.core.config import settings
 from app.core.audit import audit, AuditAction, AuditOutcome
+from app.core.logging import get_logger
+from app.core.upload_security import (
+    UploadValidationError,
+    discard_quarantined,
+    extract_extension,
+    promote_from_quarantine,
+    sanitize_filename,
+    stream_to_quarantine,
+    validate_content,
+    validate_extension,
+)
+from app.services.antivirus import get_scanner
 import os
 import shutil
 from datetime import datetime
 
 router = APIRouter()
+logger = get_logger("documents")
 
 class DocumentResponse(BaseModel):
     id: str
@@ -85,32 +98,163 @@ async def upload_document(
             raise HTTPException(status_code=400, detail="Create a workspace first.")
         workspace_id = ws.id
 
-    # 2. Check upload directory
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{datetime.utcnow().timestamp()}_{file.filename}")
-    
-    # Save file locally
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    file_size = os.path.getsize(file_path)
-    ext = file.filename.split(".")[-1].lower() if file.filename else "txt"
-    
+    # 2. Security pipeline: validate -> quarantine -> scan -> promote.
+    #    Nothing reaches permanent storage until every check has passed.
+    original_name = sanitize_filename(file.filename)
+    ext = extract_extension(file.filename)
+
+    def _reject(exc: UploadValidationError):
+        """Audit and translate a validation failure into an HTTP error."""
+        logger.warning(
+            f"Upload rejected: {exc.reason} ({original_name})",
+            extra={"user_id": current_user.id, "action": "document.upload.rejected"},
+        )
+        audit(
+            action=AuditAction.DOCUMENT_UPLOAD_REJECTED,
+            actor=current_user,
+            outcome=AuditOutcome.DENIED,
+            resource="document:rejected",
+            request=request,
+            metadata={
+                "filename": original_name,
+                "extension": ext,
+                "reason": exc.reason,
+                "workspace_id": workspace_id,
+            },
+        )
+        return HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    logger.info(
+        f"Upload started: {original_name}",
+        extra={"user_id": current_user.id, "action": "document.upload.started"},
+    )
+
+    # 2a. Extension allowlist (cheap rejection before any bytes are written)
+    try:
+        validate_extension(ext, settings.allowed_upload_extensions)
+    except UploadValidationError as exc:
+        raise _reject(exc)
+
+    # 2b. Stream into quarantine, enforcing the size cap mid-write and
+    #     computing SHA-256 in the same pass.
+    try:
+        stored = await stream_to_quarantine(
+            upload_file=file,
+            quarantine_dir=settings.QUARANTINE_DIR,
+            extension=ext,
+            max_bytes=settings.max_upload_bytes,
+        )
+    except UploadValidationError as exc:
+        raise _reject(exc)
+
+    quarantine_path = stored.path
+    file_size = stored.size
+    content_hash = stored.sha256
+
+    # 2c. Content-based type validation - the declared extension and the
+    #     client Content-Type are both untrusted.
+    try:
+        detected_kind, mime_type = validate_content(quarantine_path, ext)
+    except UploadValidationError as exc:
+        discard_quarantined(quarantine_path)
+        raise _reject(exc)
+
+    # 2d. Antivirus scan while still quarantined
+    scan_result = get_scanner().scan_file(quarantine_path)
+    if scan_result.is_infected:
+        discard_quarantined(quarantine_path)
+        audit(
+            action=AuditAction.DOCUMENT_QUARANTINE,
+            actor=current_user,
+            outcome=AuditOutcome.DENIED,
+            resource="document:quarantined",
+            request=request,
+            metadata={
+                "filename": original_name,
+                "sha256": content_hash,
+                "workspace_id": workspace_id,
+                **scan_result.to_metadata(),
+            },
+        )
+        raise HTTPException(
+            status_code=400, detail="File failed the security scan and was rejected."
+        )
+
+    # 2e. Duplicate detection by content hash, scoped to the workspace
+    if settings.ENABLE_DUPLICATE_DETECTION:
+        existing = (
+            db.query(Document)
+            .filter(
+                Document.workspace_id == workspace_id,
+                Document.content_hash == content_hash,
+            )
+            .first()
+        )
+        if existing:
+            # Identical content already indexed: drop the new copy rather than
+            # re-embedding it. Returns 200 with the existing document so the
+            # upload API contract is unchanged for callers.
+            discard_quarantined(quarantine_path)
+            logger.info(
+                f"Duplicate upload ignored: {original_name} -> {existing.id}",
+                extra={"user_id": current_user.id, "action": "document.upload.duplicate"},
+            )
+            audit(
+                action=AuditAction.DOCUMENT_DUPLICATE,
+                actor=current_user,
+                outcome=AuditOutcome.SUCCESS,
+                resource=f"document:{existing.id}",
+                request=request,
+                metadata={
+                    "filename": original_name,
+                    "sha256": content_hash,
+                    "workspace_id": workspace_id,
+                    "existing_document_id": existing.id,
+                },
+            )
+            return {
+                "id": existing.id,
+                "title": existing.original_filename,
+                "fileType": existing.file_type,
+                "fileSizeKb": existing.file_size // 1024,
+                "status": existing.status,
+                "chunkCount": existing.chunk_count,
+                "tags": existing.tags or [],
+                "uploadedBy": current_user.full_name,
+                "uploadedAt": existing.created_at.isoformat(),
+                "version": existing.version,
+                "ocrApplied": existing.ocr_applied,
+                "folderPath": existing.folder_path,
+                "duplicate": True,
+                "message": "This document already exists in the workspace.",
+            }
+
+    # 2f. Validation passed - promote out of quarantine into permanent storage
+    file_path = promote_from_quarantine(quarantine_path, settings.UPLOAD_DIR)
+    logger.info(
+        f"Upload validated and stored: {original_name} "
+        f"(kind={detected_kind}, sha256={content_hash[:12]}...)",
+        extra={"user_id": current_user.id, "action": "document.upload.stored"},
+    )
+
     # 3. Create Document DB entry
     doc = Document(
         workspace_id=workspace_id,
         uploaded_by=current_user.id,
         filename=os.path.basename(file_path),
-        original_filename=file.filename or "unknown",
+        original_filename=original_name,
         file_type=ext,
         file_size=file_size,
         file_path=file_path,
+        content_hash=content_hash,
+        mime_type=mime_type,
         status="processing",
         folder_path=folder or "/Uploads",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
+    
     
     try:
         # 4. Extract and clean text
@@ -166,9 +310,11 @@ async def upload_document(
         doc.status = "failed"
         doc.error_message = str(e)
         db.commit()
-        # Clean up file on failure
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Clean up file on failure. Must never raise: on Windows an extractor
+        # that failed mid-parse can still hold the handle, and letting that
+        # PermissionError escape would mask the real processing error and
+        # bypass the audit record below.
+        discard_quarantined(file_path)
         audit(
             action=AuditAction.DOCUMENT_UPLOAD,
             actor=current_user,
@@ -178,8 +324,12 @@ async def upload_document(
             metadata={
                 "filename": doc.original_filename,
                 "file_type": ext,
+                "detected_kind": detected_kind,
+                "mime_type": mime_type,
                 "file_size": file_size,
+                "sha256": content_hash,
                 "workspace_id": workspace_id,
+                "antivirus": scan_result.to_metadata(),
                 "reason": str(e)[:200],
             },
         )
@@ -197,9 +347,13 @@ async def upload_document(
         metadata={
             "filename": doc.original_filename,
             "file_type": ext,
+            "detected_kind": detected_kind,
+            "mime_type": mime_type,
             "file_size": file_size,
+            "sha256": content_hash,
             "chunk_count": doc.chunk_count,
             "workspace_id": workspace_id,
+            "antivirus": scan_result.to_metadata(),
         },
     )
         
