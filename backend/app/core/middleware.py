@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
 from app.core.logging import request_id_var, get_logger
+from app.core.config import settings
 
 logger = get_logger("middleware")
 
@@ -69,17 +70,55 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Injects production security headers."""
+    """Injects production security headers.
+
+    All values come from configuration. Two behaviours differ by environment:
+
+    * HSTS is only sent in production. Sending it over plain HTTP in
+      development pins the browser to HTTPS for localhost and locks the
+      developer out until they clear the pin.
+    * The docs routes get a relaxed CSP, because Swagger UI and ReDoc load
+      their assets from a CDN and inline their bootstrap script. Applying the
+      strict application CSP there would leave a blank page.
+
+    ``X-XSS-Protection`` is deliberately NOT sent: it is deprecated, ignored by
+    modern browsers, and its legacy auditor introduced vulnerabilities of its
+    own. CSP replaces it.
+    """
+
+    #: Paths that need the relaxed CSP so the API documentation renders.
+    _DOCS_PATHS = ("/docs", "/redoc", "/openapi.json")
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # HSTS - uncomment when HTTPS is configured
-        # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+        if not settings.SECURITY_HEADERS_ENABLED:
+            return response
+
+        path = request.url.path
+        response.headers["X-Content-Type-Options"] = settings.HEADER_X_CONTENT_TYPE_OPTIONS
+        response.headers["X-Frame-Options"] = settings.HEADER_X_FRAME_OPTIONS
+        response.headers["Referrer-Policy"] = settings.HEADER_REFERRER_POLICY
+        response.headers["Permissions-Policy"] = settings.HEADER_PERMISSIONS_POLICY
+        response.headers["Cross-Origin-Resource-Policy"] = settings.HEADER_CROSS_ORIGIN_RESOURCE_POLICY
+        response.headers["Cross-Origin-Opener-Policy"] = settings.HEADER_CROSS_ORIGIN_OPENER_POLICY
+
+        # COEP is opt-in: require-corp breaks any cross-origin resource that
+        # does not opt in (including the docs CDN), so it stays off by default.
+        if settings.HEADER_CROSS_ORIGIN_EMBEDDER_POLICY:
+            response.headers["Cross-Origin-Embedder-Policy"] = settings.HEADER_CROSS_ORIGIN_EMBEDDER_POLICY
+
+        if path.startswith(self._DOCS_PATHS):
+            csp = settings.CSP_DOCS
+        else:
+            csp = settings.CSP_DEFAULT
+        if csp:
+            response.headers["Content-Security-Policy"] = csp
+
+        # HSTS: production only, and never over a plain-HTTP request.
+        if settings.is_production and settings.HSTS_ENABLED:
+            response.headers["Strict-Transport-Security"] = settings.hsts_value
+
         return response
 
 

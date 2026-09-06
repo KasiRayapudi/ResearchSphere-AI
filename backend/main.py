@@ -27,7 +27,7 @@ from app.core.exception_handlers import (
     generic_exception_handler,
 )
 from app.core.exceptions import AppException
-from app.core.config import settings
+from app.core.config import settings, validate_configuration, ConfigurationError
 from app.api.v1 import (
     auth_router,
     workspaces_router,
@@ -171,6 +171,23 @@ async def lifespan(app: FastAPI):
         f"Starting {settings.APP_NAME} v{settings.APP_VERSION} "
         f"(environment={settings.ENVIRONMENT})"
     )
+
+    # Configuration validation. In production a misconfiguration aborts
+    # startup; outside production the same findings are logged as warnings so
+    # local development is not blocked.
+    config_report = validate_configuration(settings)
+    for warning in config_report["warnings"]:
+        logger.warning(f"[config] {warning}")
+    if config_report["errors"]:
+        for error in config_report["errors"]:
+            logger.error(f"[config] {error}")
+        raise ConfigurationError(
+            "Refusing to start: "
+            f"{len(config_report['errors'])} invalid production configuration "
+            "setting(s): " + "; ".join(config_report["errors"])
+        )
+    if not config_report["warnings"]:
+        logger.info("[config] configuration validated")
 
     # Long-lived clients, created once and reused by the health checks
     if QdrantClient is not None:

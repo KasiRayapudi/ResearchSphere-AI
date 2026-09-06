@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
 from typing import List, Optional
 import os
 
@@ -64,6 +65,44 @@ class Settings(BaseSettings):
     # Redis (optional - Redis checks are skipped when this is blank)
     REDIS_URL: str = "redis://localhost:6379"
 
+    # ------------------------------------------------------------------
+    # Security headers (all configurable; see SecurityHeadersMiddleware)
+    # ------------------------------------------------------------------
+    SECURITY_HEADERS_ENABLED: bool = True
+    HEADER_X_CONTENT_TYPE_OPTIONS: str = "nosniff"
+    HEADER_X_FRAME_OPTIONS: str = "DENY"
+    HEADER_REFERRER_POLICY: str = "strict-origin-when-cross-origin"
+    HEADER_PERMISSIONS_POLICY: str = (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    )
+    HEADER_CROSS_ORIGIN_RESOURCE_POLICY: str = "same-site"
+    HEADER_CROSS_ORIGIN_OPENER_POLICY: str = "same-origin"
+    #: Blank by default: require-corp breaks cross-origin resources that do not
+    #: opt in, including the Swagger CDN. Enable deliberately.
+    HEADER_CROSS_ORIGIN_EMBEDDER_POLICY: str = ""
+
+    #: CSP for the API itself. The API returns JSON, so it needs almost nothing.
+    CSP_DEFAULT: str = (
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    )
+    #: CSP for /docs and /redoc, which load assets from jsdelivr and inline
+    #: their bootstrap script. A strict policy here renders a blank page.
+    CSP_DOCS: str = (
+        "default-src 'self'; "
+        "img-src 'self' data: https://fastapi.tiangolo.com; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "worker-src 'self' blob:; "
+        "frame-ancestors 'none'; base-uri 'none'"
+    )
+
+    # HSTS (production only - see SecurityHeadersMiddleware)
+    HSTS_ENABLED: bool = True
+    HSTS_MAX_AGE: int = 31536000  # 1 year
+    HSTS_INCLUDE_SUBDOMAINS: bool = True
+    HSTS_PRELOAD: bool = False
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
     @staticmethod
@@ -110,6 +149,146 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return max(1, self.MAX_UPLOAD_SIZE_MB) * 1024 * 1024
+
+    @property
+    def hsts_value(self) -> str:
+        parts = [f"max-age={self.HSTS_MAX_AGE}"]
+        if self.HSTS_INCLUDE_SUBDOMAINS:
+            parts.append("includeSubDomains")
+        if self.HSTS_PRELOAD:
+            parts.append("preload")
+        return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Startup configuration validation
+# ---------------------------------------------------------------------------
+#: Values that must never be used outside development.
+INSECURE_SECRET_DEFAULTS = {
+    "change-this-in-production-super-secret-key-32chars",
+    "super-secret-jwt-key-researchsphere-2026-prod",
+    "secret",
+    "changeme",
+}
+
+MIN_SECRET_LENGTH = 32
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when production configuration is missing or unsafe."""
+
+
+def validate_configuration(config: "Settings" = None) -> dict:
+    """Validate runtime configuration.
+
+    Returns ``{"errors": [...], "warnings": [...]}``. In production the caller
+    refuses to start when ``errors`` is non-empty; outside production the same
+    findings are surfaced as warnings so local development stays frictionless.
+    """
+    cfg = config or settings
+    errors: List[str] = []
+    warnings: List[str] = []
+    production = cfg.is_production
+
+    def fail(message: str) -> None:
+        (errors if production else warnings).append(message)
+
+    # --- JWT / application secret ---
+    secret = (cfg.SECRET_KEY or "").strip()
+    if not secret:
+        fail("SECRET_KEY is not set.")
+    elif secret in INSECURE_SECRET_DEFAULTS:
+        fail("SECRET_KEY is still set to a well-known default value.")
+    elif len(secret) < MIN_SECRET_LENGTH:
+        fail(
+            f"SECRET_KEY is too short ({len(secret)} chars); "
+            f"at least {MIN_SECRET_LENGTH} are required."
+        )
+    if cfg.ALGORITHM.upper().startswith("NONE"):
+        errors.append("JWT ALGORITHM must not be 'none'.")
+
+    # --- Gemini ---
+    if not (cfg.GEMINI_API_KEY or "").strip():
+        fail("GEMINI_API_KEY is not set; chat, research and reports will fail.")
+
+    # --- Database ---
+    db_url = (cfg.DATABASE_URL or "").strip()
+    if not db_url:
+        fail("DATABASE_URL is not set.")
+    elif db_url.startswith("sqlite"):
+        fail("DATABASE_URL points at SQLite, which is not supported in production.")
+    elif production and ("@localhost" in db_url or "@127.0.0.1" in db_url):
+        warnings.append("DATABASE_URL points at localhost in production.")
+
+    # --- Redis (optional, but must be well-formed when configured) ---
+    redis_url = (cfg.REDIS_URL or "").strip()
+    if redis_url and not redis_url.startswith(("redis://", "rediss://", "unix://")):
+        fail(f"REDIS_URL has an unsupported scheme: {redis_url.split(':', 1)[0]!r}")
+    if production and not redis_url:
+        warnings.append(
+            "REDIS_URL is empty: rate limiting falls back to per-process "
+            "in-memory counters and token revocation is disabled."
+        )
+
+    # --- Qdrant ---
+    if not (cfg.QDRANT_HOST or "").strip():
+        fail("QDRANT_HOST is not set.")
+    if not (1 <= int(cfg.QDRANT_PORT) <= 65535):
+        fail(f"QDRANT_PORT is out of range: {cfg.QDRANT_PORT}")
+    if not (cfg.QDRANT_COLLECTION or "").strip():
+        fail("QDRANT_COLLECTION is not set.")
+
+    # --- CORS origins ---
+    origins = cfg.cors_origins
+    if not origins:
+        fail("No CORS origins configured; the frontend will be blocked.")
+    if "*" in origins:
+        fail("Wildcard CORS origin '*' is not permitted in production.")
+    for origin in origins:
+        if origin != "*" and not origin.startswith(("http://", "https://")):
+            fail(f"CORS origin is not a valid URL: {origin!r}")
+        if production and origin.startswith("http://"):
+            warnings.append(f"CORS origin uses plain HTTP in production: {origin}")
+
+    # --- Trusted hosts ---
+    hosts = cfg.trusted_hosts
+    if not hosts:
+        fail("No TRUSTED_HOSTS configured.")
+    if production and "*" in hosts:
+        errors.append("Wildcard TRUSTED_HOSTS '*' is not permitted in production.")
+
+    # --- Upload paths ---
+    for label, path_value in (
+        ("UPLOAD_DIR", cfg.UPLOAD_DIR),
+        ("QUARANTINE_DIR", cfg.QUARANTINE_DIR),
+    ):
+        if not (path_value or "").strip():
+            fail(f"{label} is not set.")
+            continue
+        try:
+            resolved = Path(path_value).resolve()
+            resolved.mkdir(parents=True, exist_ok=True)
+            probe = resolved / ".config_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception as exc:
+            fail(f"{label} ({path_value}) is not writable: {exc}")
+    try:
+        if Path(cfg.QUARANTINE_DIR).resolve() == Path(cfg.UPLOAD_DIR).resolve():
+            fail("QUARANTINE_DIR must not be the same directory as UPLOAD_DIR.")
+    except Exception:
+        pass
+
+    if cfg.MAX_UPLOAD_SIZE_MB <= 0:
+        fail(f"MAX_UPLOAD_SIZE_MB must be positive (got {cfg.MAX_UPLOAD_SIZE_MB}).")
+    if not cfg.allowed_upload_extensions:
+        fail("ALLOWED_UPLOAD_EXTENSIONS is empty; every upload would be rejected.")
+
+    # --- Misc production hygiene ---
+    if production and cfg.DEBUG:
+        errors.append("DEBUG must be disabled in production.")
+
+    return {"errors": errors, "warnings": warnings}
 
 
 settings = Settings()
