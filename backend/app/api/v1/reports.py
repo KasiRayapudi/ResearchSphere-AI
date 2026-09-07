@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -75,9 +76,20 @@ async def generate_report(
         raise HTTPException(status_code=400, detail="Workspace required")
     workspace_id = ws.id
 
-    # 1. Run RAG and LangGraph agent workflow to synthesize the report contents
+    # 1. Run RAG and LangGraph agent workflow to synthesize the report contents.
+    #
+    # run_graph is synchronous and does network I/O (vector search, Gemini).
+    # Calling it directly from this async handler blocked the event loop for
+    # the whole run and, because the retriever needs its own loop, made
+    # retrieval raise on every request. Offloading to a worker thread fixes
+    # both: other requests keep being served and the retriever works.
     try:
-        graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
+        graph_output = await run_in_threadpool(
+            engine.run_graph,
+            payload.objective,
+            workspace_id=workspace_id,
+            document_ids=payload.document_ids or None,
+        )
     except Exception as e:
         audit(
             action=AuditAction.REPORT_GENERATE,
@@ -106,8 +118,18 @@ async def generate_report(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact verified by Critic Agent. Confidence level: "
-        + str(graph_output.get("confidence_score", 0.95)),
+        # Report what the critic actually concluded. The previous text asserted
+        # "Fact verified" unconditionally and defaulted the score to 0.95, so a
+        # run with no evidence still claimed high confidence.
+        technical_analysis=(
+            (
+                "Critic agent verified the synthesis against retrieved sources. "
+                if graph_output.get("critic_verified")
+                else "Critic agent could not verify the synthesis against retrieved sources. "
+            )
+            + f"Confidence level: {graph_output.get('confidence_score', 0.0)}. "
+            + f"Supporting chunks retrieved: {len(graph_output.get('retrieved_chunks') or [])}."
+        ),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
         source_document_ids=payload.document_ids

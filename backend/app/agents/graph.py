@@ -1,9 +1,13 @@
+import asyncio
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.state import AgentState
+from app.core.logging import get_logger
 from app.rag.pipeline import get_rag_response
+
+logger = get_logger("agents")
 
 
 class PlannerAgent:
@@ -40,29 +44,33 @@ class RetrieverAgent:
         obj = state["research_objective"]
         trace = state.get("agent_trace", [])
 
-        # Call RAG pipeline similarity search (returns chunks & citations)
-        # Assuming workspace default "ws-1" or workspace_id inside objective/payload
-        # For simplicity, we search all documents of the user
-        import asyncio
+        workspace_id = state.get("workspace_id")
+        if not workspace_id:
+            # Retrieving without a tenant scope would search another
+            # workspace's documents, so refuse rather than guess.
+            raise ValueError("RetrieverAgent requires workspace_id in the graph state")
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            rag_output = loop.run_until_complete(get_rag_response(obj, workspace_id="ws-1"))
-        except Exception:
-            rag_output = {"sources": [], "response_time_ms": 100}
-        finally:
-            loop.close()
+        # get_rag_response is async and the graph runs synchronously. The graph
+        # itself is invoked from a worker thread (see reports.generate_report),
+        # so this thread owns no event loop and asyncio.run is safe here.
+        rag_output = asyncio.run(
+            get_rag_response(
+                obj,
+                workspace_id=workspace_id,
+                document_ids=state.get("document_ids") or None,
+            )
+        )
 
+        sources = rag_output.get("sources", [])
         trace.append(
             {
                 "agent": "Retriever",
-                "task": f"Retrieved {len(rag_output.get('sources', []))} document chunks from Qdrant vector store",
-                "status": "completed",
-                "time_ms": rag_output.get("response_time_ms", 120),
+                "task": f"Retrieved {len(sources)} document chunks from the vector store",
+                "status": "completed" if sources else "no_results",
+                "time_ms": rag_output.get("response_time_ms", 0),
             }
         )
-        return {"retrieved_chunks": rag_output.get("sources", []), "agent_trace": trace}
+        return {"retrieved_chunks": sources, "agent_trace": trace}
 
 
 class ResearcherAgent:
@@ -81,12 +89,36 @@ class ResearcherAgent:
         context_str = "\n\n".join([c.get("content", "") for c in chunks])
         prompt = f"Analyze the following objective: {obj}\n\nUsing this context:\n{context_str}\n\nProvide a comprehensive research synthesis."
 
+        if not chunks:
+            # No evidence retrieved. Saying so is the honest result; asking the
+            # model to write a synthesis anyway produces confident invention.
+            trace.append(
+                {
+                    "agent": "Researcher",
+                    "task": "No source material retrieved; synthesis skipped",
+                    "status": "no_results",
+                    "time_ms": 0,
+                }
+            )
+            return {
+                "synthesized_summary": (
+                    "No documents in this workspace matched the research objective, "
+                    "so no synthesis could be produced. Upload relevant sources and "
+                    "run the report again."
+                ),
+                "agent_trace": trace,
+            }
+
         try:
             model = genai.GenerativeModel("gemini-1.5-flash")
             response = model.generate_content(prompt)
             summary = response.text
-        except Exception:
-            summary = f"Synthesized draft: Critical review on objective '{obj}' using retrieved document source context."
+        except Exception as exc:
+            # Previously this fell back to a canned sentence that read like a
+            # real synthesis. Surfacing the failure lets the route return 500
+            # and audit it rather than persisting a fabricated report.
+            logger.error(f"Researcher synthesis failed: {exc}", exc_info=True)
+            raise RuntimeError(f"Research synthesis failed: {exc}") from exc
 
         trace.append(
             {
@@ -101,12 +133,20 @@ class ResearcherAgent:
 
 class CriticAgent:
     def execute(self, state: AgentState) -> dict[str, Any]:
-        summary = state.get("synthesized_summary", "")
+        summary = state.get("synthesized_summary", "") or ""
+        chunks = state.get("retrieved_chunks", [])
         trace = state.get("agent_trace", [])
 
-        # Check factual consistency (mock checking or simple checks)
-        verified = len(summary) > 50
-        confidence = 0.95 if verified else 0.40
+        # Confidence is derived from the retrieval evidence that actually backs
+        # the summary: how many chunks were found and how well they matched.
+        # A fixed 0.95 told the reader nothing and was wrong whenever retrieval
+        # returned little or nothing.
+        scores = [c.get("score", 0.0) or 0.0 for c in chunks]
+        mean_score = sum(scores) / len(scores) if scores else 0.0
+        # Full evidence weight at five or more supporting chunks.
+        coverage = min(len(chunks), 5) / 5
+        verified = bool(chunks) and len(summary) > 50
+        confidence = round(mean_score * coverage, 2) if verified else 0.0
 
         trace.append(
             {
@@ -130,7 +170,9 @@ class CitationAgent:
                 {
                     "id": f"cit-{idx+1}",
                     "document_id": c.get("document_id"),
-                    "excerpt": c.get("content")[:150] + "...",
+                    # content can be absent on a malformed payload; indexing
+                    # None here previously raised inside the graph.
+                    "excerpt": (c.get("content") or "")[:150] + "...",
                     "page": c.get("page_number", 1),
                     "score": c.get("score", 0.95),
                 }
@@ -206,9 +248,29 @@ research_graph = workflow.compile()
 
 
 class LangGraphResearchEngine:
-    def run_graph(self, research_objective: str, workspace_id: str = "ws-1") -> dict[str, Any]:
+    def run_graph(
+        self,
+        research_objective: str,
+        workspace_id: str,
+        document_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Run the research graph for one workspace.
+
+        ``workspace_id`` is required and has no default: the previous "ws-1"
+        default meant every report retrieved from one fixed workspace whatever
+        the caller's tenant was.
+
+        Blocking: the compiled graph runs synchronously and performs network
+        I/O. Call it from a worker thread (``run_in_threadpool``), never
+        directly from an async request handler.
+        """
+        if not workspace_id:
+            raise ValueError("run_graph requires a workspace_id")
+
         inputs = {
             "research_objective": research_objective,
+            "workspace_id": workspace_id,
+            "document_ids": document_ids or [],
             "subtasks": [],
             "collected_sources": [],
             "retrieved_chunks": [],
