@@ -16,7 +16,13 @@ httpx==0.27.2
 
 # Security scanning
 bandit[toml]==1.8.0
-pip-audit==2.7.3
+# 2.8.0, not 2.7.3: both this and cyclonedx-bom below depend on
+# cyclonedx-python-lib, and 2.7.3 caps it at <8 while cyclonedx-bom 5.x
+# requires >=8. There is no version of cyclonedx-python-lib satisfying both,
+# so pip fails with ResolutionImpossible. 2.8.0 widens the cap to <9, which
+# overlaps cyclonedx-bom's >=8,<9 at 8.x. Keep these two in step when bumping
+# either of them.
+pip-audit==2.8.0
 
 # Supply chain
 cyclonedx-bom==5.1.1
