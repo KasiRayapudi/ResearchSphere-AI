@@ -116,8 +116,6 @@ omit = [
     "venv/*",
     "*/__pycache__/*",
     "tests/*",
-    # Orphaned duplicate model module, kept for reference but never imported.
-    "app/models/models.py",
 ]
 
 [tool.coverage.report]

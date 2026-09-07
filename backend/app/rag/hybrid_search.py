@@ -2,9 +2,13 @@ from typing import Any
 
 
 class HybridSearchEngine:
-    """
-    Combines Dense Vector Cosine Similarity with Sparse BM25 Keyword Search
-    using Reciprocal Rank Fusion (RRF).
+    """Reciprocal Rank Fusion over dense and sparse result lists.
+
+    NOTE: this is not currently wired into the retrieval path. app/rag/pipeline
+    performs dense-only search via vector_store.search_similar, and no BM25
+    sparse index exists yet. The fusion logic below is correct and tested, and
+    is kept for when a sparse index is added - but retrieval today is dense
+    only, whatever the product copy says.
     """
 
     def __init__(self, rrf_k: int = 60):
