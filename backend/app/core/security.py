@@ -7,6 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
+from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
 from app.core.database import get_db
@@ -253,6 +254,7 @@ def require_role(*roles: str):
         user_role = (getattr(current_user, "role", "") or "").lower()
         if user_role in required or role_rank(user_role) >= minimum:
             return current_user
+        metrics.safe(metrics.authz_denials_total.labels(reason="missing_role").inc)
         audit(
             action=AuditAction.PERMISSION_DENIED,
             actor=current_user,
@@ -277,6 +279,7 @@ def require_admin(
     user_role = (getattr(current_user, "role", "") or "").lower()
     if role_rank(user_role) >= ROLE_RANKS["admin"]:
         return current_user
+    metrics.safe(metrics.authz_denials_total.labels(reason="not_admin").inc)
     audit(
         action=AuditAction.PERMISSION_DENIED,
         actor=current_user,
@@ -317,6 +320,7 @@ def require_workspace_owner(
             and role_rank((getattr(current_user, "role", "") or "").lower()) >= ROLE_RANKS["admin"]
         ):
             return workspace
+        metrics.safe(metrics.authz_denials_total.labels(reason="workspace_isolation").inc)
         audit(
             action=AuditAction.PERMISSION_DENIED,
             actor=current_user,

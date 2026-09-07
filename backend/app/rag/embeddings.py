@@ -5,6 +5,8 @@ Model: all-MiniLM-L6-v2 (384 dimensions, fast, high quality)
 
 import logging
 
+from app.core import metrics
+
 logger = logging.getLogger(__name__)
 
 _model = None
@@ -29,12 +31,16 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     model = get_embedding_model()
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+    metrics.safe(metrics.embedding_batch_size.observe, len(texts))
+    with metrics.track_duration(metrics.embedding_duration_seconds):
+        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
     return embeddings.tolist()
 
 
 def embed_query(query: str) -> list[float]:
     """Generate embedding for a single query string."""
     model = get_embedding_model()
-    embedding = model.encode([query], show_progress_bar=False)
+    metrics.safe(metrics.embedding_batch_size.observe, 1)
+    with metrics.track_duration(metrics.embedding_duration_seconds):
+        embedding = model.encode([query], show_progress_bar=False)
     return embedding[0].tolist()

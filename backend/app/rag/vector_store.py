@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import Any
 
+from app.core import metrics
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -109,13 +110,18 @@ def search_similar(
 
     search_filter = Filter(must=must_conditions)
 
-    results = client.search(
-        collection_name=settings.QDRANT_COLLECTION,
-        query_vector=query_embedding,
-        query_filter=search_filter,
-        limit=top_k,
-        with_payload=True,
-    )
+    with metrics.track_duration(metrics.retrieval_duration_seconds):
+        results = client.search(
+            collection_name=settings.QDRANT_COLLECTION,
+            query_vector=query_embedding,
+            query_filter=search_filter,
+            limit=top_k,
+            with_payload=True,
+        )
+
+    # A spike at zero here means retrieval is finding nothing and answers are
+    # ungrounded - the single most useful RAG health signal.
+    metrics.safe(metrics.retrieval_results.observe, len(results))
 
     return [
         {

@@ -18,7 +18,10 @@ class TestHealthEndpoints:
 
     def test_health_reports_every_dependency(self, client):
         body = client.get("/api/health").json()
-        assert set(body["checks"]) == {"database", "qdrant", "redis", "gemini", "storage"}
+        # Milestone 3 added disk and memory to the same check map.
+        assert {"database", "qdrant", "redis", "gemini", "storage", "disk", "memory"} == set(
+            body["checks"]
+        )
         assert body["checks"]["database"] == "ok"
         assert "uptime_seconds" in body
         assert "version" in body

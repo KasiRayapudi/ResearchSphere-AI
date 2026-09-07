@@ -3,6 +3,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
+from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
 from app.core.database import get_db
@@ -76,6 +77,12 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
             request=request,
             metadata={"reason": "bad_password" if user else "unknown_email"},
         )
+        metrics.safe(metrics.auth_attempts_total.labels(action="login", outcome="failure").inc)
+        metrics.safe(
+            metrics.auth_failures_total.labels(
+                action="login", reason="bad_password" if user else "unknown_email"
+            ).inc
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password"
         )
@@ -87,6 +94,7 @@ async def login(payload: UserLogin, request: Request, db: Session = Depends(get_
         user_agent=request.headers.get("User-Agent"),
         client_ip=request.client.host if request.client else None,
     )
+    metrics.safe(metrics.auth_attempts_total.labels(action="login", outcome="success").inc)
     audit(
         action=AuditAction.LOGIN_SUCCESS,
         actor=user,
@@ -166,6 +174,7 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
     db.add(default_ws)
     db.commit()
 
+    metrics.safe(metrics.auth_attempts_total.labels(action="signup", outcome="success").inc)
     audit(
         action=AuditAction.USER_REGISTERED,
         actor=new_user,
@@ -414,6 +423,10 @@ async def refresh_access_token(
     )
 
     if result.reuse_detected:
+        metrics.safe(metrics.token_refresh_reuse_total.inc)
+        metrics.safe(
+            metrics.auth_attempts_total.labels(action="refresh", outcome="reuse_detected").inc
+        )
         audit(
             action=AuditAction.TOKEN_REUSE_DETECTED,
             outcome=AuditOutcome.DENIED,
@@ -442,6 +455,7 @@ async def refresh_access_token(
             detail="Invalid or expired refresh token.",
         )
 
+    metrics.safe(metrics.auth_attempts_total.labels(action="refresh", outcome="success").inc)
     audit(
         action=AuditAction.TOKEN_REFRESHED,
         actor=result.user,
@@ -469,6 +483,7 @@ async def logout(
     blacklisted = revoke_token(payload.get("jti"), payload.get("exp"))
     revoked = revoke_all_for_user(db, current_user.id, reason="logout")
 
+    metrics.safe(metrics.auth_attempts_total.labels(action="logout", outcome="success").inc)
     audit(
         action=AuditAction.LOGOUT,
         actor=current_user,

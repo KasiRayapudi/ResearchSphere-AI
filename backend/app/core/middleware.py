@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from app.core import metrics
 from app.core.config import settings
 from app.core.logging import get_logger, request_id_var
 from app.core.redis_client import get_redis, mark_unavailable
@@ -255,4 +256,116 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
         response.headers["X-RateLimit-Limit"] = str(max_rpm)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         response.headers["X-RateLimit-Backend"] = backend
+        return response
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Records Prometheus metrics for every request.
+
+    Labels use the matched route template rather than the raw path. Labelling
+    ``/api/v1/documents/{id}`` by its concrete URL would mint a new time series
+    per document and make the metrics store unusable, so unmatched paths
+    collapse to a single ``<unmatched>`` bucket.
+
+    Instrumentation failures are swallowed: metrics must never be the reason a
+    request fails.
+    """
+
+    #: Excluded from metrics, and from the slow-request warning, because an
+    #: orchestrator polls them constantly and they carry no useful signal.
+    _EXCLUDED = frozenset(
+        {"/api/live", "/live", "/metrics", "/api/health", "/health", "/api/ready", "/ready"}
+    )
+
+    @staticmethod
+    def _route_template(request: Request) -> str:
+        route = request.scope.get("route")
+        template = getattr(route, "path", None)
+        return template or "<unmatched>"
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in self._EXCLUDED:
+            return await call_next(request)
+
+        method = request.method
+        started = time.perf_counter()
+        in_progress = None
+
+        try:
+            content_length = request.headers.get("content-length")
+            if content_length and content_length.isdigit():
+                # Recorded against the raw path here; the route is not matched
+                # until the request has been routed.
+                request.state.metrics_request_size = int(content_length)
+        except Exception:
+            pass
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            route = self._route_template(request)
+            metrics.safe(
+                metrics.http_exceptions_total.labels(
+                    method=method, route=route, exception=type(exc).__name__
+                ).inc
+            )
+            metrics.safe(
+                metrics.http_requests_total.labels(
+                    method=method, route=route, status_class="5xx", status="500"
+                ).inc
+            )
+            raise
+        finally:
+            if in_progress is not None:
+                metrics.safe(in_progress.dec)
+
+        elapsed = time.perf_counter() - started
+        route = self._route_template(request)
+        status = response.status_code
+
+        metrics.safe(
+            metrics.http_requests_total.labels(
+                method=method,
+                route=route,
+                status_class=f"{status // 100}xx",
+                status=str(status),
+            ).inc
+        )
+        metrics.safe(
+            metrics.http_request_duration_seconds.labels(method=method, route=route).observe,
+            elapsed,
+        )
+
+        size = getattr(request.state, "metrics_request_size", None)
+        if size:
+            metrics.safe(
+                metrics.http_request_size_bytes.labels(method=method, route=route).observe,
+                size,
+            )
+
+        if status == 429:
+            tier = "auth" if "/auth/" in request.url.path.lower() else "default"
+            metrics.safe(
+                metrics.rate_limit_rejections_total.labels(
+                    tier=tier, backend=response.headers.get("X-RateLimit-Backend", "unknown")
+                ).inc
+            )
+
+        # A slow request is worth a log line as well as a histogram bucket: the
+        # histogram says "something was slow", the log says which request.
+        threshold = settings.SLOW_REQUEST_THRESHOLD_MS / 1000.0
+        if elapsed > threshold:
+            metrics.safe(metrics.http_slow_requests_total.labels(method=method, route=route).inc)
+            logger.warning(
+                f"Slow request: {method} {request.url.path} took {elapsed * 1000:.0f}ms",
+                extra={
+                    "duration_ms": round(elapsed * 1000, 2),
+                    "status_code": status,
+                    "request_id": getattr(request.state, "request_id", ""),
+                    "route": route,
+                    "slow_request": True,
+                },
+            )
+
+        response.headers["X-Response-Time-Ms"] = f"{elapsed * 1000:.1f}"
         return response

@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.agents.graph import LangGraphResearchEngine
+from app.core import metrics
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
 from app.models.report import Report as ReportModel
@@ -105,6 +106,7 @@ async def start_session(
     try:
         graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
     except Exception as e:
+        metrics.safe(metrics.research_sessions_total.labels(outcome="failed").inc)
         raise HTTPException(status_code=500, detail=f"LangGraph execution failed: {str(e)}") from e
 
     final_report_data = graph_output.get("final_report") or {}
@@ -130,6 +132,7 @@ async def start_session(
     db.add(report)
     db.commit()
     db.refresh(report)
+    metrics.safe(metrics.research_sessions_total.labels(outcome="success").inc)
 
     # 3. Return payload mapping visual agent graph steps
     return {

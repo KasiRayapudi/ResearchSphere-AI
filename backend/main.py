@@ -1,8 +1,10 @@
+import hmac
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -23,6 +25,7 @@ from app.api.v1 import (
     research_router,
     workspaces_router,
 )
+from app.core import metrics
 from app.core.config import ConfigurationError, settings, validate_configuration
 from app.core.database import Base, engine
 from app.core.exception_handlers import (
@@ -35,6 +38,7 @@ from app.core.exceptions import AppException
 from app.core.logging import get_logger, setup_logging
 from app.core.middleware import (
     LoggingMiddleware,
+    MetricsMiddleware,
     RateLimitingMiddleware,
     RequestIDMiddleware,
     SecurityHeadersMiddleware,
@@ -130,20 +134,79 @@ def check_storage() -> str:
         return "failed"
 
 
+def check_resources() -> dict:
+    """Sample disk and memory, and report them against the warning thresholds.
+
+    Returns a status map plus the raw measurements, so the health endpoints can
+    show numbers rather than only a verdict.
+    """
+    sample = metrics.collect_process_metrics()
+    detail = {"measurements": sample}
+
+    disk_percent = sample.get("disk_usage_percent")
+    if disk_percent is None:
+        detail["disk"] = "unavailable"
+    elif disk_percent >= settings.DISK_USAGE_WARN_PERCENT:
+        detail["disk"] = "degraded"
+        logger.warning(
+            f"Disk usage {disk_percent:.1f}% is at or above the "
+            f"{settings.DISK_USAGE_WARN_PERCENT}% threshold"
+        )
+    else:
+        detail["disk"] = "ok"
+
+    memory_percent = sample.get("system_memory_percent")
+    if memory_percent is None:
+        detail["memory"] = "unavailable"
+    elif memory_percent >= settings.MEMORY_USAGE_WARN_PERCENT:
+        detail["memory"] = "degraded"
+        logger.warning(
+            f"System memory {memory_percent:.1f}% is at or above the "
+            f"{settings.MEMORY_USAGE_WARN_PERCENT}% threshold"
+        )
+    else:
+        detail["memory"] = "ok"
+
+    return detail
+
+
 def collect_checks() -> dict:
-    """Run every dependency check and return a status map."""
-    return {
-        "database": check_database(),
-        "qdrant": check_qdrant(),
-        "redis": check_redis(),
-        "gemini": check_gemini(),
-        "storage": check_storage(),
-    }
+    """Run every dependency check and return a status map.
+
+    Each probe is timed and mirrored into Prometheus so dependency
+    availability is queryable historically, not just at the moment a probe is
+    called.
+    """
+    checks = {}
+    for name, probe in (
+        ("database", check_database),
+        ("qdrant", check_qdrant),
+        ("redis", check_redis),
+        ("gemini", check_gemini),
+        ("storage", check_storage),
+    ):
+        started = time.perf_counter()
+        status = probe()
+        metrics.safe(metrics.observe_dependency, name, status, time.perf_counter() - started)
+        checks[name] = status
+
+    resources = check_resources()
+    checks["disk"] = resources["disk"]
+    checks["memory"] = resources["memory"]
+    return checks
 
 
-# Statuses that do not block readiness. "missing"/"disabled"/"unavailable" mean
-# an optional dependency is simply not configured, which is not a failure.
+# Statuses that count as healthy for reporting. "missing"/"disabled"/
+# "unavailable" mean an optional dependency is simply not configured, which is
+# not a failure.
 _HEALTHY_STATUSES = {"ok", "configured", "disabled", "unavailable"}
+
+# Statuses that do not block readiness. Resource pressure is deliberately
+# included: a disk at 85% or memory at 90% is worth warning about, but failing
+# readiness would pull the instance out of the load balancer and concentrate
+# the same traffic onto fewer instances - making the incident worse. /api/health
+# still reports it as degraded so it is visible and alertable.
+_READY_STATUSES = _HEALTHY_STATUSES | {"degraded"}
 
 
 def uptime_seconds() -> float:
@@ -289,6 +352,11 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
     # 3. Structured logging
     app.add_middleware(LoggingMiddleware)
+    # 3b. Metrics. Registered inside RequestIDMiddleware so slow-request
+    # warnings carry the correlation id, and outside routing so the matched
+    # route template is available for low-cardinality labels.
+    if settings.METRICS_ENABLED:
+        app.add_middleware(MetricsMiddleware)
     # 4. Security headers
     app.add_middleware(SecurityHeadersMiddleware)
     # 5. Rate limiting
@@ -369,7 +437,7 @@ def create_app() -> FastAPI:
     async def ready():
         """Readiness probe - 503 when a required dependency is unavailable."""
         checks = await run_in_threadpool(collect_checks)
-        failed = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
+        failed = [n for n, s in checks.items() if s not in _READY_STATUSES]
         payload = {
             "status": "unavailable" if failed else "ready",
             "version": settings.APP_VERSION,
@@ -380,6 +448,30 @@ def create_app() -> FastAPI:
             payload["failed"] = failed
             logger.warning(f"Readiness probe failed: {', '.join(failed)}")
         return JSONResponse(status_code=503 if failed else 200, content=payload)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(request: Request):
+        """Prometheus exposition endpoint.
+
+        Optionally bearer-protected via METRICS_TOKEN. In most deployments the
+        route is instead restricted at the reverse proxy, which is why the
+        token is off by default rather than a mandatory secret.
+        """
+        if not settings.METRICS_ENABLED:
+            return JSONResponse(status_code=404, content={"detail": "Metrics are disabled"})
+
+        if settings.METRICS_TOKEN:
+            supplied = request.headers.get("Authorization", "")
+            expected = f"Bearer {settings.METRICS_TOKEN}"
+            # Constant-time comparison: this guards a scrape credential.
+            if not hmac.compare_digest(supplied, expected):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        # Refresh the gauges that are sampled rather than incremented.
+        metrics.safe(metrics.collect_process_metrics)
+        metrics.safe(metrics.set_app_info)
+        payload = await run_in_threadpool(metrics.render)
+        return Response(content=payload, media_type=metrics.CONTENT_TYPE)
 
     # Legacy unprefixed aliases - kept so existing probes keep working.
     app.add_api_route("/health", health, methods=["GET"], include_in_schema=False)

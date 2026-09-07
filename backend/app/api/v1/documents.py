@@ -1,10 +1,12 @@
 import os
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
 from app.core.database import get_db
@@ -102,6 +104,7 @@ async def upload_document(
 
     # 2. Security pipeline: validate -> quarantine -> scan -> promote.
     #    Nothing reaches permanent storage until every check has passed.
+    upload_started = time.perf_counter()
     original_name = sanitize_filename(file.filename)
     ext = extract_extension(file.filename)
 
@@ -124,6 +127,8 @@ async def upload_document(
                 "workspace_id": workspace_id,
             },
         )
+        metrics.safe(metrics.uploads_total.labels(outcome="rejected").inc)
+        metrics.safe(metrics.upload_rejections_total.labels(reason=exc.reason).inc)
         return HTTPException(status_code=exc.status_code, detail=exc.message)
 
     logger.info(
@@ -178,6 +183,7 @@ async def upload_document(
                 **scan_result.to_metadata(),
             },
         )
+        metrics.safe(metrics.uploads_total.labels(outcome="quarantined").inc)
         raise HTTPException(
             status_code=400, detail="File failed the security scan and was rejected."
         )
@@ -214,6 +220,7 @@ async def upload_document(
                     "existing_document_id": existing.id,
                 },
             )
+            metrics.safe(metrics.uploads_total.labels(outcome="duplicate").inc)
             return {
                 "id": existing.id,
                 "title": existing.original_filename,
@@ -315,6 +322,7 @@ async def upload_document(
         # PermissionError escape would mask the real processing error and
         # bypass the audit record below.
         discard_quarantined(file_path)
+        metrics.safe(metrics.uploads_total.labels(outcome="failed").inc)
         audit(
             action=AuditAction.DOCUMENT_UPLOAD,
             actor=current_user,
@@ -335,6 +343,11 @@ async def upload_document(
         )
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}") from e
 
+    metrics.safe(metrics.uploads_total.labels(outcome="accepted").inc)
+    metrics.safe(metrics.documents_indexed_total.inc)
+    metrics.safe(metrics.document_chunks_total.inc, doc.chunk_count or 0)
+    metrics.safe(metrics.upload_size_bytes.labels(file_type=ext).observe, file_size)
+    metrics.safe(metrics.upload_duration_seconds.observe, time.perf_counter() - upload_started)
     audit(
         action=AuditAction.DOCUMENT_UPLOAD,
         actor=current_user,

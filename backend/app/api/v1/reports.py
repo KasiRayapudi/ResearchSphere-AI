@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.agents.graph import LangGraphResearchEngine
+from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
@@ -90,6 +91,7 @@ async def generate_report(
                 "reason": str(e)[:200],
             },
         )
+        metrics.safe(metrics.reports_generated_total.labels(outcome="failed").inc)
         raise HTTPException(
             status_code=500, detail=f"LangGraph failed to generate report: {str(e)}"
         ) from e
@@ -119,6 +121,7 @@ async def generate_report(
     db.commit()
     db.refresh(report)
 
+    metrics.safe(metrics.reports_generated_total.labels(outcome="success").inc)
     audit(
         action=AuditAction.REPORT_GENERATE,
         actor=current_user,

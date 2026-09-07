@@ -1,15 +1,18 @@
 import asyncio
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.logging import get_logger
 from app.core.security import get_current_user, resolve_workspace
+from app.core.tracking import capture_exception
 from app.models.chat import ChatMessage, ChatSession
 from app.models.user import User
 from app.rag.pipeline import stream_rag_response
@@ -142,6 +145,8 @@ async def chat_stream(
     db.commit()
 
     async def event_generator():
+        stream_started = time.perf_counter()
+        first_token_at = None
         accumulated_text = ""
         sources_meta = []
         response_time = 0
@@ -167,6 +172,14 @@ async def chat_stream(
                     except Exception as e:
                         logger.error(f"Error parsing RAG metadata: {e}")
                 else:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        # Time to first token is what a user perceives as
+                        # responsiveness; total duration hides it entirely.
+                        metrics.safe(
+                            metrics.chat_time_to_first_token_seconds.observe,
+                            first_token_at - stream_started,
+                        )
                     yield f"data: {json.dumps({'text': chunk})}\n\n"
                     accumulated_text += chunk
 
@@ -176,6 +189,8 @@ async def chat_stream(
             # the response has started streaming the status code is already
             # sent, so an exception here would truncate the stream with no
             # explanation. Emit a typed error event instead.
+            metrics.safe(metrics.chat_messages_total.labels(outcome="failed").inc)
+            capture_exception(exc, route="chat.stream", workspace_id=workspace_id)
             logger.error(f"Chat stream failed: {exc}", exc_info=True)
             yield f"data: {json.dumps({'error': 'The assistant is temporarily unavailable. Please try again.'})}\n\n"
             yield "data: [DONE]\n\n"
@@ -197,6 +212,10 @@ async def chat_stream(
             logger.error(f"Failed to persist assistant message: {exc}", exc_info=True)
             db.rollback()
 
+        metrics.safe(metrics.chat_messages_total.labels(outcome="completed").inc)
+        metrics.safe(
+            metrics.chat_stream_duration_seconds.observe, time.perf_counter() - stream_started
+        )
         # Send completed session marker
         yield "data: [DONE]\n\n"
 

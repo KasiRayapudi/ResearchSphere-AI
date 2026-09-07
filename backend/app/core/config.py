@@ -83,6 +83,28 @@ class Settings(BaseSettings):
     # Trusted hosts (comma-separated). "*" is only permitted outside production.
     TRUSTED_HOSTS: str = "localhost,127.0.0.1"
 
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+    METRICS_ENABLED: bool = True
+    #: When set, /metrics requires `Authorization: Bearer <token>`. Leave blank
+    #: and restrict the route at the reverse proxy instead (the usual setup).
+    METRICS_TOKEN: str = ""
+    #: Requests slower than this are counted and logged with the request id.
+    SLOW_REQUEST_THRESHOLD_MS: int = 1000
+    #: Health endpoints report degraded above these thresholds.
+    DISK_USAGE_WARN_PERCENT: int = 85
+    MEMORY_USAGE_WARN_PERCENT: int = 90
+    #: Optional error-tracking DSN. No SDK is bundled; see app/core/tracking.py.
+    ERROR_TRACKING_DSN: str = ""
+    ERROR_TRACKING_SAMPLE_RATE: float = 1.0
+    #: Rotating file log. Blank keeps logs on stdout only, which is correct for
+    #: containers; set a path when running outside one.
+    LOG_FILE: str = ""
+    LOG_FILE_MAX_BYTES: int = 10 * 1024 * 1024
+    LOG_FILE_BACKUP_COUNT: int = 5
+    LOG_LEVEL: str = "INFO"
+
     # Redis (optional - Redis checks are skipped when this is blank)
     REDIS_URL: str = "redis://localhost:6379"
 
