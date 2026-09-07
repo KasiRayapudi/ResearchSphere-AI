@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -12,6 +12,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import app.models  # Ensure all models are imported for metadata creation
 from app.api.v1 import (
@@ -389,7 +390,12 @@ def create_app() -> FastAPI:
     # Exception handlers
     # -------------------------------------------------------------------
     app.add_exception_handler(AppException, app_exception_handler)
-    app.add_exception_handler(HTTPException, http_exception_handler)
+    # Registered against Starlette's HTTPException, which FastAPI's subclasses.
+    # Registering the subclass alone left Starlette's own errors -- an unmatched
+    # route, a TrustedHost rejection -- returning a bare {"detail": ...} instead
+    # of the standard envelope, so those responses carried no request_id to
+    # correlate with the logs.
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(Exception, generic_exception_handler)
 
