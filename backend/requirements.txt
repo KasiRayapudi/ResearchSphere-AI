@@ -27,5 +27,13 @@ tiktoken==0.8.0
 numpy==1.26.4
 redis==5.1.1
 celery==5.4.0
+
+# Observability. Both are imported by app/core/metrics.py, which main.py
+# imports at startup, so they are runtime dependencies rather than tooling:
+# prometheus_client is a hard top-level import and the application cannot
+# start without it, and psutil backs the disk/memory checks that /api/health
+# and /api/ready report on.
+prometheus-client==0.21.1
+psutil==6.1.1
 pytest==8.3.3
 pytest-asyncio==0.24.0
