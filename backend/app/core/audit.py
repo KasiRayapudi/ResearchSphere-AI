@@ -88,6 +88,9 @@ class AuditAction(str, Enum):
     # Reports
     REPORT_GENERATE = "report.generate"
 
+    # Connectors
+    CONNECTOR_TOGGLE = "connector.toggle"
+
     # Admin
     ADMIN_ACCESS = "admin.access"
     ADMIN_ACTION = "admin.action"

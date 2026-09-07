@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -30,6 +30,14 @@ class Report(Base):
 
     # Source documents used
     source_document_ids = Column(JSON, default=list)
+
+    #: The agent trace this report was actually produced by, as recorded by the
+    #: LangGraph run. Persisted so the research view can show what really ran;
+    #: it previously rendered a fixed four-step script with invented timings.
+    agent_trace = Column(JSON, default=list)
+
+    #: Confidence reported by the critic agent for this run.
+    confidence_score = Column(Float, nullable=True)
 
     format = Column(String(20), default="markdown")  # markdown, pdf
     status = Column(String(20), default="generating")  # generating, ready, failed

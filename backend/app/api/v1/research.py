@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -47,43 +48,24 @@ async def get_sessions(
             "objective": r.query,
             "workspaceId": r.workspace_id,
             "status": r.status,
-            "progressPercentage": 100 if r.status == "ready" else 40,
+            "progressPercentage": 100 if r.status == "ready" else 0,
             "sourcesCount": len(r.source_document_ids or []),
             "createdAt": r.created_at.isoformat(),
             "updatedAt": r.updated_at.isoformat(),
+            # The trace recorded by the run that produced this report. Empty
+            # for reports generated before the trace was persisted -- an empty
+            # list is honest; the fixed four-step script that used to be
+            # returned here was not.
             "agentSteps": [
                 {
-                    "id": "s-1",
-                    "agentName": "Planner",
-                    "status": "completed",
-                    "task": "Decomposed objective into 4 subtasks",
-                    "executionTimeMs": 75,
-                    "timestamp": "1 min ago",
-                },
-                {
-                    "id": "s-2",
-                    "agentName": "Retriever",
-                    "status": "completed",
-                    "task": "Fetched references from knowledge base",
-                    "executionTimeMs": 120,
-                    "timestamp": "1 min ago",
-                },
-                {
-                    "id": "s-3",
-                    "agentName": "Researcher",
-                    "status": "completed",
-                    "task": "Synthesized summary review",
-                    "executionTimeMs": 450,
-                    "timestamp": "Just now",
-                },
-                {
-                    "id": "s-4",
-                    "agentName": "Critic",
-                    "status": "completed",
-                    "task": "Factual verification check passed",
-                    "executionTimeMs": 110,
-                    "timestamp": "Just now",
-                },
+                    "id": f"as-{idx}",
+                    "agentName": step.get("agent"),
+                    "status": step.get("status"),
+                    "task": step.get("task"),
+                    "executionTimeMs": step.get("time_ms"),
+                    "timestamp": r.created_at.isoformat(),
+                }
+                for idx, step in enumerate(r.agent_trace or [])
             ],
         }
         for r in reports
@@ -102,9 +84,14 @@ async def start_session(
         raise HTTPException(status_code=400, detail="Workspace required")
     workspace_id = ws.id
 
-    # 1. Run multi-agent LangGraph workflow
+    # 1. Run multi-agent LangGraph workflow.
+    #
+    # run_graph is synchronous and does network I/O; see reports.generate_report
+    # for why it must not be called inline from an async handler.
     try:
-        graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
+        graph_output = await run_in_threadpool(
+            engine.run_graph, payload.objective, workspace_id=workspace_id
+        )
     except Exception as e:
         metrics.safe(metrics.research_sessions_total.labels(outcome="failed").inc)
         raise HTTPException(status_code=500, detail=f"LangGraph execution failed: {str(e)}") from e
@@ -119,8 +106,18 @@ async def start_session(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact checked by Critic Agent. Confidence score: "
-        + str(graph_output.get("confidence_score", 0.95)),
+        # Report what the critic concluded rather than asserting verification
+        # and defaulting the score to 0.95.
+        technical_analysis=(
+            (
+                "Critic agent verified the synthesis against retrieved sources. "
+                if graph_output.get("critic_verified")
+                else "Critic agent could not verify the synthesis against retrieved sources. "
+            )
+            + f"Confidence score: {graph_output.get('confidence_score', 0.0)}."
+        ),
+        agent_trace=graph_output.get("agent_trace", []),
+        confidence_score=graph_output.get("confidence_score", 0.0),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
         source_document_ids=[
@@ -152,7 +149,7 @@ async def start_session(
                 "status": trace.get("status"),
                 "task": trace.get("task"),
                 "executionTimeMs": trace.get("time_ms"),
-                "timestamp": "Just now",
+                "timestamp": report.created_at.isoformat(),
             }
             for idx, trace in enumerate(graph_output.get("agent_trace", []))
         ],

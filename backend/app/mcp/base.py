@@ -11,7 +11,10 @@ class BaseMCPConnector(ABC):
         self.connector_id = connector_id
         self.name = name
         self.provider = provider
-        self.status = "connected"
+        # No connector has a real transport yet, so none of them is connected.
+        # Reporting "connected" made the workspace UI show live integrations
+        # that had never contacted anything.
+        self.status = "disconnected"
 
     @abstractmethod
     def sync_data(self) -> list[dict[str, Any]]:

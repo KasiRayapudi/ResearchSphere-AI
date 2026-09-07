@@ -136,6 +136,8 @@ async def generate_report(
         or [
             c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")
         ],
+        agent_trace=graph_output.get("agent_trace", []),
+        confidence_score=graph_output.get("confidence_score", 0.0),
         format="pdf",
         status="ready",
     )

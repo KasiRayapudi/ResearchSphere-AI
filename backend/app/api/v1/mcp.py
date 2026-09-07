@@ -4,11 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
 from app.mcp.registry import MCPConnectorRegistry
 from app.models.report import Connector as ConnectorModel
 from app.models.user import User
+from app.models.workspace import Workspace
 
 router = APIRouter()
 registry = MCPConnectorRegistry()
@@ -102,10 +104,21 @@ async def get_mcp_connectors(
 
 @router.post("/{connector_id}/toggle", response_model=ConnectorToggleResponse)
 async def toggle_mcp_connector(
-    connector_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    connector_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    # Find in DB
-    conn = db.query(ConnectorModel).filter(ConnectorModel.id == connector_id).first()
+    # Ownership check: a connector is reachable only through a workspace the
+    # caller owns. Looking it up by id alone let any authenticated user toggle
+    # any tenant's connectors. A connector that exists but belongs to someone
+    # else falls through to the 404 below, so ids cannot be probed.
+    conn = (
+        db.query(ConnectorModel)
+        .join(Workspace, ConnectorModel.workspace_id == Workspace.id)
+        .filter(ConnectorModel.id == connector_id, Workspace.owner_id == current_user.id)
+        .first()
+    )
     if not conn:
         # Check if it's a future connector
         registry_status = registry.list_all_connectors()
@@ -122,6 +135,14 @@ async def toggle_mcp_connector(
                 itemsSyncedCount=0,
                 is_future_connector=True,
             )
+        audit(
+            action=AuditAction.PERMISSION_DENIED,
+            actor=current_user,
+            outcome=AuditOutcome.DENIED,
+            resource=f"connector:{connector_id}",
+            request=request,
+            metadata={"reason": "not_owner_or_not_found"},
+        )
         raise HTTPException(status_code=404, detail="Connector not found")
 
     # Toggle status
@@ -130,6 +151,19 @@ async def toggle_mcp_connector(
     conn.last_synced_at = datetime.utcnow()
     db.commit()
     db.refresh(conn)
+
+    audit(
+        action=AuditAction.CONNECTOR_TOGGLE,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"connector:{conn.id}",
+        request=request,
+        metadata={
+            "provider": conn.connector_type,
+            "workspace_id": conn.workspace_id,
+            "status": new_status,
+        },
+    )
 
     return ConnectorToggleResponse(
         id=conn.id,
