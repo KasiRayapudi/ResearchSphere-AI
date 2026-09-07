@@ -210,9 +210,7 @@ class TestMiddleware:
         assert response.headers["x-request-id"] == supplied
 
     def test_hostile_request_id_is_sanitised(self, client):
-        response = client.get(
-            "/api/live", headers={"X-Request-ID": "abc\r\nInjected-Header: evil"}
-        )
+        response = client.get("/api/live", headers={"X-Request-ID": "abc\r\nInjected-Header: evil"})
         returned = response.headers["x-request-id"]
         # A header value carrying CRLF would let a client inject headers.
         assert "\r" not in returned and "\n" not in returned

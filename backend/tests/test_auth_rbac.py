@@ -27,18 +27,14 @@ class TestCurrentUser:
         from app.core.security import create_access_token
 
         token = create_access_token({"role": "member"})
-        response = client.get(
-            "/api/v1/workspaces", headers={"Authorization": f"Bearer {token}"}
-        )
+        response = client.get("/api/v1/workspaces", headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 401
 
     def test_a_token_for_a_deleted_account_is_rejected(self, client):
         from app.core.security import create_access_token
 
         token = create_access_token({"sub": "a-user-that-never-existed", "role": "member"})
-        response = client.get(
-            "/api/v1/workspaces", headers={"Authorization": f"Bearer {token}"}
-        )
+        response = client.get("/api/v1/workspaces", headers={"Authorization": f"Bearer {token}"})
         # A valid signature is not enough: the account must still exist.
         assert response.status_code == 401
 
@@ -83,9 +79,7 @@ class TestCurrentUser:
         claims = decode_token(registered_user["access_token"], check_revocation=False)
         revoke_token(claims["jti"], exp=claims["exp"])
 
-        still_decodable = decode_token(
-            registered_user["access_token"], check_revocation=False
-        )
+        still_decodable = decode_token(registered_user["access_token"], check_revocation=False)
         assert still_decodable["sub"] == claims["sub"]
 
 
@@ -146,12 +140,8 @@ class TestRoleEnforcement:
         """
         from app.core.security import create_access_token
 
-        token = create_access_token(
-            {"sub": registered_user["user"]["id"], "role": "admin"}
-        )
-        response = client.get(
-            "/api/v1/admin/stats", headers={"Authorization": f"Bearer {token}"}
-        )
+        token = create_access_token({"sub": registered_user["user"]["id"], "role": "admin"})
+        response = client.get("/api/v1/admin/stats", headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 403
 
 
@@ -286,8 +276,13 @@ class TestStructuredLogging:
         from app.core.logging import JSONFormatter
 
         record = logging.LogRecord(
-            name="t", level=logging.INFO, pathname=__file__, lineno=1,
-            msg="m", args=(), exc_info=None,
+            name="t",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="m",
+            args=(),
+            exc_info=None,
         )
         record.user_id = "u-1"
         record.action = "document.upload"
@@ -307,8 +302,13 @@ class TestStructuredLogging:
             exc_info = sys.exc_info()
 
         record = logging.LogRecord(
-            name="t", level=logging.ERROR, pathname=__file__, lineno=1,
-            msg="m", args=(), exc_info=exc_info,
+            name="t",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="m",
+            args=(),
+            exc_info=exc_info,
         )
         payload = json.loads(JSONFormatter().format(record))
         # A traceback that breaks the JSON frame is useless to a log shipper.
@@ -320,8 +320,13 @@ class TestStructuredLogging:
         from app.core.logging import JSONFormatter
 
         record = logging.LogRecord(
-            name="t", level=logging.INFO, pathname=__file__, lineno=1,
-            msg="line one\nline two", args=(), exc_info=None,
+            name="t",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="line one\nline two",
+            args=(),
+            exc_info=None,
         )
         rendered = JSONFormatter().format(record)
         assert len(rendered.splitlines()) == 1
@@ -371,9 +376,11 @@ class TestRagBoundaries:
     def test_the_embedding_model_is_loaded_once(self):
         from app.rag import embeddings
 
-        embeddings.get_embedding_model.cache_clear() if hasattr(
-            embeddings.get_embedding_model, "cache_clear"
-        ) else None
+        (
+            embeddings.get_embedding_model.cache_clear()
+            if hasattr(embeddings.get_embedding_model, "cache_clear")
+            else None
+        )
 
         with patch("sentence_transformers.SentenceTransformer") as constructor:
             constructor.return_value = MagicMock()
@@ -385,9 +392,10 @@ class TestRagBoundaries:
     def test_the_qdrant_client_is_reused(self):
         from app.rag import vector_store
 
-        with patch.object(vector_store, "_client", None), patch(
-            "qdrant_client.QdrantClient"
-        ) as constructor:
+        with (
+            patch.object(vector_store, "_client", None),
+            patch("qdrant_client.QdrantClient") as constructor,
+        ):
             constructor.return_value = MagicMock()
             first = vector_store.get_qdrant_client()
             second = vector_store.get_qdrant_client()

@@ -72,9 +72,7 @@ class TestChatSessions:
         listed = client.get("/api/v1/chat/sessions", headers=auth_headers).json()
         assert any(item["id"] == session_id for item in listed)
 
-    def test_listed_session_uses_the_frontend_field_names(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_listed_session_uses_the_frontend_field_names(self, client, auth_headers, workspace_id):
         client.post(f"/api/v1/chat/sessions?workspace_id={workspace_id}", headers=auth_headers)
         item = client.get("/api/v1/chat/sessions", headers=auth_headers).json()[0]
         # Renaming any of these silently breaks the chat sidebar.
@@ -152,9 +150,7 @@ class TestChatStream:
         assert events[-1] == {"__done__": True}
 
     def test_answer_is_persisted_with_its_sources(self, client, auth_headers, workspace_id):
-        with patch(
-            "app.api.v1.chat.stream_rag_response", _stream_of("Answer text", SOURCES_FRAME)
-        ):
+        with patch("app.api.v1.chat.stream_rag_response", _stream_of("Answer text", SOURCES_FRAME)):
             client.post(
                 "/api/v1/chat/stream",
                 headers=auth_headers,
@@ -177,9 +173,7 @@ class TestChatStream:
         finally:
             session.close()
 
-    def test_user_message_is_persisted_before_the_stream(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_user_message_is_persisted_before_the_stream(self, client, auth_headers, workspace_id):
         with patch("app.api.v1.chat.stream_rag_response", _stream_of("x", SOURCES_FRAME)):
             client.post(
                 "/api/v1/chat/stream",
@@ -201,9 +195,7 @@ class TestChatStream:
         finally:
             session.close()
 
-    def test_a_session_is_created_when_none_is_supplied(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_a_session_is_created_when_none_is_supplied(self, client, auth_headers, workspace_id):
         assert client.get("/api/v1/chat/sessions", headers=auth_headers).json() == []
 
         with patch("app.api.v1.chat.stream_rag_response", _stream_of("x", SOURCES_FRAME)):
@@ -367,9 +359,7 @@ class TestReports:
         listed = client.get("/api/v1/reports", headers=auth_headers).json()
         assert any(item["id"] == body["id"] for item in listed)
 
-    def test_explicit_document_ids_win_over_citation_ids(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_explicit_document_ids_win_over_citation_ids(self, client, auth_headers, workspace_id):
         with patch.object(
             __import__("app.api.v1.reports", fromlist=["engine"]).engine,
             "run_graph",
@@ -416,9 +406,7 @@ class TestReports:
         samples = client.get("/metrics").text
         assert 'researchsphere_reports_generated_total{outcome="failed"}' in samples
 
-    def test_empty_graph_output_still_produces_a_record(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_empty_graph_output_still_produces_a_record(self, client, auth_headers, workspace_id):
         engine = __import__("app.api.v1.reports", fromlist=["engine"]).engine
         with patch.object(engine, "run_graph", return_value={}):
             response = client.post(
@@ -490,9 +478,7 @@ class TestReports:
         # The expensive agent run must be refused before it starts.
         graph.assert_not_called()
 
-    def test_listed_report_uses_the_frontend_field_names(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_listed_report_uses_the_frontend_field_names(self, client, auth_headers, workspace_id):
         engine = __import__("app.api.v1.reports", fromlist=["engine"]).engine
         with patch.object(engine, "run_graph", return_value=self._graph_output()):
             client.post(
@@ -583,8 +569,9 @@ class TestLangGraphEngine:
         fake_model = MagicMock()
         fake_model.generate_content.return_value = MagicMock(text="A grounded synthesis " * 5)
 
-        with patch.object(graph_module, "get_rag_response", _sources), patch(
-            "google.generativeai.GenerativeModel", return_value=fake_model
+        with (
+            patch.object(graph_module, "get_rag_response", _sources),
+            patch("google.generativeai.GenerativeModel", return_value=fake_model),
         ):
             response = client.post(
                 "/api/v1/reports/generate",
@@ -600,9 +587,7 @@ class TestLangGraphEngine:
     def test_synthesis_failure_is_surfaced_not_papered_over(self):
         from app.agents import graph as graph_module
 
-        with patch(
-            "google.generativeai.GenerativeModel", side_effect=RuntimeError("no api key")
-        ):
+        with patch("google.generativeai.GenerativeModel", side_effect=RuntimeError("no api key")):
             with pytest.raises(RuntimeError, match="Research synthesis failed"):
                 graph_module.ResearcherAgent().execute(
                     {

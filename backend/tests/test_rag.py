@@ -210,9 +210,7 @@ class TestVectorStore:
         fake_client = MagicMock()
         fake_client.search.return_value = []
         with patch.object(vector_store, "get_qdrant_client", return_value=fake_client):
-            vector_store.search_similar(
-                [0.1] * 384, workspace_id="ws-1", document_ids=["d1", "d2"]
-            )
+            vector_store.search_similar([0.1] * 384, workspace_id="ws-1", document_ids=["d1", "d2"])
 
         conditions = fake_client.search.call_args.kwargs["query_filter"].must
         assert any(c.key == "document_id" for c in conditions)
@@ -312,8 +310,9 @@ class TestStreamingPipeline:
     async def test_reports_when_nothing_is_retrieved(self):
         from app.rag import pipeline
 
-        with patch.object(pipeline, "embed_query", return_value=[0.1] * 384), patch.object(
-            pipeline, "search_similar", return_value=[]
+        with (
+            patch.object(pipeline, "embed_query", return_value=[0.1] * 384),
+            patch.object(pipeline, "search_similar", return_value=[]),
         ):
             chunks = [c async for c in pipeline.stream_rag_response("q", "ws-1")]
 
@@ -333,9 +332,11 @@ class TestStreamingPipeline:
         fake_model = MagicMock()
         fake_model.generate_content.return_value = [_Part(), _Part()]
 
-        with patch.object(pipeline, "embed_query", return_value=[0.1] * 384), patch.object(
-            pipeline, "search_similar", return_value=retrieved
-        ), patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model):
+        with (
+            patch.object(pipeline, "embed_query", return_value=[0.1] * 384),
+            patch.object(pipeline, "search_similar", return_value=retrieved),
+            patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model),
+        ):
             chunks = [c async for c in pipeline.stream_rag_response("q", "ws-1")]
 
         assert "answer " in chunks[0]
@@ -357,9 +358,11 @@ class TestStreamingPipeline:
         fake_model = MagicMock()
         fake_model.generate_content.return_value = [_Part()]
 
-        with patch.object(pipeline, "embed_query", return_value=[0.1] * 384), patch.object(
-            pipeline, "search_similar", return_value=retrieved
-        ), patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model):
+        with (
+            patch.object(pipeline, "embed_query", return_value=[0.1] * 384),
+            patch.object(pipeline, "search_similar", return_value=retrieved),
+            patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model),
+        ):
             chunks = [c async for c in pipeline.stream_rag_response("q", "ws-1")]
 
         marker = chunks[-1]
@@ -376,9 +379,11 @@ class TestStreamingPipeline:
         fake_model = MagicMock()
         fake_model.generate_content.return_value = MagicMock(text="the answer")
 
-        with patch.object(pipeline, "embed_query", return_value=[0.1] * 384), patch.object(
-            pipeline, "search_similar", return_value=retrieved
-        ), patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model):
+        with (
+            patch.object(pipeline, "embed_query", return_value=[0.1] * 384),
+            patch.object(pipeline, "search_similar", return_value=retrieved),
+            patch.object(pipeline.genai, "GenerativeModel", return_value=fake_model),
+        ):
             result = await pipeline.get_rag_response("q", "ws-1")
 
         assert result["answer"] == "the answer"
@@ -389,8 +394,9 @@ class TestStreamingPipeline:
     async def test_non_streaming_reports_empty_index(self):
         from app.rag import pipeline
 
-        with patch.object(pipeline, "embed_query", return_value=[0.1] * 384), patch.object(
-            pipeline, "search_similar", return_value=[]
+        with (
+            patch.object(pipeline, "embed_query", return_value=[0.1] * 384),
+            patch.object(pipeline, "search_similar", return_value=[]),
         ):
             result = await pipeline.get_rag_response("q", "ws-1")
 

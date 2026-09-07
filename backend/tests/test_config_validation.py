@@ -9,9 +9,7 @@ safety.
 
 import pytest
 
-from app.core.config import (
-    INSECURE_SECRET_DEFAULTS as _KNOWN_DEFAULTS,
-)
+from app.core.config import INSECURE_SECRET_DEFAULTS as _KNOWN_DEFAULTS
 from app.core.config import Settings, validate_configuration
 
 pytestmark = pytest.mark.unit
@@ -166,15 +164,12 @@ class TestUploadValidation:
     def test_an_unwritable_upload_directory_is_fatal(self, tmp_path):
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("i am a file", encoding="utf-8")
-        errors = _errors(
-            UPLOAD_DIR=str(blocker / "uploads"), QUARANTINE_DIR=str(tmp_path / "q")
-        )
+        errors = _errors(UPLOAD_DIR=str(blocker / "uploads"), QUARANTINE_DIR=str(tmp_path / "q"))
         assert any("UPLOAD_DIR" in e for e in errors), errors
 
     def test_a_missing_upload_directory_setting_is_fatal(self, tmp_path):
         assert any(
-            "UPLOAD_DIR" in e
-            for e in _errors(UPLOAD_DIR="", QUARANTINE_DIR=str(tmp_path / "q"))
+            "UPLOAD_DIR" in e for e in _errors(UPLOAD_DIR="", QUARANTINE_DIR=str(tmp_path / "q"))
         )
 
     def test_quarantine_must_differ_from_the_upload_directory(self, tmp_path):

@@ -17,27 +17,55 @@ class TestExceptionTypes:
     @pytest.mark.parametrize(
         "factory,status,code",
         [
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["ResourceNotFoundException"]
-            ).ResourceNotFoundException("Document", "doc-1"), 404, "RESOURCE_NOT_FOUND"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["AuthenticationException"]
-            ).AuthenticationException(), 401, "AUTHENTICATION_FAILED"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["AuthorizationException"]
-            ).AuthorizationException(), 403, "AUTHORIZATION_FAILED"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["ValidationException"]
-            ).ValidationException(), 422, "VALIDATION_ERROR"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["RateLimitException"]
-            ).RateLimitException(), 429, "RATE_LIMIT_EXCEEDED"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["RAGProcessingException"]
-            ).RAGProcessingException(), 500, "RAG_PROCESSING_ERROR"),
-            (lambda m: __import__(
-                "app.core.exceptions", fromlist=["FileValidationException"]
-            ).FileValidationException(), 400, "FILE_VALIDATION_ERROR"),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["ResourceNotFoundException"]
+                ).ResourceNotFoundException("Document", "doc-1"),
+                404,
+                "RESOURCE_NOT_FOUND",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["AuthenticationException"]
+                ).AuthenticationException(),
+                401,
+                "AUTHENTICATION_FAILED",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["AuthorizationException"]
+                ).AuthorizationException(),
+                403,
+                "AUTHORIZATION_FAILED",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["ValidationException"]
+                ).ValidationException(),
+                422,
+                "VALIDATION_ERROR",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["RateLimitException"]
+                ).RateLimitException(),
+                429,
+                "RATE_LIMIT_EXCEEDED",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["RAGProcessingException"]
+                ).RAGProcessingException(),
+                500,
+                "RAG_PROCESSING_ERROR",
+            ),
+            (
+                lambda m: __import__(
+                    "app.core.exceptions", fromlist=["FileValidationException"]
+                ).FileValidationException(),
+                400,
+                "FILE_VALIDATION_ERROR",
+            ),
         ],
     )
     def test_each_type_carries_its_status_and_code(self, factory, status, code):
@@ -118,9 +146,7 @@ class TestFileLogging:
             logging.getLogger("researchsphere.test").info("structured line")
             for handler in root.handlers:
                 handler.flush()
-            lines = [
-                ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()
-            ]
+            lines = [ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
             assert lines
             assert json.loads(lines[-1])["message"]
         finally:
@@ -235,9 +261,7 @@ class TestUploadSecurityEdges:
             ("shell script", b"#!/bin/sh\nrm -rf /\n" + b"x" * 300),
         ],
     )
-    def test_executable_content_is_rejected_whatever_the_extension(
-        self, tmp_path, name, payload
-    ):
+    def test_executable_content_is_rejected_whatever_the_extension(self, tmp_path, name, payload):
         from app.core.upload_security import UploadValidationError, validate_content
 
         path = tmp_path / "disguised.txt"
@@ -297,9 +321,7 @@ class TestRefreshRotation:
         assert after.status_code == 401
 
     def test_an_unknown_refresh_token_is_rejected(self, client):
-        response = client.post(
-            "/api/v1/auth/refresh", json={"refresh_token": "not-a-real-token"}
-        )
+        response = client.post("/api/v1/auth/refresh", json={"refresh_token": "not-a-real-token"})
         assert response.status_code == 401
 
     def test_an_access_token_cannot_be_used_to_refresh(self, client, registered_user):

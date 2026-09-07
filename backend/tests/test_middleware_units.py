@@ -139,9 +139,10 @@ class TestLimiterDegradation:
         failing = MagicMock()
         failing.pipeline.return_value.execute.side_effect = OSError("connection reset")
 
-        with patch("app.core.middleware.get_redis", return_value=failing), patch(
-            "app.core.middleware.mark_unavailable"
-        ) as marked:
+        with (
+            patch("app.core.middleware.get_redis", return_value=failing),
+            patch("app.core.middleware.mark_unavailable") as marked,
+        ):
             response = await limiter.dispatch(request, _next)
 
         # A Redis outage must degrade to per-process limiting, not to a 500.
@@ -181,9 +182,7 @@ class TestAnalytics:
         assert measured <= set(body), body
         assert all(body[key] == 0 for key in measured), body
 
-    def test_trend_series_is_flat_for_a_new_workspace(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_trend_series_is_flat_for_a_new_workspace(self, client, auth_headers, workspace_id):
         body = client.get(
             f"/api/v1/analytics?workspace_id={workspace_id}", headers=auth_headers
         ).json()
@@ -273,7 +272,8 @@ class TestPasswordReset:
 
         new_password = "Zq4%tRn8&xKp1"
         response = client.post(
-            "/api/v1/auth/password-reset/confirm", json={"token": token, "new_password": new_password}
+            "/api/v1/auth/password-reset/confirm",
+            json={"token": token, "new_password": new_password},
         )
         assert response.status_code == 200
 
@@ -306,12 +306,14 @@ class TestPasswordReset:
             session.close()
 
         first = client.post(
-            "/api/v1/auth/password-reset/confirm", json={"token": token, "new_password": "Zq4%tRn8&xKp1"}
+            "/api/v1/auth/password-reset/confirm",
+            json={"token": token, "new_password": "Zq4%tRn8&xKp1"},
         )
         assert first.status_code == 200
 
         second = client.post(
-            "/api/v1/auth/password-reset/confirm", json={"token": token, "new_password": "Wm7!bYc3@dFh9"}
+            "/api/v1/auth/password-reset/confirm",
+            json={"token": token, "new_password": "Wm7!bYc3@dFh9"},
         )
         # A replayable reset token is a standing account takeover.
         assert second.status_code == 400
@@ -347,7 +349,8 @@ class TestPasswordReset:
             session.close()
 
         response = client.post(
-            "/api/v1/auth/password-reset/confirm", json={"token": token, "new_password": "Zq4%tRn8&xKp1"}
+            "/api/v1/auth/password-reset/confirm",
+            json={"token": token, "new_password": "Zq4%tRn8&xKp1"},
         )
         assert response.status_code == 400
 

@@ -178,9 +178,10 @@ class TestTokenRevocation:
     def test_write_failure_is_reported_and_marks_redis_unavailable(self):
         client = MagicMock()
         client.setex.side_effect = OSError("connection reset")
-        with patch.object(token_store, "get_redis", return_value=client), patch.object(
-            token_store, "mark_unavailable"
-        ) as marked:
+        with (
+            patch.object(token_store, "get_redis", return_value=client),
+            patch.object(token_store, "mark_unavailable") as marked,
+        ):
             assert token_store.revoke_token("jti-1", exp=time.time() + 60) is False
         marked.assert_called_once()
 
@@ -206,8 +207,9 @@ class TestTokenRevocation:
     def test_blacklist_size_is_none_when_the_scan_fails(self):
         client = MagicMock()
         client.scan_iter.side_effect = OSError("scan failed")
-        with patch.object(token_store, "get_redis", return_value=client), patch.object(
-            token_store, "mark_unavailable"
+        with (
+            patch.object(token_store, "get_redis", return_value=client),
+            patch.object(token_store, "mark_unavailable"),
         ):
             assert token_store.blacklist_size() is None
 
@@ -229,9 +231,7 @@ class TestConfigurationValidation:
         assert validate_configuration(_settings())["errors"] == []
 
     def test_production_rejects_a_weak_secret(self):
-        report = validate_configuration(
-            _settings(ENVIRONMENT="production", SECRET_KEY="short")
-        )
+        report = validate_configuration(_settings(ENVIRONMENT="production", SECRET_KEY="short"))
         assert any("SECRET_KEY" in error for error in report["errors"])
 
     def test_production_rejects_wildcard_cors(self):
@@ -378,8 +378,9 @@ class TestDatabaseEngine:
                 raise OSError("connection refused")
             return real_create_engine(url, **kwargs)
 
-        with patch("sqlalchemy.create_engine", _create_engine), patch(
-            "app.core.config.settings.ENVIRONMENT", "development"
+        with (
+            patch("sqlalchemy.create_engine", _create_engine),
+            patch("app.core.config.settings.ENVIRONMENT", "development"),
         ):
             reloaded = importlib.reload(database_module)
 
@@ -400,8 +401,9 @@ class TestDatabaseEngine:
 
         import app.core.database as database_module
 
-        with patch("sqlalchemy.create_engine", side_effect=OSError("connection refused")), patch(
-            "app.core.config.settings.ENVIRONMENT", "production"
+        with (
+            patch("sqlalchemy.create_engine", side_effect=OSError("connection refused")),
+            patch("app.core.config.settings.ENVIRONMENT", "production"),
         ):
             with pytest.raises(OSError):
                 importlib.reload(database_module)

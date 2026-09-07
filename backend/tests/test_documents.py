@@ -18,9 +18,10 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def indexing_stubs():
     """Substitute the embedding model and Qdrant, leaving everything else real."""
-    with patch("app.api.v1.documents.embed_texts") as embed, patch(
-        "app.api.v1.documents.upsert_chunks"
-    ) as upsert:
+    with (
+        patch("app.api.v1.documents.embed_texts") as embed,
+        patch("app.api.v1.documents.upsert_chunks") as upsert,
+    ):
         embed.side_effect = lambda texts: [[0.1] * 384 for _ in texts]
         upsert.side_effect = lambda chunks, embeddings, document_id, workspace_id: [
             f"point-{i}" for i in range(len(chunks))
@@ -136,7 +137,11 @@ class TestUploadSucceeds:
             ("rows.csv", b"col_a,col_b\n" + b"1,2\n" * 200, "text/csv"),
         ):
             response = _upload(
-                client, auth_headers, name=name, content=content, ctype=ctype,
+                client,
+                auth_headers,
+                name=name,
+                content=content,
+                ctype=ctype,
                 workspace_id=workspace_id,
             )
             assert response.status_code == 200, f"{name}: {response.text}"
@@ -152,9 +157,12 @@ class TestUploadRejections:
 
     def test_blocked_extension_is_refused(self, client, auth_headers, workspace_id):
         response = _upload(
-            client, auth_headers, name="payload.exe",
+            client,
+            auth_headers,
+            name="payload.exe",
             content=b"MZ\x90\x00" + b"\x00" * 400,
-            ctype="application/octet-stream", workspace_id=workspace_id,
+            ctype="application/octet-stream",
+            workspace_id=workspace_id,
         )
         assert response.status_code == 415
 
@@ -163,15 +171,15 @@ class TestUploadRejections:
     ):
         # A PE binary renamed to .txt: the allowlist passes, content does not.
         response = _upload(
-            client, auth_headers, name="innocent.txt",
+            client,
+            auth_headers,
+            name="innocent.txt",
             content=b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 500,
             workspace_id=workspace_id,
         )
         assert response.status_code == 415
 
-    def test_oversized_upload_is_refused(
-        self, client, auth_headers, workspace_id, indexing_stubs
-    ):
+    def test_oversized_upload_is_refused(self, client, auth_headers, workspace_id, indexing_stubs):
         from app.core.config import settings
 
         original = settings.MAX_UPLOAD_SIZE_MB
@@ -179,7 +187,9 @@ class TestUploadRejections:
         settings.MAX_UPLOAD_SIZE_MB = 1
         try:
             response = _upload(
-                client, auth_headers, content=b"x" * (2 * 1024 * 1024),
+                client,
+                auth_headers,
+                content=b"x" * (2 * 1024 * 1024),
                 workspace_id=workspace_id,
             )
             assert response.status_code == 413
@@ -217,8 +227,11 @@ class TestUploadRejections:
         before = set(quarantine.glob("*")) if quarantine.exists() else set()
 
         _upload(
-            client, auth_headers, name="bad.txt",
-            content=b"MZ\x90\x00" + b"\x00" * 500, workspace_id=workspace_id,
+            client,
+            auth_headers,
+            name="bad.txt",
+            content=b"MZ\x90\x00" + b"\x00" * 500,
+            workspace_id=workspace_id,
         )
 
         after = set(quarantine.glob("*")) if quarantine.exists() else set()
@@ -271,10 +284,16 @@ class TestDuplicateDetection:
     def test_different_content_is_indexed_separately(
         self, client, auth_headers, workspace_id, indexing_stubs
     ):
-        first = _upload(client, auth_headers, content=b"first body " * 40,
-                        workspace_id=workspace_id)
-        second = _upload(client, auth_headers, name="b.txt", content=b"second body " * 40,
-                         workspace_id=workspace_id)
+        first = _upload(
+            client, auth_headers, content=b"first body " * 40, workspace_id=workspace_id
+        )
+        second = _upload(
+            client,
+            auth_headers,
+            name="b.txt",
+            content=b"second body " * 40,
+            workspace_id=workspace_id,
+        )
         assert first.json()["id"] != second.json()["id"]
         assert indexing_stubs["upsert"].call_count == 2
 
@@ -314,9 +333,7 @@ class TestDuplicateDetection:
 
 # ------------------------------------------------------ processing failure --
 class TestProcessingFailure:
-    def test_embedding_failure_marks_the_document_failed(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_embedding_failure_marks_the_document_failed(self, client, auth_headers, workspace_id):
         with patch("app.api.v1.documents.embed_texts", side_effect=RuntimeError("model down")):
             response = _upload(client, auth_headers, workspace_id=workspace_id)
 
@@ -340,8 +357,9 @@ class TestProcessingFailure:
             session.close()
 
     def test_vector_upsert_failure_is_surfaced(self, client, auth_headers, workspace_id):
-        with patch("app.api.v1.documents.embed_texts", lambda texts: [[0.1] * 384 for _ in texts]), patch(
-            "app.api.v1.documents.upsert_chunks", side_effect=RuntimeError("qdrant refused")
+        with (
+            patch("app.api.v1.documents.embed_texts", lambda texts: [[0.1] * 384 for _ in texts]),
+            patch("app.api.v1.documents.upsert_chunks", side_effect=RuntimeError("qdrant refused")),
         ):
             response = _upload(client, auth_headers, workspace_id=workspace_id)
         assert response.status_code == 500

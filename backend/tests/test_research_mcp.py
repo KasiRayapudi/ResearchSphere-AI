@@ -124,9 +124,7 @@ class TestResearchSessions:
         finally:
             session.close()
 
-    def test_unverified_run_is_not_described_as_verified(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_unverified_run_is_not_described_as_verified(self, client, auth_headers, workspace_id):
         output = dict(GRAPH_OUTPUT, critic_verified=False, confidence_score=0.0)
         self._start(client, auth_headers, workspace_id, output=output)
 
@@ -153,9 +151,10 @@ class TestResearchSessions:
                 json={"title": "t", "objective": "o", "workspace_id": workspace_id},
             )
         assert response.status_code == 500
-        assert 'researchsphere_research_sessions_total{outcome="failed"}' in client.get(
-            "/metrics"
-        ).text
+        assert (
+            'researchsphere_research_sessions_total{outcome="failed"}'
+            in client.get("/metrics").text
+        )
 
     def test_graph_runs_off_the_event_loop(self, client, auth_headers, workspace_id):
         """The graph must not be invoked inline from the async handler.
@@ -220,9 +219,7 @@ class TestMCPConnectors:
 
     def test_listing_is_idempotent(self, client, auth_headers, workspace_id):
         first = client.get(f"/api/v1/mcp?workspace_id={workspace_id}", headers=auth_headers).json()
-        second = client.get(
-            f"/api/v1/mcp?workspace_id={workspace_id}", headers=auth_headers
-        ).json()
+        second = client.get(f"/api/v1/mcp?workspace_id={workspace_id}", headers=auth_headers).json()
         # Reconciliation must not insert a duplicate row on every request.
         assert len(first) == len(second)
 
@@ -233,9 +230,7 @@ class TestMCPConnectors:
         assert any(c["is_future_connector"] for c in connectors)
 
     def _live_connector(self, client, headers, workspace_id):
-        connectors = client.get(
-            f"/api/v1/mcp?workspace_id={workspace_id}", headers=headers
-        ).json()
+        connectors = client.get(f"/api/v1/mcp?workspace_id={workspace_id}", headers=headers).json()
         return next(c for c in connectors if not c["is_future_connector"])
 
     def test_owner_can_toggle(self, client, auth_headers, workspace_id):
@@ -248,17 +243,15 @@ class TestMCPConnectors:
 
     def test_toggle_is_reversible(self, client, auth_headers, workspace_id):
         connector = self._live_connector(client, auth_headers, workspace_id)
-        first = client.post(
-            f"/api/v1/mcp/{connector['id']}/toggle", headers=auth_headers
-        ).json()["status"]
-        second = client.post(
-            f"/api/v1/mcp/{connector['id']}/toggle", headers=auth_headers
-        ).json()["status"]
+        first = client.post(f"/api/v1/mcp/{connector['id']}/toggle", headers=auth_headers).json()[
+            "status"
+        ]
+        second = client.post(f"/api/v1/mcp/{connector['id']}/toggle", headers=auth_headers).json()[
+            "status"
+        ]
         assert first != second
 
-    def test_another_users_connector_cannot_be_toggled(
-        self, client, auth_headers, workspace_id
-    ):
+    def test_another_users_connector_cannot_be_toggled(self, client, auth_headers, workspace_id):
         """Regression: the toggle looked the connector up by id alone.
 
         Any authenticated user could enable or disable any tenant's connectors
@@ -296,9 +289,7 @@ class TestMCPConnectors:
         assert client.post("/api/v1/mcp/some-id/toggle").status_code == 401
 
     def test_connectors_are_not_shared_across_accounts(self, client, auth_headers, workspace_id):
-        mine = client.get(
-            f"/api/v1/mcp?workspace_id={workspace_id}", headers=auth_headers
-        ).json()
+        mine = client.get(f"/api/v1/mcp?workspace_id={workspace_id}", headers=auth_headers).json()
         my_ids = {c["id"] for c in mine if not c["is_future_connector"]}
 
         headers = _other_account(client, "mcp_isolation@example.com")
