@@ -8,11 +8,7 @@ from jose import jwt
 
 from app.core.audit import REDACTED, AuditAction, AuditOutcome, redact
 from app.core.config import Settings, validate_configuration
-from app.core.password_policy import (
-    PasswordPolicyError,
-    evaluate_password,
-    validate_password,
-)
+from app.core.password_policy import PasswordPolicyError, evaluate_password, validate_password
 from app.core.security import (
     TOKEN_TYPE_ACCESS,
     TOKEN_TYPE_REFRESH,

@@ -120,11 +120,7 @@ def rotate_refresh_token(
     client_ip: str | None = None,
 ) -> RefreshResult:
     """Validate, rotate and reissue. Detects reuse of a rotated token."""
-    from app.core.security import (
-        TOKEN_TYPE_REFRESH,
-        create_access_token,
-        decode_token,
-    )
+    from app.core.security import TOKEN_TYPE_REFRESH, create_access_token, decode_token
     from app.models.user import User
 
     try:

@@ -7,11 +7,7 @@ from fastapi import HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.core.exceptions import (
-    AppException,
-    ValidationException,
-    format_error_response,
-)
+from app.core.exceptions import AppException, ValidationException, format_error_response
 
 
 async def app_exception_handler(request: Request, exc: AppException):
