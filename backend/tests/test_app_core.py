@@ -366,32 +366,39 @@ class TestSecurityHelpers:
         assert claims["typ"] == "access"
 
     def test_a_refresh_token_is_rejected_where_an_access_token_is_required(self):
-        from app.core.exceptions import AuthenticationException
+        from fastapi import HTTPException
+
         from app.core.security import create_refresh_token, decode_token
 
         token = create_refresh_token({"sub": "user-1"})
         # Token type confusion: a refresh token must not authenticate a request.
-        with pytest.raises((AuthenticationException, Exception)):
+        with pytest.raises(HTTPException) as raised:
             decode_token(token, expected_type="access")
+        assert raised.value.status_code == 401
 
     def test_a_tampered_token_is_rejected(self):
+        from fastapi import HTTPException
+
         from app.core.security import create_access_token, decode_token
 
         token = create_access_token({"sub": "user-1", "role": "member"})
         tampered = token[:-4] + ("aaaa" if not token.endswith("aaaa") else "bbbb")
-        with pytest.raises(Exception):
+        with pytest.raises(HTTPException) as raised:
             decode_token(tampered, expected_type="access")
+        assert raised.value.status_code == 401
 
     def test_a_token_signed_with_another_key_is_rejected(self):
         import jose.jwt
+        from fastapi import HTTPException
 
         from app.core.security import decode_token
 
         forged = jose.jwt.encode(
             {"sub": "user-1", "typ": "access"}, "a-completely-different-key", algorithm="HS256"
         )
-        with pytest.raises(Exception):
+        with pytest.raises(HTTPException) as raised:
             decode_token(forged, expected_type="access")
+        assert raised.value.status_code == 401
 
     def test_role_ranking_is_ordered(self):
         from app.core.security import role_rank

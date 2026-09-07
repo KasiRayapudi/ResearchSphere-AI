@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     # File Storage
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
+    #: Storage quota reported to the workspace analytics view. Nothing
+    #: enforces it -- it is the figure the usage bar is drawn against, and it
+    #: was previously a 50000 literal repeated in the analytics route.
+    STORAGE_CAPACITY_MB: int = 50000
     #: Uploads land here first and are promoted only after validation+scanning.
     QUARANTINE_DIR: str = "./uploads/.quarantine"
 

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
 from app.models.chat import ChatMessage, ChatSession
@@ -28,7 +29,7 @@ async def get_analytics(
             "embeddingsGeneratedTotal": 0,
             "avgResponseTimeMs": 0,
             "storageUsageMb": 0,
-            "storageCapacityMb": 50000,
+            "storageCapacityMb": settings.STORAGE_CAPACITY_MB,
             "dailyQueries": [],
             "topSources": [],
             "modelUsageBreakdown": [],
@@ -126,7 +127,7 @@ async def get_analytics(
         "embeddingsGeneratedTotal": chunk_count,
         "avgResponseTimeMs": avg_latency,
         "storageUsageMb": storage_mb,
-        "storageCapacityMb": 50000,
+        "storageCapacityMb": settings.STORAGE_CAPACITY_MB,
         "dailyQueries": daily_queries,
         "topSources": top_sources,
         # Per-model usage is not tracked yet; returning an invented split
