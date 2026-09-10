@@ -10,7 +10,6 @@ common-password and context (email/name) lists rather than relying purely on
 character-class rules.
 """
 
-import hashlib
 import math
 import re
 from dataclasses import dataclass, field
@@ -269,12 +268,3 @@ def validate_password(
     if result.violations:
         raise PasswordPolicyError(result.violations)
     return result
-
-
-def password_fingerprint(password: str) -> str:
-    """Non-reversible fingerprint for password-history comparison.
-
-    Not a credential store - history uses the real bcrypt hashes. This exists
-    so history checks can be logged/compared without touching the plaintext.
-    """
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
