@@ -18,12 +18,35 @@ import type {
   Report,
   ResearchSession,
   SystemHealth,
+  PageQuery,
+  Paginated,
   User,
   Workspace,
   WorkspaceInvitation,
   WorkspaceMember,
   WorkspaceRole,
 } from '../types';
+
+/**
+ * Turn a PageQuery into the query parameters the API expects.
+ *
+ * Undefined entries are dropped rather than sent as empty strings, which the
+ * server would reject as an invalid sort or order.
+ */
+function pageQuery(
+  workspaceId?: string,
+  query: PageQuery = {}
+): Record<string, string | number | boolean | null | undefined> {
+  return {
+    workspace_id: workspaceId,
+    page: query.page,
+    page_size: query.pageSize,
+    sort: query.sort,
+    order: query.order,
+    search: query.search,
+    cursor: query.cursor,
+  };
+}
 
 export interface AuthResult {
   user: User;
@@ -160,8 +183,21 @@ export class ApiService {
   }
 
   // -------------------------------------------------------- documents
+  /** One page of documents, with the total and cursor. */
+  static getDocumentsPage(
+    workspaceId?: string,
+    query: PageQuery = {}
+  ): Promise<Paginated<Document>> {
+    return api.get<Paginated<Document>>('/documents', { query: pageQuery(workspaceId, query) });
+  }
+
   static async getDocuments(workspaceId?: string): Promise<Document[]> {
-    return api.get<Document[]>('/documents', { query: { workspace_id: workspaceId } });
+    // The document manager renders a flat list. It takes the first page at
+    // the server's maximum; paging it properly is a UI change, and this
+    // keeps the screen correct in the meantime rather than silently showing
+    // 25 of 5,000.
+    const page = await ApiService.getDocumentsPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   /**
@@ -172,10 +208,20 @@ export class ApiService {
   /** Indexing progress for one document. Polled while an upload finishes. */
   // ----------------------------------------------------- workspace members --
 
-  static getMembers(workspaceId?: string): Promise<WorkspaceMember[]> {
-    return api.get<WorkspaceMember[]>('/workspace/members', {
-      query: { workspace_id: workspaceId },
+  static getMembersPage(
+    workspaceId?: string,
+    query: PageQuery = {}
+  ): Promise<Paginated<WorkspaceMember>> {
+    return api.get<Paginated<WorkspaceMember>>('/workspace/members', {
+      query: pageQuery(workspaceId, query),
     });
+  }
+
+  static async getMembers(workspaceId?: string): Promise<WorkspaceMember[]> {
+    // The members page shows everyone; the server caps this at 100, which is
+    // a larger workspace than the flat list is designed for anyway.
+    const page = await ApiService.getMembersPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   static updateMemberRole(
@@ -206,10 +252,18 @@ export class ApiService {
     );
   }
 
-  static getInvitations(workspaceId?: string): Promise<WorkspaceInvitation[]> {
-    return api.get<WorkspaceInvitation[]>('/workspace/invitations', {
-      query: { workspace_id: workspaceId },
+  static getInvitationsPage(
+    workspaceId?: string,
+    query: PageQuery = {}
+  ): Promise<Paginated<WorkspaceInvitation>> {
+    return api.get<Paginated<WorkspaceInvitation>>('/workspace/invitations', {
+      query: pageQuery(workspaceId, query),
     });
+  }
+
+  static async getInvitations(workspaceId?: string): Promise<WorkspaceInvitation[]> {
+    const page = await ApiService.getInvitationsPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   static inviteMember(
@@ -326,11 +380,15 @@ export class ApiService {
   }
 
   // ------------------------------------------------------------- chat
+  static getChatSessionsPage(workspaceId?: string, query: PageQuery = {}) {
+    return api.get<
+      Paginated<{ id: string; title: string; workspaceId: string; createdAt: string }>
+    >('/chat/sessions', { query: pageQuery(workspaceId, query) });
+  }
+
   static async getChatSessions(workspaceId?: string) {
-    return api.get<Array<{ id: string; title: string; workspaceId: string; createdAt: string }>>(
-      '/chat/sessions',
-      { query: { workspace_id: workspaceId } }
-    );
+    const page = await ApiService.getChatSessionsPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   static async createChatSession(workspaceId?: string) {
@@ -340,8 +398,18 @@ export class ApiService {
   }
 
   // --------------------------------------------------------- research
+  static getResearchSessionsPage(
+    workspaceId?: string,
+    query: PageQuery = {}
+  ): Promise<Paginated<ResearchSession>> {
+    return api.get<Paginated<ResearchSession>>('/research', {
+      query: pageQuery(workspaceId, query),
+    });
+  }
+
   static async getResearchSessions(workspaceId?: string): Promise<ResearchSession[]> {
-    return api.get<ResearchSession[]>('/research', { query: { workspace_id: workspaceId } });
+    const page = await ApiService.getResearchSessionsPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   static async startResearchSession(
@@ -357,8 +425,16 @@ export class ApiService {
   }
 
   // ----------------------------------------------------------- reports
+  static getReportsPage(
+    workspaceId?: string,
+    query: PageQuery = {}
+  ): Promise<Paginated<Report>> {
+    return api.get<Paginated<Report>>('/reports', { query: pageQuery(workspaceId, query) });
+  }
+
   static async getReports(workspaceId?: string): Promise<Report[]> {
-    return api.get<Report[]>('/reports', { query: { workspace_id: workspaceId } });
+    const page = await ApiService.getReportsPage(workspaceId, { pageSize: 100 });
+    return page.items;
   }
 
   static async generateReport(

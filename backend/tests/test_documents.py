@@ -400,7 +400,7 @@ class TestDocumentListing:
         self, client, auth_headers, workspace_id, indexing_stubs
     ):
         document_id = _upload(client, auth_headers, workspace_id=workspace_id).json()["id"]
-        listed = client.get("/api/v1/documents", headers=auth_headers).json()
+        listed = client.get("/api/v1/documents", headers=auth_headers).json()["items"]
         assert any(item["id"] == document_id for item in listed)
 
     def test_documents_are_not_visible_across_accounts(
@@ -424,7 +424,7 @@ class TestDocumentListing:
                 json={"email": "doc_isolation@example.com", "password": STRONG_PASSWORD},
             )
         headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
-        assert client.get("/api/v1/documents", headers=headers).json() == []
+        assert client.get("/api/v1/documents", headers=headers).json()["items"] == []
 
 
 # --------------------------------------------------------------- deletion ---
@@ -438,7 +438,7 @@ class TestDocumentDeletion:
 
         assert not any(
             item["id"] == document_id
-            for item in client.get("/api/v1/documents", headers=auth_headers).json()
+            for item in client.get("/api/v1/documents", headers=auth_headers).json()["items"]
         )
 
     def test_local_file_is_removed(self, client, auth_headers, workspace_id, indexing_stubs):
@@ -490,7 +490,7 @@ class TestDocumentDeletion:
         # ...and it is still there for its owner.
         assert any(
             item["id"] == document_id
-            for item in client.get("/api/v1/documents", headers=auth_headers).json()
+            for item in client.get("/api/v1/documents", headers=auth_headers).json()["items"]
         )
 
     def test_unknown_document_returns_404(self, client, auth_headers):

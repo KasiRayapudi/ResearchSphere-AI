@@ -1,7 +1,7 @@
 import os
 import time
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.logging import get_logger
+from app.core.pagination import Page, PageParams, page_params, paginate
 from app.core.security import get_current_user, resolve_workspace
 from app.core.upload_security import (
     UploadValidationError,
@@ -53,38 +54,83 @@ class DocumentResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=list[dict])
+#: Sort keys a client may use, mapped to columns. An allowlist rather than
+#: getattr on the model: that would expose its shape and let a caller order
+#: by an unindexed column to make the query expensive.
+DOCUMENT_SORTS = {
+    "uploadedAt": Document.created_at,
+    "title": Document.original_filename,
+    "size": Document.file_size,
+    "status": Document.status,
+    "chunkCount": Document.chunk_count,
+}
+
+
+def _document_payload(doc: Document, current_user: User) -> dict:
+    """The row shape the frontend expects, shared by list and upload."""
+    return {
+        "id": doc.id,
+        "title": doc.original_filename,
+        "fileType": doc.file_type,
+        "fileSizeKb": (doc.file_size or 0) // 1024,
+        "status": doc.status,
+        "chunkCount": doc.chunk_count or 0,
+        "progress": doc.progress or 0,
+        "tags": doc.tags or [],
+        "uploadedBy": current_user.full_name,
+        "uploadedAt": doc.created_at.isoformat() if doc.created_at else "",
+        "version": doc.version,
+        "ocrApplied": doc.file_type == "pdf",
+        "folderPath": doc.folder_path,
+    }
+
+
+@router.get("")
 async def get_documents(
     request: Request,
     workspace_id: str | None = None,
+    status: str | None = Query(None, description="Filter by processing status."),
+    file_type: str | None = Query(None, description="Filter by file extension."),
+    folder: str | None = Query(None, description="Filter by folder path."),
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Find active workspace if not specified
+    """Documents in the workspace, newest first.
+
+    Accepts a cursor as well as a page number: a workspace's document list
+    grows without bound, and deep offsets on it get slower the further in
+    they go, while a cursor stays flat.
+    """
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
-        return []
-    workspace_id = ws.id
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    documents = db.query(Document).filter(Document.workspace_id == workspace_id).all()
+    query = db.query(Document).filter(Document.workspace_id == ws.id)
+    if status:
+        query = query.filter(Document.status == status)
+    if file_type:
+        query = query.filter(Document.file_type == file_type.lower().lstrip("."))
+    if folder:
+        query = query.filter(Document.folder_path == folder)
 
-    return [
-        {
-            "id": doc.id,
-            "title": doc.original_filename,
-            "fileType": doc.file_type,
-            "fileSizeKb": doc.file_size // 1024,
-            "status": doc.status,
-            "chunkCount": doc.chunk_count,
-            "tags": doc.tags or [],
-            "uploadedBy": current_user.full_name,
-            "uploadedAt": doc.created_at.isoformat(),
-            "version": doc.version,
-            "ocrApplied": doc.ocr_applied,
-            "folderPath": doc.folder_path,
-        }
-        for doc in documents
-    ]
+    page = paginate(
+        query,
+        params,
+        sortable=DOCUMENT_SORTS,
+        default_sort="uploadedAt",
+        tiebreaker=Document.id,
+        searchable=[Document.original_filename, Document.title, Document.description],
+    )
+    return page.envelope([_document_payload(doc, current_user) for doc in page.items])
 
 
 @router.post("/upload")

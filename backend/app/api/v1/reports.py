@@ -7,6 +7,7 @@ from app.agents.graph import LangGraphResearchEngine
 from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
+from app.core.pagination import Page, PageParams, page_params, paginate
 from app.core.security import get_current_user, resolve_workspace
 from app.core.workspace_access import require_workspace_role
 from app.models.report import Report as ReportModel
@@ -23,46 +24,67 @@ class ReportGenerateRequest(BaseModel):
     document_ids: list[str] = []
 
 
+REPORT_SORTS = {
+    "createdAt": ReportModel.created_at,
+    "title": ReportModel.title,
+    "status": ReportModel.status,
+}
+
+
 @router.get("")
 async def get_reports(
     request: Request,
     workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
-        return []
-    workspace_id = ws.id
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    reports = (
-        db.query(ReportModel)
-        .filter(ReportModel.workspace_id == workspace_id, ReportModel.user_id == current_user.id)
-        .order_by(ReportModel.created_at.desc())
-        .all()
+    query = db.query(ReportModel).filter(
+        ReportModel.workspace_id == ws.id, ReportModel.user_id == current_user.id
     )
-
-    return [
-        {
-            "id": r.id,
-            "title": r.title,
-            "format": r.format,
-            "summary": r.executive_summary or "Executive Research synthesis",
-            "objective": r.query,
-            "generatedAt": r.created_at.isoformat(),
-            "author": current_user.full_name,
-            "sourceDocumentIds": r.source_document_ids or [],
-            "sections": [
-                {"title": "Executive Summary", "content": r.executive_summary or ""},
-                {"title": "Research Findings & Analysis", "content": r.findings or ""},
-                {
-                    "title": "Technical Assessment & Limitation",
-                    "content": r.technical_analysis or "",
-                },
-            ],
-        }
-        for r in reports
-    ]
+    page = paginate(
+        query,
+        params,
+        sortable=REPORT_SORTS,
+        default_sort="createdAt",
+        tiebreaker=ReportModel.id,
+        searchable=[ReportModel.title, ReportModel.query],
+    )
+    return page.envelope(
+        [
+            {
+                "id": r.id,
+                "title": r.title,
+                "format": r.format,
+                "summary": r.executive_summary or "Executive Research synthesis",
+                "objective": r.query,
+                "generatedAt": r.created_at.isoformat(),
+                "author": current_user.full_name,
+                "sourceDocumentIds": r.source_document_ids or [],
+                "sections": [
+                    {"title": "Executive Summary", "content": r.executive_summary or ""},
+                    {"title": "Research Findings & Analysis", "content": r.findings or ""},
+                    {
+                        "title": "Technical Assessment & Limitation",
+                        "content": r.technical_analysis or "",
+                    },
+                ],
+            }
+            for r in page.items
+        ]
+    )
 
 
 @router.post("/generate")

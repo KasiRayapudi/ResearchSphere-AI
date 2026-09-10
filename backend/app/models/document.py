@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -23,6 +23,15 @@ class DocumentStatus(str):
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        # Every document list filters by workspace and orders by created_at.
+        # A composite index serves both in one seek; separate single-column
+        # indexes would make the database sort the workspace's rows itself.
+        Index("ix_documents_workspace_created", "workspace_id", "created_at"),
+        # Status filtering within a workspace, used by the upload UI and by
+        # the stalled-document reaper.
+        Index("ix_documents_workspace_status", "workspace_id", "status"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     workspace_id = Column(
@@ -78,6 +87,11 @@ class Document(Base):
 
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
+    __table_args__ = (
+        # Chunks are read and deleted per document, in chunk order. Without
+        # this every ingest re-scans the whole table to clear a retry.
+        Index("ix_document_chunks_document_index", "document_id", "chunk_index"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     document_id = Column(String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)

@@ -192,3 +192,31 @@ export const ROLE_CAN = {
   transferOwnership: (role: WorkspaceRole) => role === 'owner',
   write: (role: WorkspaceRole) => role !== 'viewer',
 } as const;
+
+/**
+ * The envelope every list endpoint returns.
+ *
+ * `total` and `pages` are null on a keyset page: counting the whole set
+ * would defeat the point of using a cursor, so the API omits them rather
+ * than reporting a number it did not compute.
+ */
+export interface Paginated<T> {
+  items: T[];
+  page: number;
+  pageSize: number;
+  total: number | null;
+  pages: number | null;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  nextCursor: string | null;
+}
+
+/** Query parameters accepted by every list endpoint. */
+export interface PageQuery {
+  page?: number;
+  pageSize?: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+  search?: string;
+  cursor?: string;
+}

@@ -11,6 +11,7 @@ from app.core import metrics
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.logging import get_logger
+from app.core.pagination import Page, PageParams, page_params, paginate
 from app.core.security import get_current_user, resolve_workspace
 from app.core.tracking import capture_exception
 from app.core.workspace_access import require_workspace_role
@@ -29,34 +30,63 @@ class ChatQuery(BaseModel):
     model: str = "Gemini 1.5 Pro"
 
 
+#: Sorting a chat sidebar by anything but recency is unusual, but title
+#: ordering is cheap to offer and the allowlist has to be explicit anyway.
+SESSION_SORTS = {
+    "updatedAt": ChatSession.updated_at,
+    "createdAt": ChatSession.created_at,
+    "title": ChatSession.title,
+}
+
+
 @router.get("/sessions")
 async def get_sessions(
     request: Request,
     workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Chat sessions for the caller in this workspace.
+
+    Scoped to the caller as well as the workspace: a conversation belongs to
+    the person who had it, not to everyone who can read the workspace.
+    """
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
-        return []
-    workspace_id = ws.id
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    sessions = (
-        db.query(ChatSession)
-        .filter(ChatSession.workspace_id == workspace_id, ChatSession.user_id == current_user.id)
-        .order_by(ChatSession.updated_at.desc())
-        .all()
+    query = db.query(ChatSession).filter(
+        ChatSession.workspace_id == ws.id,
+        ChatSession.user_id == current_user.id,
     )
-
-    return [
-        {
-            "id": s.id,
-            "title": s.title or "New Chat Session",
-            "workspaceId": s.workspace_id,
-            "createdAt": s.created_at.isoformat(),
-        }
-        for s in sessions
-    ]
+    page = paginate(
+        query,
+        params,
+        sortable=SESSION_SORTS,
+        default_sort="updatedAt",
+        tiebreaker=ChatSession.id,
+        searchable=[ChatSession.title],
+    )
+    return page.envelope(
+        [
+            {
+                "id": session.id,
+                "title": session.title or "New Chat Session",
+                "workspaceId": session.workspace_id,
+                "createdAt": session.created_at.isoformat(),
+            }
+            for session in page.items
+        ]
+    )
 
 
 @router.post("/sessions")

@@ -60,7 +60,12 @@ class TestChatSessions:
     def test_new_account_has_no_sessions(self, client, auth_headers):
         response = client.get("/api/v1/chat/sessions", headers=auth_headers)
         assert response.status_code == 200
-        assert response.json() == []
+        body = response.json()
+        assert body["items"] == []
+        # An empty list still has to describe itself, or a client cannot tell
+        # "no results" from "no more pages".
+        assert body["total"] == 0
+        assert body["hasNext"] is False
 
     def test_session_can_be_created_and_listed(self, client, auth_headers, workspace_id):
         created = client.post(
@@ -69,12 +74,12 @@ class TestChatSessions:
         assert created.status_code == 200
         session_id = created.json()["id"]
 
-        listed = client.get("/api/v1/chat/sessions", headers=auth_headers).json()
+        listed = client.get("/api/v1/chat/sessions", headers=auth_headers).json()["items"]
         assert any(item["id"] == session_id for item in listed)
 
     def test_listed_session_uses_the_frontend_field_names(self, client, auth_headers, workspace_id):
         client.post(f"/api/v1/chat/sessions?workspace_id={workspace_id}", headers=auth_headers)
-        item = client.get("/api/v1/chat/sessions", headers=auth_headers).json()[0]
+        item = client.get("/api/v1/chat/sessions", headers=auth_headers).json()["items"][0]
         # Renaming any of these silently breaks the chat sidebar.
         assert {"id", "title", "workspaceId", "createdAt"} <= set(item)
 
@@ -124,7 +129,7 @@ class TestChatSessions:
             )
         headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
 
-        assert client.get("/api/v1/chat/sessions", headers=headers).json() == []
+        assert client.get("/api/v1/chat/sessions", headers=headers).json()["items"] == []
 
 
 # --------------------------------------------------------------- chat stream --
@@ -196,7 +201,7 @@ class TestChatStream:
             session.close()
 
     def test_a_session_is_created_when_none_is_supplied(self, client, auth_headers, workspace_id):
-        assert client.get("/api/v1/chat/sessions", headers=auth_headers).json() == []
+        assert client.get("/api/v1/chat/sessions", headers=auth_headers).json()["items"] == []
 
         with patch("app.api.v1.chat.stream_rag_response", _stream_of("x", SOURCES_FRAME)):
             client.post(
@@ -205,7 +210,7 @@ class TestChatStream:
                 json={"prompt": "A brand new conversation", "workspace_id": workspace_id},
             )
 
-        sessions = client.get("/api/v1/chat/sessions", headers=auth_headers).json()
+        sessions = client.get("/api/v1/chat/sessions", headers=auth_headers).json()["items"]
         assert len(sessions) == 1
         # The first prompt names the session, so the sidebar is not all "New Chat".
         assert sessions[0]["title"] == "A brand new conversation"[:40]
@@ -322,7 +327,7 @@ class TestReports:
         assert client.get("/api/v1/reports").status_code == 401
 
     def test_new_account_has_no_reports(self, client, auth_headers):
-        assert client.get("/api/v1/reports", headers=auth_headers).json() == []
+        assert client.get("/api/v1/reports", headers=auth_headers).json()["items"] == []
 
     def _graph_output(self):
         return {
@@ -356,7 +361,7 @@ class TestReports:
         # Citations with a document id become the report's provenance.
         assert body["sourceDocumentIds"] == ["doc-7"]
 
-        listed = client.get("/api/v1/reports", headers=auth_headers).json()
+        listed = client.get("/api/v1/reports", headers=auth_headers).json()["items"]
         assert any(item["id"] == body["id"] for item in listed)
 
     def test_explicit_document_ids_win_over_citation_ids(self, client, auth_headers, workspace_id):
@@ -444,7 +449,7 @@ class TestReports:
             )
         headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
 
-        assert client.get("/api/v1/reports", headers=headers).json() == []
+        assert client.get("/api/v1/reports", headers=headers).json()["items"] == []
 
     def test_generating_in_another_users_workspace_is_refused(
         self, client, auth_headers, workspace_id
@@ -486,7 +491,7 @@ class TestReports:
                 headers=auth_headers,
                 json={"title": "Shaped", "objective": "o", "workspace_id": workspace_id},
             )
-        item = client.get("/api/v1/reports", headers=auth_headers).json()[0]
+        item = client.get("/api/v1/reports", headers=auth_headers).json()["items"][0]
         assert {
             "id",
             "title",

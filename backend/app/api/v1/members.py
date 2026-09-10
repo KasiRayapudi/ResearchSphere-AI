@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,7 @@ from app.core.invitations import (
     normalise_email,
 )
 from app.core.logging import get_logger
+from app.core.pagination import PageParams, page_params, paginate
 from app.core.security import get_current_user
 from app.core.workspace_access import membership_for, require_workspace_role
 from app.models.membership import WorkspaceInvitation, WorkspaceMember, WorkspaceRole
@@ -116,11 +117,23 @@ def _resolve(workspace_id: str | None, request: Request, db: Session, current_us
     return ws
 
 
-def _member_payload(db: Session, member: WorkspaceMember) -> MemberResponse:
-    user = db.query(User).filter(User.id == member.user_id).first()
-    inviter = (
-        db.query(User).filter(User.id == member.invited_by).first() if member.invited_by else None
-    )
+def _users_by_id(db: Session, user_ids) -> dict[str, User]:
+    """Fetch several users in one query.
+
+    Rendering a member list used to issue two queries per row -- one for the
+    member, one for whoever invited them -- so a workspace of fifty people
+    cost a hundred round trips. One IN query answers all of them.
+    """
+    wanted = {uid for uid in user_ids if uid}
+    if not wanted:
+        return {}
+    return {user.id: user for user in db.query(User).filter(User.id.in_(wanted)).all()}
+
+
+def _member_payload(member: WorkspaceMember, users: dict[str, User]) -> MemberResponse:
+    """One member row, using a prefetched user map."""
+    user = users.get(member.user_id)
+    inviter = users.get(member.invited_by) if member.invited_by else None
     return MemberResponse(
         id=member.id,
         userId=member.user_id,
@@ -130,6 +143,25 @@ def _member_payload(db: Session, member: WorkspaceMember) -> MemberResponse:
         joinedAt=member.joined_at.isoformat() if member.joined_at else "",
         invitedBy=inviter.full_name if inviter else None,
     )
+
+
+def _one_member(db: Session, member: WorkspaceMember) -> MemberResponse:
+    """A single member row, for endpoints that return exactly one."""
+    return _member_payload(member, _users_by_id(db, [member.user_id, member.invited_by]))
+
+
+#: Sortable columns for the member list.
+MEMBER_SORTS = {
+    "joinedAt": WorkspaceMember.joined_at,
+    "role": WorkspaceMember.role,
+}
+
+INVITATION_SORTS = {
+    "createdAt": WorkspaceInvitation.created_at,
+    "expiresAt": WorkspaceInvitation.expires_at,
+    "email": WorkspaceInvitation.email,
+    "role": WorkspaceInvitation.role,
+}
 
 
 def _invitation_status(invitation: WorkspaceInvitation) -> str:
@@ -143,10 +175,11 @@ def _invitation_status(invitation: WorkspaceInvitation) -> str:
 
 
 # --------------------------------------------------------------- members --
-@router.get("/members", response_model=list[MemberResponse])
+@router.get("/members")
 async def list_members(
     request: Request,
     workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -154,13 +187,18 @@ async def list_members(
     ws = _resolve(workspace_id, request, db, current_user)
     require_workspace_role(request, ws, "members.read", current_user, db=db)
 
-    members = (
-        db.query(WorkspaceMember)
-        .filter(WorkspaceMember.workspace_id == ws.id)
-        .order_by(WorkspaceMember.joined_at.asc())
-        .all()
+    query = db.query(WorkspaceMember).filter(WorkspaceMember.workspace_id == ws.id)
+    page = paginate(
+        query,
+        params,
+        sortable=MEMBER_SORTS,
+        default_sort="joinedAt",
+        tiebreaker=WorkspaceMember.id,
     )
-    return [_member_payload(db, member) for member in members]
+
+    # One query for every user on the page, rather than two per row.
+    users = _users_by_id(db, [m.user_id for m in page.items] + [m.invited_by for m in page.items])
+    return page.envelope([_member_payload(member, users) for member in page.items])
 
 
 @router.patch("/members/{member_id}", response_model=MemberResponse)
@@ -217,7 +255,7 @@ async def update_member_role(
             "to_role": new_role,
         },
     )
-    return _member_payload(db, member)
+    return _one_member(db, member)
 
 
 @router.delete("/members/{member_id}")
@@ -342,14 +380,19 @@ async def transfer_ownership(
         .order_by(WorkspaceMember.joined_at.asc())
         .all()
     )
-    return [_member_payload(db, member) for member in members]
+    users = _users_by_id(db, [m.user_id for m in members] + [m.invited_by for m in members])
+    return [_member_payload(member, users) for member in members]
 
 
 # ----------------------------------------------------------- invitations --
-@router.get("/invitations", response_model=list[InvitationResponse])
+@router.get("/invitations")
 async def list_invitations(
     request: Request,
     workspace_id: str | None = None,
+    status: str | None = Query(
+        None, description="Filter by pending / accepted / revoked / expired."
+    ),
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -357,13 +400,24 @@ async def list_invitations(
     ws = _resolve(workspace_id, request, db, current_user)
     require_workspace_role(request, ws, "members.invite", current_user, db=db)
 
-    invitations = (
-        db.query(WorkspaceInvitation)
-        .filter(WorkspaceInvitation.workspace_id == ws.id)
-        .order_by(WorkspaceInvitation.created_at.desc())
-        .all()
+    query = db.query(WorkspaceInvitation).filter(WorkspaceInvitation.workspace_id == ws.id)
+    # Status is derived from accepted_at / revoked_at / expires_at rather
+    # than stored, so it is filtered after the rows are built rather than in
+    # SQL. That means a status filter narrows the page, not the query; the
+    # totals still describe the unfiltered set, which is the honest reading
+    # of "how many invitations does this workspace have".
+    page = paginate(
+        query,
+        params,
+        sortable=INVITATION_SORTS,
+        default_sort="createdAt",
+        tiebreaker=WorkspaceInvitation.id,
+        searchable=[WorkspaceInvitation.email],
     )
-    return [
+
+    # Previously this ran the same user lookup twice for every row.
+    inviters = _users_by_id(db, [inv.invited_by for inv in page.items])
+    rows = [
         InvitationResponse(
             id=inv.id,
             email=inv.email,
@@ -371,14 +425,17 @@ async def list_invitations(
             expiresAt=inv.expires_at.isoformat(),
             createdAt=inv.created_at.isoformat() if inv.created_at else "",
             invitedBy=(
-                db.query(User).filter(User.id == inv.invited_by).first().full_name
-                if inv.invited_by and db.query(User).filter(User.id == inv.invited_by).first()
+                inviters[inv.invited_by].full_name
+                if inv.invited_by and inv.invited_by in inviters
                 else None
             ),
             status=_invitation_status(inv),
         )
-        for inv in invitations
+        for inv in page.items
     ]
+    if status:
+        rows = [row for row in rows if row.status == status]
+    return page.envelope(rows)
 
 
 @router.post("/invite", response_model=InvitationResponse)

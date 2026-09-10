@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.agents.graph import LangGraphResearchEngine
 from app.core import metrics
 from app.core.database import get_db
+from app.core.pagination import Page, PageParams, page_params, paginate
 from app.core.security import get_current_user, resolve_workspace
 from app.core.workspace_access import require_workspace_role
 from app.models.report import Report as ReportModel
@@ -21,56 +22,75 @@ class StartResearchRequest(BaseModel):
     workspace_id: str | None = None
 
 
+RESEARCH_SORTS = {
+    "createdAt": ReportModel.created_at,
+    "updatedAt": ReportModel.updated_at,
+    "title": ReportModel.title,
+    "status": ReportModel.status,
+}
+
+
 @router.get("")
 async def get_sessions(
     request: Request,
     workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
-        return []
-    workspace_id = ws.id
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    # For MVP, we can return generated research sessions mapped to Reports or ChatSessions
-    # Or query from DB. Let's fetch from Report table since report represents a compiled agent research session!
-    reports = (
-        db.query(ReportModel)
-        .filter(ReportModel.workspace_id == workspace_id, ReportModel.user_id == current_user.id)
-        .order_by(ReportModel.created_at.desc())
-        .all()
+    query = db.query(ReportModel).filter(
+        ReportModel.workspace_id == ws.id, ReportModel.user_id == current_user.id
     )
-
-    return [
-        {
-            "id": r.id,
-            "title": r.title,
-            "objective": r.query,
-            "workspaceId": r.workspace_id,
-            "status": r.status,
-            "progressPercentage": 100 if r.status == "ready" else 0,
-            "sourcesCount": len(r.source_document_ids or []),
-            "createdAt": r.created_at.isoformat(),
-            "updatedAt": r.updated_at.isoformat(),
-            # The trace recorded by the run that produced this report. Empty
-            # for reports generated before the trace was persisted -- an empty
-            # list is honest; the fixed four-step script that used to be
-            # returned here was not.
-            "agentSteps": [
-                {
-                    "id": f"as-{idx}",
-                    "agentName": step.get("agent"),
-                    "status": step.get("status"),
-                    "task": step.get("task"),
-                    "executionTimeMs": step.get("time_ms"),
-                    "timestamp": r.created_at.isoformat(),
-                }
-                for idx, step in enumerate(r.agent_trace or [])
-            ],
-        }
-        for r in reports
-    ]
+    page = paginate(
+        query,
+        params,
+        sortable=RESEARCH_SORTS,
+        default_sort="createdAt",
+        tiebreaker=ReportModel.id,
+        searchable=[ReportModel.title, ReportModel.query],
+    )
+    return page.envelope(
+        [
+            {
+                "id": r.id,
+                "title": r.title,
+                "objective": r.query,
+                "workspaceId": r.workspace_id,
+                "status": r.status,
+                "progressPercentage": 100 if r.status == "ready" else 0,
+                "sourcesCount": len(r.source_document_ids or []),
+                "createdAt": r.created_at.isoformat(),
+                "updatedAt": r.updated_at.isoformat(),
+                # The trace recorded by the run that produced this report.
+                # Empty for reports generated before it was persisted, which
+                # is accurate: theirs was never recorded.
+                "agentSteps": [
+                    {
+                        "id": f"as-{idx}",
+                        "agentName": step.get("agent"),
+                        "status": step.get("status"),
+                        "task": step.get("task"),
+                        "executionTimeMs": step.get("time_ms"),
+                        "timestamp": r.created_at.isoformat(),
+                    }
+                    for idx, step in enumerate(r.agent_trace or [])
+                ],
+            }
+            for r in page.items
+        ]
+    )
 
 
 @router.post("/start")

@@ -56,7 +56,7 @@ def _add_member(client, owner, invitee, role):
     members = client.get(
         f"/api/v1/workspace/members?workspace_id={owner['workspace_id']}",
         headers=owner["headers"],
-    ).json()
+    ).json()["items"]
     return next(m["id"] for m in members if m["userId"] == invitee["id"])
 
 
@@ -101,7 +101,7 @@ class TestMembership:
         members = client.get(
             f"/api/v1/workspace/members?workspace_id={owner['workspace_id']}",
             headers=owner["headers"],
-        ).json()
+        ).json()["items"]
         assert len(members) == 1
         assert members[0]["userId"] == owner["id"]
         assert members[0]["role"] == WorkspaceRole.OWNER
@@ -134,7 +134,7 @@ class TestMembership:
 
         members = client.get(
             f"/api/v1/workspace/members?workspace_id={workspace_id}", headers=owner["headers"]
-        ).json()
+        ).json()["items"]
         assert [m["role"] for m in members] == [WorkspaceRole.OWNER]
 
 
@@ -529,7 +529,7 @@ class TestMemberManagement:
         members = client.get(
             f"/api/v1/workspace/members?workspace_id={owner['workspace_id']}",
             headers=owner["headers"],
-        ).json()
+        ).json()["items"]
         owner_member = next(m for m in members if m["role"] == WorkspaceRole.OWNER)
 
         response = client.patch(
@@ -543,7 +543,7 @@ class TestMemberManagement:
         members = client.get(
             f"/api/v1/workspace/members?workspace_id={owner['workspace_id']}",
             headers=owner["headers"],
-        ).json()
+        ).json()["items"]
         owner_member = next(m for m in members if m["role"] == WorkspaceRole.OWNER)
 
         response = client.delete(
@@ -654,6 +654,6 @@ class TestOwnershipTransfer:
         members = client.get(
             f"/api/v1/workspace/members?workspace_id={owner['workspace_id']}",
             headers=successor["headers"],
-        ).json()
+        ).json()["items"]
         owners = [m for m in members if m["role"] == WorkspaceRole.OWNER]
         assert len(owners) == 1

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -9,6 +9,11 @@ from app.core.database import Base
 
 class Report(Base):
     __tablename__ = "reports"
+    __table_args__ = (
+        # Reports and research sessions are both listed per workspace, per
+        # user, newest first.
+        Index("ix_reports_workspace_user_created", "workspace_id", "user_id", "created_at"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     workspace_id = Column(
@@ -52,6 +57,7 @@ class Report(Base):
 
 class Connector(Base):
     __tablename__ = "connectors"
+    __table_args__ = (Index("ix_connectors_workspace", "workspace_id"),)
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     workspace_id = Column(

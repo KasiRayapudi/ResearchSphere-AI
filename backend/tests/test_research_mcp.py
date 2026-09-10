@@ -50,7 +50,7 @@ class TestResearchSessions:
         assert response.status_code == 401
 
     def test_new_account_has_no_sessions(self, client, auth_headers):
-        assert client.get("/api/v1/research", headers=auth_headers).json() == []
+        assert client.get("/api/v1/research", headers=auth_headers).json()["items"] == []
 
     def _start(self, client, headers, workspace_id, output=None):
         from app.api.v1 import research
@@ -90,7 +90,7 @@ class TestResearchSessions:
         actually did, and timestamps of "1 min ago"/"Just now".
         """
         self._start(client, auth_headers, workspace_id)
-        listed = client.get("/api/v1/research", headers=auth_headers).json()
+        listed = client.get("/api/v1/research", headers=auth_headers).json()["items"]
         assert len(listed) == 1
 
         steps = listed[0]["agentSteps"]
@@ -103,7 +103,7 @@ class TestResearchSessions:
     def test_a_run_with_no_steps_reports_none(self, client, auth_headers, workspace_id):
         output = dict(GRAPH_OUTPUT, agent_trace=[])
         self._start(client, auth_headers, workspace_id, output=output)
-        listed = client.get("/api/v1/research", headers=auth_headers).json()
+        listed = client.get("/api/v1/research", headers=auth_headers).json()["items"]
         # An empty list is honest; inventing steps is not.
         assert listed[0]["agentSteps"] == []
 
@@ -187,7 +187,7 @@ class TestResearchSessions:
     def test_sessions_are_not_visible_across_accounts(self, client, auth_headers, workspace_id):
         self._start(client, auth_headers, workspace_id)
         headers = _other_account(client, "research_isolation@example.com")
-        assert client.get("/api/v1/research", headers=headers).json() == []
+        assert client.get("/api/v1/research", headers=headers).json()["items"] == []
 
     def test_starting_in_another_users_workspace_is_refused(
         self, client, auth_headers, workspace_id
