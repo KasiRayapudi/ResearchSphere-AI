@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     ENVIRONMENT: str = "development"  # development | staging | production
+    #: Start even when the database schema is not at the migration head. A
+    #: development-only escape hatch, ignored in production where a schema
+    #: mismatch always refuses startup. Nothing creates tables automatically
+    #: any more, so a mismatch means migrations are pending.
+    ALLOW_PENDING_MIGRATIONS: bool = False
 
     # Security
     SECRET_KEY: str = "change-this-in-production-super-secret-key-32chars"

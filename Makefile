@@ -58,6 +58,21 @@ frontend-typecheck: ## Type-check the frontend
 
 verify: frontend-typecheck frontend-lint frontend-build ## Run every local check
 
+migrate: ## Apply database migrations (development stack)
+	docker compose run --rm backend migrate
+
+migrate-status: ## Show the current and head revisions (development stack)
+	docker compose run --rm backend python -m alembic current -v
+
+migration: ## Create a migration from model changes: make migration m="add x"
+	cd backend && ./venv/Scripts/python -m alembic revision --autogenerate -m "$(m)"
+
+prod-migrate: ## Apply database migrations (production stack)
+	docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend migrate
+
+prod-stamp: ## Mark an existing pre-Alembic database as current WITHOUT migrating
+	docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend stamp
+
 worker-logs: ## Tail the ingestion worker (development stack)
 	docker compose logs -f worker
 

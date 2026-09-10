@@ -28,7 +28,7 @@ from app.api.v1 import (
 )
 from app.core import metrics
 from app.core.config import ConfigurationError, settings, validate_configuration
-from app.core.database import Base, engine
+from app.core.database import engine
 from app.core.exception_handlers import (
     app_exception_handler,
     generic_exception_handler,
@@ -44,6 +44,7 @@ from app.core.middleware import (
     RequestIDMiddleware,
     SecurityHeadersMiddleware,
 )
+from app.core.schema import verify_schema
 
 # Optional external services imports for health checks
 try:
@@ -274,13 +275,14 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(f"[startup] {name}: {status}")
 
-    # Development convenience: ensure tables exist. Production uses migrations.
-    if not settings.is_production and checks["database"] == "ok":
-        try:
-            Base.metadata.create_all(bind=engine)
-            logger.info("[startup] database schema ensured (development mode)")
-        except Exception as exc:
-            logger.error(f"[startup] schema creation failed: {exc}")
+    # The schema is owned by Alembic, not by the application. create_all used
+    # to run here outside production; it creates missing tables but never
+    # alters an existing one, so a drifted database looked healthy until a
+    # query hit a column that was never added. Startup now verifies the
+    # recorded revision and refuses to run against a schema this build was
+    # not written for.
+    if checks["database"] == "ok":
+        await run_in_threadpool(verify_schema, engine)
 
     degraded = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
     if degraded:

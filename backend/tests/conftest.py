@@ -32,7 +32,6 @@ os.environ["TRUSTED_HOSTS"] = "localhost,127.0.0.1,testserver"
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
-from app.core.database import Base, engine  # noqa: E402
 
 #: Satisfies the backend password policy; reused across tests.
 STRONG_PASSWORD = "Xk9#mQp2$vLw7"
@@ -40,8 +39,18 @@ STRONG_PASSWORD = "Xk9#mQp2$vLw7"
 
 @pytest.fixture(scope="session", autouse=True)
 def _create_schema():
-    """Create every table once for the session."""
-    Base.metadata.create_all(bind=engine)
+    """Build the test schema by running the real migrations.
+
+    Deliberately not Base.metadata.create_all: that would test the models
+    against a schema no deployment ever gets. Running `alembic upgrade head`
+    here means every test executes against the schema a fresh install
+    actually receives, so a migration that does not match the models fails
+    the suite rather than production.
+    """
+    from alembic import command
+    from app.core.schema import alembic_config
+
+    command.upgrade(alembic_config(), "head")
     yield
 
 

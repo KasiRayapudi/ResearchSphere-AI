@@ -120,6 +120,28 @@ case "${1:-serve}" in
             --log-level "${UVICORN_LOG_LEVEL:-info}"
         ;;
 
+    migrate)
+        # Applies pending migrations and exits. Run this as a one-shot task
+        # before rolling out a new version; the API refuses to start against
+        # a schema it was not built for, so ordering is enforced either way.
+        wait_for_dependencies
+        validate_config
+
+        log INFO "applying database migrations"
+        exec python -m alembic upgrade head
+        ;;
+
+    stamp)
+        # Records the current schema as being at the migration head WITHOUT
+        # running any migration. Only for a database created before Alembic
+        # was introduced, whose tables already match the baseline. Running
+        # `migrate` there would try to create tables that already exist.
+        validate_config
+
+        log WARN "stamping the database as up to date without applying migrations"
+        exec python -m alembic stamp head
+        ;;
+
     worker)
         # Celery worker for document ingestion. Waits for the same
         # dependencies the API does, since it needs the database, Qdrant and

@@ -302,8 +302,37 @@ venv\Scripts\activate
 
 pip install -r requirements.txt
 
+# Create the database schema. The application does not create tables:
+# it verifies the migration revision at startup and refuses to run
+# against a schema it was not built for.
+alembic upgrade head
+
 uvicorn main:app --reload
 ```
+
+If the server refuses to start with a schema error, it names the command to
+run. The two it can ask for are different and are not interchangeable:
+
+- `alembic upgrade head` - applies migrations. Use it on an empty database
+  or one already managed by Alembic.
+- `alembic stamp head` - records the current schema as up to date without
+  changing anything. Use it **only** on a database created before Alembic
+  was introduced, whose tables already match.
+
+Also useful:
+
+```bash
+alembic current -v                    # what the database is at
+alembic upgrade head --sql            # print the SQL instead of applying it
+make migration m="add widget table"   # autogenerate after a model change
+```
+
+Full detail, including how existing deployments migrate:
+[`backend/migrations/README.md`](backend/migrations/README.md).
+
+Document ingestion runs in a Celery worker rather than in the upload
+request. `docker compose up` starts one; running the API on its own without
+Redis falls back to indexing inline and logs a warning each time.
 
 ---
 
