@@ -441,25 +441,32 @@ class TestDocumentDeletion:
             for item in client.get("/api/v1/documents", headers=auth_headers).json()["items"]
         )
 
-    def test_local_file_is_removed(self, client, auth_headers, workspace_id, indexing_stubs):
-        import os
+    def test_stored_object_is_removed(self, client, auth_headers, workspace_id, indexing_stubs):
+        """Deleting a document must not leave its bytes behind.
+
+        Asked through the storage layer rather than through file_path: an
+        upload no longer records an absolute path, and the guarantee holds
+        whichever provider is configured.
+        """
+        from app.core.database import SessionLocal
+        from app.models.document import Document
+        from app.services.storage import get_storage, resolve_key
 
         document_id = _upload(client, auth_headers, workspace_id=workspace_id).json()["id"]
 
-        from app.core.database import SessionLocal
-        from app.models.document import Document
-
         session = SessionLocal()
         try:
-            path = session.get(Document, document_id).file_path
+            document = session.get(Document, document_id)
+            key = resolve_key(document.storage_key, document.file_path)
         finally:
             session.close()
-        assert os.path.exists(path)
+        assert key, "an upload must record where its bytes went"
+        assert get_storage().exists(key)
 
         with patch("app.api.v1.documents.delete_document_vectors"):
             client.delete(f"/api/v1/documents/{document_id}", headers=auth_headers)
-        # Orphaned files on disk are a slow storage leak.
-        assert not os.path.exists(path)
+        # Orphaned objects are a slow storage leak.
+        assert not get_storage().exists(key)
 
     def test_another_users_document_cannot_be_deleted(
         self, client, auth_headers, workspace_id, indexing_stubs
