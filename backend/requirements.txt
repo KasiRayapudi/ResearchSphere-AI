@@ -28,6 +28,11 @@ numpy==1.26.4
 redis==5.1.1
 celery==5.4.0
 
+# Object storage. Imported lazily by app/services/storage/s3.py, but declared
+# here because STORAGE_PROVIDER=s3 (or minio) is the supported production
+# configuration and the image must be able to serve it.
+boto3==1.35.36
+
 # Observability. Both are imported by app/core/metrics.py, which main.py
 # imports at startup, so they are runtime dependencies rather than tooling:
 # prometheus_client is a hard top-level import and the application cannot

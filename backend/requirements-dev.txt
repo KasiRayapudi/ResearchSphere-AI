@@ -30,3 +30,8 @@ pip-licenses==5.0.0
 
 # Test doubles for Redis-backed features (no server required in CI)
 fakeredis==2.26.1
+
+# In-process S3 implementation for the storage tests. moto serves the real
+# botocore request path, so the S3 provider is exercised end to end rather
+# than against a hand-written stub of the client.
+moto[s3]==5.0.18
