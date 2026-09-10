@@ -89,8 +89,10 @@ class TestBaselineMatchesModels:
     def test_every_model_table_is_created(self, tmp_path):
         migrated = set(_describe(_migrated_engine(tmp_path, "t.db")))
         assert migrated == set(_model_metadata().tables)
-        # Guards against a model being added without a migration.
-        assert len(migrated) == 10
+        # Deliberate magic number. The comparison above passes if a model is
+        # defined but never imported, because it is then absent from both
+        # sides. Bump this only when a table is genuinely added.
+        assert len(migrated) == 12
 
     def test_there_is_exactly_one_head(self):
         """Two heads mean `upgrade head` is ambiguous and will fail."""
@@ -113,13 +115,22 @@ class TestBaselineMatchesModels:
             config = alembic_config()
             command.upgrade(config, "head")
             engine = create_engine(url)
-            assert _describe(engine)  # tables exist
+            at_head = _describe(engine)
+            assert at_head, "upgrade head created nothing"
 
+            # Reverse only the newest revision, then re-apply it. Written
+            # against whatever the newest revision happens to be so it keeps
+            # testing the migration that was just added, rather than a
+            # revision hard-coded when this test was written.
             command.downgrade(config, "-1")
-            assert _describe(engine) == {}  # baseline removed everything
+            assert _describe(engine) != at_head, "downgrade changed nothing"
 
             command.upgrade(config, "head")
-            assert set(_describe(engine)) == set(_describe(_models_engine(tmp_path, "cmp.db")))
+            assert _describe(engine) == at_head, "the round trip did not restore the schema"
+
+            # And all the way down, which is what a full rollback does.
+            command.downgrade(config, "base")
+            assert _describe(engine) == {}
             engine.dispose()
         finally:
             settings.DATABASE_URL = original

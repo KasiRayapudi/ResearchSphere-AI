@@ -26,3 +26,12 @@ class Workspace(Base):
     )
     reports = relationship("Report", back_populates="workspace", cascade="all, delete-orphan")
     connectors = relationship("Connector", back_populates="workspace", cascade="all, delete-orphan")
+    #: owner_id remains the denormalised pointer to the owner member, kept so
+    #: existing queries and API responses are unchanged. Access control goes
+    #: through `members`.
+    members = relationship(
+        "WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan"
+    )
+    invitations = relationship(
+        "WorkspaceInvitation", back_populates="workspace", cascade="all, delete-orphan"
+    )
