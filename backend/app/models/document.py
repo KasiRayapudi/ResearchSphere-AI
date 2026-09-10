@@ -44,13 +44,7 @@ class Document(Base):
     version = Column(Integer, default=1)
     ocr_applied = Column(Boolean, default=False)
     folder_path = Column(String(500), default="/Uploads")
-    # Existing fields continue unchanged
     title = Column(String(500), nullable=True)
-    description = Column(Text, nullable=True)
-    tags = Column(JSON, default=list)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    indexed_at = Column(DateTime, nullable=True)
     description = Column(Text, nullable=True)
     tags = Column(JSON, default=list)
 
