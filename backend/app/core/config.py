@@ -87,6 +87,31 @@ class Settings(BaseSettings):
     #: credential, so it should outlive the click and little else.
     SIGNED_URL_EXPIRE_SECONDS: int = 300
 
+    # --- Realtime (WebSocket) ---------------------------------------------
+    #: Turns the WebSocket endpoint off entirely. The REST API is unchanged
+    #: either way, so this is a safe switch to flip during an incident.
+    WS_ENABLED: bool = True
+    #: How often the reaper looks for connections that have gone quiet.
+    WS_HEARTBEAT_INTERVAL_SECONDS: int = 25
+    #: Silence longer than this closes the connection. Must be comfortably
+    #: more than the client's ping interval, or healthy clients get reaped
+    #: between their own heartbeats.
+    WS_HEARTBEAT_TIMEOUT_SECONDS: int = 60
+    #: A browser tab is one connection; the cap allows for a few tabs plus a
+    #: reconnect overlapping the socket it replaces.
+    WS_MAX_CONNECTIONS_PER_USER: int = 5
+    #: Ceiling for the process. Nothing else bounds this: every HTTP
+    #: middleware, rate limiting included, skips non-HTTP scopes.
+    WS_MAX_CONNECTIONS_TOTAL: int = 1000
+    #: Events buffered per connection before it is treated as too slow to
+    #: keep. Deep enough to absorb a burst, shallow enough that a stalled
+    #: client is noticed rather than accumulated.
+    WS_SEND_QUEUE_SIZE: int = 100
+    #: Events retained per workspace for reconnect replay. Bounds the memory
+    #: a busy workspace can occupy in Redis, and caps how far behind a client
+    #: can be and still catch up without refetching.
+    WS_REPLAY_BUFFER_SIZE: int = 200
+
     #: How long an object must have existed before the sweep will consider
     #: it orphaned. Generous on purpose: an upload writes the object before
     #: it commits the row, so a shorter window could delete a file that is
