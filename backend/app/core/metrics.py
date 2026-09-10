@@ -163,6 +163,13 @@ upload_duration_seconds = Histogram(
     buckets=MODEL_LATENCY_BUCKETS,
 )
 
+upload_request_duration_seconds = Histogram(
+    "researchsphere_upload_request_duration_seconds",
+    "Time to accept an upload: validation, scan and storage, up to the point "
+    "the document is queued. Excludes indexing, which happens in a worker.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+
 upload_size_bytes = Histogram(
     "researchsphere_upload_size_bytes",
     "Accepted upload size.",

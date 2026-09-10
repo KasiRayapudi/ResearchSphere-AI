@@ -120,6 +120,28 @@ case "${1:-serve}" in
             --log-level "${UVICORN_LOG_LEVEL:-info}"
         ;;
 
+    worker)
+        # Celery worker for document ingestion. Waits for the same
+        # dependencies the API does, since it needs the database, Qdrant and
+        # the broker before it can usefully consume anything.
+        wait_for_dependencies
+        validate_config
+
+        concurrency="${CELERY_CONCURRENCY:-2}"
+        log INFO "starting celery worker (concurrency=${concurrency})"
+        exec python -m celery -A app.worker.celery_app:celery_app worker             --loglevel "${CELERY_LOG_LEVEL:-info}"             --concurrency "$concurrency"             --hostname "ingest@%h"             --queues "${CELERY_QUEUES:-celery}"
+        ;;
+
+    beat)
+        # Scheduler for the periodic reclaim of documents whose worker died.
+        # Exactly one beat process may run per deployment.
+        wait_for_dependencies
+        validate_config
+
+        log INFO "starting celery beat"
+        exec python -m celery -A app.worker.celery_app:celery_app beat             --loglevel "${CELERY_LOG_LEVEL:-info}"
+        ;;
+
     *)
         exec "$@"
         ;;

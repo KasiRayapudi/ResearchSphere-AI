@@ -87,6 +87,9 @@ class AuditAction(str, Enum):
     DOCUMENT_UPLOAD_REJECTED = "document.upload.rejected"
     DOCUMENT_DUPLICATE = "document.upload.duplicate"
     DOCUMENT_QUARANTINE = "document.quarantine"
+    #: Terminal outcome of background ingestion, success or failure. Distinct
+    #: from DOCUMENT_UPLOAD, which now records acceptance of the file only.
+    DOCUMENT_INDEXED = "document.indexed"
 
     # Reports
     REPORT_GENERATE = "report.generate"

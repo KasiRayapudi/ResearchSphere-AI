@@ -17,10 +17,15 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 def indexing_stubs():
-    """Substitute the embedding model and Qdrant, leaving everything else real."""
+    """Substitute the embedding model and Qdrant, leaving everything else real.
+
+    Patched on app.worker.tasks: ingestion moved into the Celery task, and
+    with no broker configured in the test environment the dispatcher runs
+    that task inline, so these uploads still finish indexed.
+    """
     with (
-        patch("app.api.v1.documents.embed_texts") as embed,
-        patch("app.api.v1.documents.upsert_chunks") as upsert,
+        patch("app.worker.tasks.embed_texts") as embed,
+        patch("app.worker.tasks.upsert_chunks") as upsert,
     ):
         embed.side_effect = lambda texts: [[0.1] * 384 for _ in texts]
         upsert.side_effect = lambda chunks, embeddings, document_id, workspace_id: [
@@ -333,39 +338,55 @@ class TestDuplicateDetection:
 
 # ------------------------------------------------------ processing failure --
 class TestProcessingFailure:
+    """Indexing now fails in the worker, not in the request.
+
+    The upload itself succeeds once the file is stored and the document is
+    recorded, so a failure during extraction or embedding shows up on the
+    document rather than as a 5xx on the upload.
+    """
+
     def test_embedding_failure_marks_the_document_failed(self, client, auth_headers, workspace_id):
-        with patch("app.api.v1.documents.embed_texts", side_effect=RuntimeError("model down")):
+        with patch("app.worker.tasks.embed_texts", side_effect=RuntimeError("model down")):
             response = _upload(client, auth_headers, workspace_id=workspace_id)
 
-        assert response.status_code == 500
+        # Accepted: the file is stored and the document exists.
+        assert response.status_code == 200
+        document_id = response.json()["id"]
 
-        from app.core.database import SessionLocal
-        from app.models.document import Document
+        status = client.get(f"/api/v1/documents/{document_id}/status", headers=auth_headers)
+        assert status.status_code == 200
+        body = status.json()
+        assert body["status"] == "failed"
+        # The reason must be recorded, not just the status.
+        assert "model down" in (body["error"] or "")
 
-        session = SessionLocal()
-        try:
-            doc = (
-                session.query(Document)
-                .filter(Document.status == "failed")
-                .order_by(Document.created_at.desc())
-                .first()
-            )
-            assert doc is not None
-            # The reason must be recorded, not just the status.
-            assert "model down" in (doc.error_message or "")
-        finally:
-            session.close()
+    def test_a_failed_document_is_not_left_processing(self, client, auth_headers, workspace_id):
+        with patch("app.worker.tasks.embed_texts", side_effect=RuntimeError("model down")):
+            response = _upload(client, auth_headers, workspace_id=workspace_id)
 
-    def test_vector_upsert_failure_is_surfaced(self, client, auth_headers, workspace_id):
+        body = client.get(
+            f"/api/v1/documents/{response.json()['id']}/status", headers=auth_headers
+        ).json()
+        # A document stuck in "processing" is a spinner that never resolves.
+        assert body["status"] != "processing"
+        assert body["completedAt"] is not None
+
+    def test_vector_upsert_failure_is_recorded(self, client, auth_headers, workspace_id):
         with (
-            patch("app.api.v1.documents.embed_texts", lambda texts: [[0.1] * 384 for _ in texts]),
-            patch("app.api.v1.documents.upsert_chunks", side_effect=RuntimeError("qdrant refused")),
+            patch("app.worker.tasks.embed_texts", lambda texts: [[0.1] * 384 for _ in texts]),
+            patch("app.worker.tasks.upsert_chunks", side_effect=RuntimeError("qdrant refused")),
         ):
             response = _upload(client, auth_headers, workspace_id=workspace_id)
-        assert response.status_code == 500
 
-    def test_failed_upload_is_counted(self, client, auth_headers, workspace_id):
-        with patch("app.api.v1.documents.embed_texts", side_effect=RuntimeError("boom")):
+        assert response.status_code == 200
+        body = client.get(
+            f"/api/v1/documents/{response.json()['id']}/status", headers=auth_headers
+        ).json()
+        assert body["status"] == "failed"
+        assert "qdrant refused" in (body["error"] or "")
+
+    def test_failed_indexing_is_counted(self, client, auth_headers, workspace_id):
+        with patch("app.worker.tasks.embed_texts", side_effect=RuntimeError("boom")):
             _upload(client, auth_headers, workspace_id=workspace_id)
         assert 'researchsphere_uploads_total{outcome="failed"}' in client.get("/metrics").text
 

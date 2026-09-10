@@ -95,7 +95,7 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
-    environment:
+    environment: &backend_env
       ENVIRONMENT: production
       DEBUG: "false"
       # `?err` makes compose refuse to start when the value is missing, rather
@@ -138,6 +138,73 @@ services:
     networks: [backend_net]
     security_opt:
       - no-new-privileges:true
+
+  # --------------------------------------------------------------- worker --
+  # Document ingestion: extraction, chunking, embedding and the vector
+  # upsert. Runs the same image as the API with a different entrypoint
+  # command, so there is one artefact to build, scan and promote.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    container_name: rs-worker
+    command: ["worker"]
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *backend_env
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
+    volumes:
+      # The worker reads the files the API stored, so it needs the same
+      # volume. Without this every ingest fails with a missing file.
+      - uploads_data:/app/uploads
+      # Shared with the API so the embedding model is downloaded once.
+      - model_cache:/home/appuser/.cache
+    healthcheck:
+      test: ["CMD", "python", "-m", "celery", "-A", "app.worker.celery_app:celery_app", "inspect", "ping", "-d", "ingest@$$HOSTNAME"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    # Long enough for an in-flight document to finish rather than being
+    # redelivered; acks_late means an interrupted task is retried anyway.
+    stop_grace_period: 120s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 4G }
+
+  # Scheduler for the periodic reclaim of documents whose worker died.
+  # Exactly one of these may run: a second would duplicate every tick.
+  beat:
+    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    container_name: rs-beat
+    command: ["beat"]
+    <<: *default-restart
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    environment:
+      <<: *backend_env
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
     deploy:
       resources:
         limits: { cpus: "2.00", memory: 4G }

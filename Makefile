@@ -58,5 +58,11 @@ frontend-typecheck: ## Type-check the frontend
 
 verify: frontend-typecheck frontend-lint frontend-build ## Run every local check
 
+worker-logs: ## Tail the ingestion worker (development stack)
+	docker compose logs -f worker
+
+prod-worker-logs: ## Tail the ingestion worker (production stack)
+	docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f worker beat
+
 clean: ## Remove build artefacts (never touches volumes or .env files)
 	rm -rf frontend/dist backend/__pycache__ backend/**/__pycache__

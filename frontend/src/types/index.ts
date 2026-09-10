@@ -136,3 +136,23 @@ export interface FeatureFlag {
   enabled: boolean;
   targetRole: string;
 }
+
+/**
+ * Indexing progress for a document, from GET /documents/{id}/status.
+ *
+ * Ingestion runs in a background worker, so an upload returns `queued` and
+ * the document moves through `processing` to one of the terminal states.
+ */
+export interface DocumentStatus {
+  id: string;
+  status: 'queued' | 'processing' | 'indexed' | 'failed' | 'pending';
+  progress: number;
+  chunkCount: number;
+  error: string | null;
+  updatedAt: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+/** States a document will not move on from without a new request. */
+export const TERMINAL_DOCUMENT_STATUSES = ['indexed', 'failed'] as const;

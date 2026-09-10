@@ -1,6 +1,5 @@
 import os
 import time
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -23,13 +22,12 @@ from app.core.upload_security import (
     validate_content,
     validate_extension,
 )
-from app.models.document import Document, DocumentChunk
+from app.models.document import Document, DocumentStatus
 from app.models.user import User
 from app.models.workspace import Workspace
-from app.rag.document_processor import chunk_text, clean_text, extract_text
-from app.rag.embeddings import embed_texts
-from app.rag.vector_store import delete_document_vectors, upsert_chunks
+from app.rag.vector_store import delete_document_vectors
 from app.services.antivirus import get_scanner
+from app.worker.dispatch import enqueue_document_processing
 
 router = APIRouter()
 logger = get_logger("documents")
@@ -258,105 +256,30 @@ async def upload_document(
         file_path=file_path,
         content_hash=content_hash,
         mime_type=mime_type,
-        status="processing",
+        status=DocumentStatus.QUEUED,
+        progress=0,
         folder_path=folder or "/Uploads",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
 
-    try:
-        # 4. Extract and clean text.
-        #
-        # Everything from here to the vector upsert is synchronous, CPU- or
-        # network-bound work measured in seconds: PDF parsing, a
-        # sentence-transformers forward pass, and a round trip to Qdrant.
-        # Called directly from this async handler it would hold the event
-        # loop for the whole upload, so the worker would serve no other
-        # request -- health probes included -- until it finished.
-        text = await run_in_threadpool(extract_text, file_path, ext)
-        cleaned = await run_in_threadpool(clean_text, text)
-
-        # 5. Chunk text
-        chunks = await run_in_threadpool(chunk_text, cleaned)
-
-        # 6. Embed chunks
-        contents = [c["content"] for c in chunks]
-        embeddings = await run_in_threadpool(embed_texts, contents)
-
-        # 7. Write chunks to DB and Vector DB
-        chunk_db_objects = []
-        for idx, chunk in enumerate(chunks):
-            db_chunk = DocumentChunk(
-                document_id=doc.id,
-                chunk_index=idx,
-                content=chunk["content"],
-                token_count=chunk["token_count"],
-            )
-            db.add(db_chunk)
-            chunk_db_objects.append(db_chunk)
-
-        db.commit()
-
-        # Map each Qdrant point back to its stored chunk row.
-        for idx, db_chunk in enumerate(chunk_db_objects):
-            chunks[idx]["db_id"] = db_chunk.id
-            db.refresh(db_chunk)
-
-        # 8. Upsert into Qdrant
-        point_ids = await run_in_threadpool(
-            upsert_chunks,
-            chunks=chunks,
-            embeddings=embeddings,
-            document_id=doc.id,
-            workspace_id=workspace_id,
-        )
-
-        # Save Qdrant point IDs on chunks
-        for idx, point_id in enumerate(point_ids):
-            chunk_db_objects[idx].qdrant_point_id = point_id
-
-        # 9. Update Document status
-        doc.status = "indexed"
-        doc.chunk_count = len(chunks)
-        doc.indexed_at = datetime.utcnow()
-        db.commit()
-
-    except Exception as e:
-        doc.status = "failed"
-        doc.error_message = str(e)
-        db.commit()
-        # Clean up file on failure. Must never raise: on Windows an extractor
-        # that failed mid-parse can still hold the handle, and letting that
-        # PermissionError escape would mask the real processing error and
-        # bypass the audit record below.
-        discard_quarantined(file_path)
-        metrics.safe(metrics.uploads_total.labels(outcome="failed").inc)
-        audit(
-            action=AuditAction.DOCUMENT_UPLOAD,
-            actor=current_user,
-            outcome=AuditOutcome.FAILURE,
-            resource=f"document:{doc.id}",
-            request=request,
-            metadata={
-                "filename": doc.original_filename,
-                "file_type": ext,
-                "detected_kind": detected_kind,
-                "mime_type": mime_type,
-                "file_size": file_size,
-                "sha256": content_hash,
-                "workspace_id": workspace_id,
-                "antivirus": scan_result.to_metadata(),
-                "reason": str(e)[:200],
-            },
-        )
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}") from e
+    # 4. Hand the document to a worker.
+    #
+    # Extraction, embedding and the vector upsert used to run here, inside
+    # the request. For a large PDF that is minutes of work holding a
+    # connection open, well past any proxy timeout, and it fails the whole
+    # upload if one dependency is briefly unavailable. The file is already
+    # stored and the row already committed, so the response can be returned
+    # now and the indexing observed through GET /documents/{id}/status.
+    task_id = await run_in_threadpool(enqueue_document_processing, doc.id)
+    db.refresh(doc)
 
     metrics.safe(metrics.uploads_total.labels(outcome="accepted").inc)
-    metrics.safe(metrics.documents_indexed_total.inc)
-    metrics.safe(metrics.document_chunks_total.inc, doc.chunk_count or 0)
     metrics.safe(metrics.upload_size_bytes.labels(file_type=ext).observe, file_size)
-    metrics.safe(metrics.upload_duration_seconds.observe, time.perf_counter() - upload_started)
+    metrics.safe(
+        metrics.upload_request_duration_seconds.observe, time.perf_counter() - upload_started
+    )
     audit(
         action=AuditAction.DOCUMENT_UPLOAD,
         actor=current_user,
@@ -370,9 +293,10 @@ async def upload_document(
             "mime_type": mime_type,
             "file_size": file_size,
             "sha256": content_hash,
-            "chunk_count": doc.chunk_count,
             "workspace_id": workspace_id,
             "antivirus": scan_result.to_metadata(),
+            "queued": task_id is not None,
+            "task_id": task_id,
         },
     )
 
@@ -383,12 +307,61 @@ async def upload_document(
         "fileSizeKb": doc.file_size // 1024,
         "status": doc.status,
         "chunkCount": doc.chunk_count,
+        "progress": doc.progress,
         "tags": doc.tags or ["auto-indexed"],
         "uploadedBy": current_user.full_name,
         "uploadedAt": doc.created_at.isoformat(),
         "version": doc.version,
         "ocrApplied": ext == "pdf",
         "folderPath": doc.folder_path,
+    }
+
+
+@router.get("/{id}/status")
+async def get_document_status(
+    id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Progress of background indexing for one document.
+
+    Polled by the upload UI until the document reaches a terminal state.
+    Deliberately narrow: it returns only what a progress display needs, so
+    it stays cheap enough to call every couple of seconds per upload.
+
+    Ownership is resolved through the owning workspace, exactly as deletion
+    is, and an unowned document is reported as missing rather than
+    forbidden so ids cannot be probed.
+    """
+    doc = (
+        db.query(Document)
+        .join(Workspace, Document.workspace_id == Workspace.id)
+        .filter(Document.id == id, Workspace.owner_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        audit(
+            action=AuditAction.PERMISSION_DENIED,
+            actor=current_user,
+            outcome=AuditOutcome.DENIED,
+            resource=f"document:{id}",
+            request=request,
+            metadata={"reason": "not_owner_or_not_found", "endpoint": "status"},
+        )
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "id": doc.id,
+        "status": doc.status,
+        "progress": doc.progress or 0,
+        "chunkCount": doc.chunk_count or 0,
+        "error": doc.error_message,
+        "updatedAt": doc.updated_at.isoformat() if doc.updated_at else None,
+        "startedAt": (doc.processing_started_at.isoformat() if doc.processing_started_at else None),
+        "completedAt": (
+            doc.processing_completed_at.isoformat() if doc.processing_completed_at else None
+        ),
     }
 
 

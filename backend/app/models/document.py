@@ -8,10 +8,17 @@ from app.core.database import Base
 
 
 class DocumentStatus(str):
-    PENDING = "pending"
+    #: Accepted and stored, waiting for a worker to pick it up.
+    QUEUED = "queued"
     PROCESSING = "processing"
     INDEXED = "indexed"
     FAILED = "failed"
+    #: Retained for rows written before ingestion became asynchronous. Nothing
+    #: sets it any more; it is treated as a terminal unknown by the API.
+    PENDING = "pending"
+
+    #: States a document will not move on from without a new request.
+    TERMINAL = ("indexed", "failed")
 
 
 class Document(Base):
@@ -35,10 +42,21 @@ class Document(Base):
     content_hash = Column(String(64), nullable=True, index=True)
     mime_type = Column(String(120), nullable=True)
 
-    # Processing status
-    status = Column(String(20), default="pending")  # pending, processing, indexed, failed
+    # Processing status. See DocumentStatus for the vocabulary.
+    status = Column(String(20), default="queued", index=True)
     chunk_count = Column(Integer, default=0)
     error_message = Column(Text, nullable=True)
+
+    #: Coarse percentage for the upload UI, 0-100. Written at stage
+    #: boundaries by the ingestion task rather than continuously, so it is
+    #: cheap: a handful of UPDATEs per document.
+    progress = Column(Integer, default=0, nullable=False)
+
+    #: When a worker claimed the document and when it let go. Both NULL while
+    #: queued. The pair is what makes a stalled document identifiable: a row
+    #: that has been "processing" since long ago has lost its worker.
+    processing_started_at = Column(DateTime, nullable=True)
+    processing_completed_at = Column(DateTime, nullable=True)
 
     # Metadata
     version = Column(Integer, default=1)

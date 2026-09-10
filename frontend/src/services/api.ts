@@ -12,6 +12,7 @@ import { api, tokenStore, ApiError } from './apiClient';
 import type {
   AnalyticsData,
   Document,
+  DocumentStatus,
   FeatureFlag,
   MCPConnector,
   Report,
@@ -165,6 +166,15 @@ export class ApiService {
    * upload progress. Returns the created document; `duplicate` is set by the
    * backend when identical content already exists in the workspace.
    */
+  /** Indexing progress for one document. Polled while an upload finishes. */
+  static getDocumentStatus(id: string): Promise<DocumentStatus> {
+    return api.get<DocumentStatus>(`/documents/${encodeURIComponent(id)}/status`, {
+      // Polled repeatedly; a failed poll is retried by the next tick, so
+      // there is no value in retrying inside a single one.
+      retries: 0,
+    });
+  }
+
   static uploadDocument(
     file: File,
     opts: {
