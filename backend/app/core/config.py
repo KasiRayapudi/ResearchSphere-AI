@@ -60,6 +60,22 @@ class Settings(BaseSettings):
     # File Storage
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
+
+    # --- Outbound email ---------------------------------------------------
+    #: "console" logs messages instead of sending them, which is the default
+    #: so a developer without a mail server is not blocked. Set "smtp" and
+    #: the SMTP_* values below to actually deliver.
+    EMAIL_BACKEND: str = "console"
+    EMAIL_FROM: str = "ResearchSphere <no-reply@researchsphere.local>"
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT: int = 10
+
+    #: How long a workspace invitation stays acceptable.
+    INVITATION_EXPIRE_HOURS: int = 168  # 7 days
     #: Storage quota reported to the workspace analytics view. Nothing
     #: enforces it -- it is the figure the usage bar is drawn against, and it
     #: was previously a 50000 literal repeated in the analytics route.
@@ -340,6 +356,16 @@ def validate_configuration(config: "Settings" = None) -> dict:
         fail(f"MAX_UPLOAD_SIZE_MB must be positive (got {cfg.MAX_UPLOAD_SIZE_MB}).")
     if not cfg.allowed_upload_extensions:
         fail("ALLOWED_UPLOAD_EXTENSIONS is empty; every upload would be rejected.")
+
+    # --- Email ---
+    if (cfg.EMAIL_BACKEND or "").strip().lower() == "smtp":
+        if not (cfg.SMTP_HOST or "").strip():
+            fail("EMAIL_BACKEND is 'smtp' but SMTP_HOST is not set.")
+    elif production:
+        warnings.append(
+            "EMAIL_BACKEND is not 'smtp', so workspace invitations and password "
+            "resets are written to the log instead of being delivered."
+        )
 
     # --- Misc production hygiene ---
     if production and cfg.DEBUG:

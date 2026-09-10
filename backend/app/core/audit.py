@@ -97,6 +97,14 @@ class AuditAction(str, Enum):
     # Connectors
     CONNECTOR_TOGGLE = "connector.toggle"
 
+    # Workspace collaboration
+    WORKSPACE_INVITED = "workspace.invite.sent"
+    WORKSPACE_INVITE_ACCEPTED = "workspace.invite.accepted"
+    WORKSPACE_INVITE_REVOKED = "workspace.invite.revoked"
+    WORKSPACE_MEMBER_REMOVED = "workspace.member.removed"
+    WORKSPACE_MEMBER_ROLE_CHANGED = "workspace.member.role_changed"
+    WORKSPACE_OWNERSHIP_TRANSFERRED = "workspace.ownership.transferred"
+
     # Admin
     ADMIN_ACCESS = "admin.access"
     ADMIN_ACTION = "admin.action"

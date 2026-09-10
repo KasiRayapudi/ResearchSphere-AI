@@ -22,6 +22,7 @@ from app.api.v1 import (
     chat_router,
     documents_router,
     mcp_router,
+    members_router,
     reports_router,
     research_router,
     workspaces_router,
@@ -406,6 +407,10 @@ def create_app() -> FastAPI:
     # -------------------------------------------------------------------
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
     app.include_router(workspaces_router, prefix="/api/v1/workspaces", tags=["Workspaces"])
+    # Mounted under the same prefix: members and invitations belong to a
+    # workspace, and keeping them there means one place to reason about
+    # workspace-scoped authorization.
+    app.include_router(members_router, prefix="/api/v1/workspace", tags=["Workspace members"])
     app.include_router(documents_router, prefix="/api/v1/documents", tags=["Documents"])
     app.include_router(chat_router, prefix="/api/v1/chat", tags=["RAG Chat"])
     app.include_router(research_router, prefix="/api/v1/research", tags=["LangGraph Agents"])

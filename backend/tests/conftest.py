@@ -177,5 +177,24 @@ def fake_redis():
 
 
 @pytest.fixture
+def indexing():
+    """Substitute the embedding model and Qdrant for upload tests.
+
+    With no broker configured the dispatcher indexes inline, so an upload in
+    a test runs the real pipeline unless these are replaced.
+    """
+    from unittest.mock import patch
+
+    with (
+        patch("app.worker.tasks.embed_texts", lambda texts: [[0.1] * 384 for _ in texts]),
+        patch(
+            "app.worker.tasks.upsert_chunks",
+            lambda **kw: [f"point-{i}" for i in range(len(kw["chunks"]))],
+        ),
+    ):
+        yield
+
+
+@pytest.fixture
 def text_file_bytes():
     return b"ResearchSphere automated test document. " * 40
