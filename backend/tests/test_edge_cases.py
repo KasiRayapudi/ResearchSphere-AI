@@ -411,6 +411,60 @@ class TestAuditRedaction:
         actor = MagicMock(id="u-1", email="a@b.com\nforged: entry", role="member")
         assert "\n" not in _describe_actor(actor)["username"]
 
+    def test_no_field_of_a_finished_record_can_forge_a_line(self):
+        """End-to-end proof that the record itself carries the guarantee.
+
+        Every attacker-influenced field is fed a newline at once: the actor,
+        the resource, the endpoint, the client IP and the metadata. None may
+        survive into the emitted record, whatever the formatter does later.
+
+        The audit logger sets propagate = False so records never reach the
+        application log, which also puts them out of caplog's reach, so this
+        attaches its own handler.
+        """
+        import logging as _logging
+
+        from app.core.audit import AuditAction, AuditOutcome, audit
+
+        captured = []
+
+        class _Capture(_logging.Handler):
+            def emit(self, record):
+                captured.append(record)
+
+        handler = _Capture()
+        audit_logger = _logging.getLogger("researchsphere.audit")
+        audit_logger.addHandler(handler)
+        try:
+            hostile = "value\nfake: forged-entry\rmore"
+            audit(
+                action=AuditAction.ADMIN_ACCESS,
+                actor={"id": hostile, "email": hostile, "role": hostile},
+                outcome=AuditOutcome.SUCCESS,
+                resource=hostile,
+                request=None,
+                endpoint=hostile,
+                client_ip=hostile,
+                http_method=hostile,
+                metadata={"note": hostile},
+            )
+        finally:
+            audit_logger.removeHandler(handler)
+
+        assert captured, "the audit record was never emitted"
+        record = getattr(captured[-1], "audit", None)
+        assert record is not None
+
+        for key, value in record.items():
+            if isinstance(value, str):
+                assert "\n" not in value, key
+                assert "\r" not in value, key
+        assert "\n" not in record["metadata"]["note"]
+        assert "\r" not in record["metadata"]["note"]
+        # The text itself is preserved; only the line break is removed, so
+        # the record stays useful to whoever reads it after an incident.
+        assert "forged-entry" in json.dumps(record)
+
     def test_auditing_never_raises(self):
         from app.core.audit import AuditAction, AuditOutcome, audit
 

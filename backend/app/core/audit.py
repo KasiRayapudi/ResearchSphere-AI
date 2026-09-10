@@ -237,13 +237,13 @@ def _describe_actor(actor: Any) -> dict:
         return {"user_id": None, "username": "anonymous", "role": None}
 
     if isinstance(actor, str):
-        return {"user_id": None, "username": actor, "role": None}
+        return {"user_id": None, "username": _clean(actor), "role": None}
 
     if isinstance(actor, Mapping):
         return {
-            "user_id": actor.get("id"),
-            "username": actor.get("email") or actor.get("full_name"),
-            "role": actor.get("role"),
+            "user_id": _clean(actor.get("id")),
+            "username": _clean(actor.get("email") or actor.get("full_name")),
+            "role": _clean(actor.get("role")),
         }
 
     # Duck-typed ORM object (app.models.user.User). Attribute access can raise
@@ -335,6 +335,11 @@ def audit(
             "resource": resource,
             "metadata": redact(dict(metadata)) if metadata else {},
         }
+        # One pass over the finished record, so a field added later is
+        # covered by default rather than by remembering to wrap it. Nested
+        # metadata is already scrubbed inside redact(); _clean leaves
+        # non-strings untouched.
+        record = {key: _clean(value) for key, value in record.items()}
 
         level = (
             logging.WARNING
