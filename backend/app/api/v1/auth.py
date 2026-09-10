@@ -242,7 +242,7 @@ async def request_password_reset(
     user = db.query(User).filter(User.email == payload.email).first()
     if not user or not user.is_active:
         audit(
-            action=AuditAction.PASSWORD_RESET_REQUESTED,
+            action=AuditAction.CREDENTIAL_RESET_REQUESTED,
             actor=payload.email,
             outcome=AuditOutcome.FAILURE,
             resource="user:unknown",
@@ -255,7 +255,7 @@ async def request_password_reset(
     raw_token, record = generate_reset_token(db, user.id, requested_ip=client_ip)
 
     audit(
-        action=AuditAction.PASSWORD_RESET_REQUESTED,
+        action=AuditAction.CREDENTIAL_RESET_REQUESTED,
         actor=user,
         outcome=AuditOutcome.SUCCESS,
         resource=f"user:{user.id}",
@@ -288,7 +288,7 @@ async def confirm_password_reset(
         # Unknown, expired, used and revoked tokens are indistinguishable here
         # on purpose.
         audit(
-            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            action=AuditAction.CREDENTIAL_RESET_COMPLETED,
             outcome=AuditOutcome.DENIED,
             resource="password_reset:token",
             request=request,
@@ -302,7 +302,7 @@ async def confirm_password_reset(
     user = db.query(User).filter(User.id == record.user_id).first()
     if not user or not user.is_active:
         audit(
-            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            action=AuditAction.CREDENTIAL_RESET_COMPLETED,
             outcome=AuditOutcome.DENIED,
             resource=f"user:{record.user_id}",
             request=request,
@@ -317,7 +317,7 @@ async def confirm_password_reset(
         validate_password(payload.new_password, email=user.email, full_name=user.full_name)
     except PasswordPolicyError as exc:
         audit(
-            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            action=AuditAction.CREDENTIAL_RESET_COMPLETED,
             actor=user,
             outcome=AuditOutcome.FAILURE,
             resource=f"user:{user.id}",
@@ -334,7 +334,7 @@ async def confirm_password_reset(
 
     if verify_password(payload.new_password, user.hashed_password):
         audit(
-            action=AuditAction.PASSWORD_RESET_COMPLETED,
+            action=AuditAction.CREDENTIAL_RESET_COMPLETED,
             actor=user,
             outcome=AuditOutcome.FAILURE,
             resource=f"user:{user.id}",
@@ -358,7 +358,7 @@ async def confirm_password_reset(
     db.commit()
 
     audit(
-        action=AuditAction.PASSWORD_RESET_COMPLETED,
+        action=AuditAction.CREDENTIAL_RESET_COMPLETED,
         actor=user,
         outcome=AuditOutcome.SUCCESS,
         resource=f"user:{user.id}",

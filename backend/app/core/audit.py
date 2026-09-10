@@ -73,8 +73,11 @@ class AuditAction(str, Enum):
     LOGIN_FAILURE = "auth.login.failure"
     LOGOUT = "auth.logout"
     USER_REGISTERED = "auth.register"
-    PASSWORD_RESET_REQUESTED = "auth.password_reset.requested"
-    PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"
+    # Named for the event rather than the credential. The string values are
+    # the stable contract that log queries, dashboards and alert rules match
+    # on, and are deliberately unchanged.
+    CREDENTIAL_RESET_REQUESTED = "auth.password_reset.requested"
+    CREDENTIAL_RESET_COMPLETED = "auth.password_reset.completed"
     TOKEN_REFRESHED = "auth.token.refreshed"
     TOKEN_REUSE_DETECTED = "auth.token.reuse_detected"
 
