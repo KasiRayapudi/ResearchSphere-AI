@@ -61,6 +61,49 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
 
+    # --- Object storage ---------------------------------------------------
+    #: filesystem | s3 | minio. Business logic never reads this; it selects
+    #: the provider once at startup and everything else speaks to the
+    #: interface.
+    STORAGE_PROVIDER: str = "filesystem"
+    #: Where the filesystem provider keeps objects. Defaults to UPLOAD_DIR so
+    #: an existing deployment keeps using the directory it already has.
+    FILESYSTEM_ROOT: str = ""
+
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = "us-east-1"
+    AWS_BUCKET: str = ""
+    #: Set to point the S3 provider at something other than AWS. Leaving it
+    #: empty is the normal case.
+    AWS_ENDPOINT_URL: str = ""
+
+    MINIO_ENDPOINT: str = ""
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
+    MINIO_BUCKET: str = ""
+
+    #: Lifetime of a signed download URL. Short by default: the URL is the
+    #: credential, so it should outlive the click and little else.
+    SIGNED_URL_EXPIRE_SECONDS: int = 300
+
+    #: How long an object must have existed before the sweep will consider
+    #: it orphaned. Generous on purpose: an upload writes the object before
+    #: it commits the row, so a shorter window could delete a file that is
+    #: about to become live.
+    STORAGE_CLEANUP_GRACE_HOURS: int = 24
+    #: Age at which an abandoned quarantine or temporary file is removed.
+    #: These belong to requests that died mid-flight; nothing reads them.
+    STORAGE_TEMP_RETENTION_HOURS: int = 6
+    #: How long the bytes of a document that failed indexing are kept. A
+    #: retry is a fresh upload with a new key, so nothing reads these again.
+    #: 0 disables the purge and keeps them indefinitely.
+    STORAGE_FAILED_RETENTION_DAYS: int = 30
+    #: Ceiling on deletions per sweep. A bug that mistook live objects for
+    #: orphans is then bounded and visible in the run statistics rather than
+    #: emptying a bucket.
+    STORAGE_CLEANUP_MAX_DELETES: int = 500
+
     # --- Outbound email ---------------------------------------------------
     #: "console" logs messages instead of sending them, which is the default
     #: so a developer without a mail server is not blocked. Set "smtp" and
@@ -356,6 +399,70 @@ def validate_configuration(config: "Settings" = None) -> dict:
         fail(f"MAX_UPLOAD_SIZE_MB must be positive (got {cfg.MAX_UPLOAD_SIZE_MB}).")
     if not cfg.allowed_upload_extensions:
         fail("ALLOWED_UPLOAD_EXTENSIONS is empty; every upload would be rejected.")
+
+    # --- Object storage ---
+    # Fail fast here rather than at the first upload: a deployment that asked
+    # for S3 and is missing a bucket name would otherwise look healthy right
+    # up until a user tried to store something.
+    provider = (cfg.STORAGE_PROVIDER or "").strip().lower()
+    if provider not in {"filesystem", "s3", "minio"}:
+        if provider == "azure":
+            fail("STORAGE_PROVIDER 'azure' is not implemented; use 's3' or 'minio'.")
+        else:
+            fail(
+                f"STORAGE_PROVIDER {cfg.STORAGE_PROVIDER!r} is not recognised; "
+                "choose filesystem, s3 or minio."
+            )
+    elif provider == "filesystem":
+        if production:
+            warnings.append(
+                "STORAGE_PROVIDER is 'filesystem': documents are written to local "
+                "disk, so the API cannot be scaled beyond one replica and uploads "
+                "are lost if the volume is not persistent."
+            )
+        root = (cfg.FILESYSTEM_ROOT or cfg.UPLOAD_DIR or "").strip()
+        if not root:
+            fail(
+                "STORAGE_PROVIDER is 'filesystem' but neither FILESYSTEM_ROOT nor UPLOAD_DIR is set."
+            )
+    elif provider == "s3":
+        if not (cfg.AWS_BUCKET or "").strip():
+            fail("STORAGE_PROVIDER is 's3' but AWS_BUCKET is not set.")
+        if not (cfg.AWS_REGION or "").strip():
+            fail("STORAGE_PROVIDER is 's3' but AWS_REGION is not set.")
+        # Credentials may legitimately be absent: on AWS they come from an
+        # instance profile or an IRSA role, which is the preferred setup.
+        if bool((cfg.AWS_ACCESS_KEY_ID or "").strip()) != bool(
+            (cfg.AWS_SECRET_ACCESS_KEY or "").strip()
+        ):
+            fail("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together.")
+    elif provider == "minio":
+        if not (cfg.MINIO_ENDPOINT or "").strip():
+            fail("STORAGE_PROVIDER is 'minio' but MINIO_ENDPOINT is not set.")
+        elif not cfg.MINIO_ENDPOINT.strip().startswith(("http://", "https://")):
+            fail("MINIO_ENDPOINT must include a scheme, e.g. https://minio.internal:9000")
+        elif production and cfg.MINIO_ENDPOINT.strip().startswith("http://"):
+            warnings.append(
+                "MINIO_ENDPOINT uses plain HTTP in production: object bytes and "
+                "signed URLs travel unencrypted."
+            )
+        if not (cfg.MINIO_BUCKET or cfg.AWS_BUCKET or "").strip():
+            fail("STORAGE_PROVIDER is 'minio' but MINIO_BUCKET is not set.")
+        if not (cfg.MINIO_ACCESS_KEY or "").strip() or not (cfg.MINIO_SECRET_KEY or "").strip():
+            fail("STORAGE_PROVIDER is 'minio' but MINIO_ACCESS_KEY/MINIO_SECRET_KEY are not set.")
+
+    # A signed URL is a bearer credential: too long a life turns a shared link
+    # into permanent access. SigV4 refuses anything beyond seven days.
+    if not 30 <= cfg.SIGNED_URL_EXPIRE_SECONDS <= 604800:
+        fail(
+            "SIGNED_URL_EXPIRE_SECONDS must be between 30 and 604800 "
+            f"(got {cfg.SIGNED_URL_EXPIRE_SECONDS})."
+        )
+    elif production and cfg.SIGNED_URL_EXPIRE_SECONDS > 3600:
+        warnings.append(
+            f"SIGNED_URL_EXPIRE_SECONDS is {cfg.SIGNED_URL_EXPIRE_SECONDS}s: anyone "
+            "holding the link can download the document until it expires."
+        )
 
     # --- Email ---
     if (cfg.EMAIL_BACKEND or "").strip().lower() == "smtp":

@@ -219,6 +219,7 @@ Track:
 
 - Docker
 - Docker Compose
+- Object storage: local filesystem, AWS S3 or MinIO (see `backend/app/services/storage/README.md`)
 
 ---
 
