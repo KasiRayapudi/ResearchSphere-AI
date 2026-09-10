@@ -399,10 +399,11 @@ class TestUploadEndpoint:
         assert response.status_code in (400, 415)
 
     def test_delete_of_unknown_document_is_404(self, client, auth_headers):
-        assert (
-            client.delete("/api/v1/documents/does-not-exist", headers=auth_headers).status_code
-            == 404
-        )
+        # The request is issued outside the assert: under `python -O` the
+        # assert is stripped, and with the call inside it the endpoint would
+        # never be exercised while the test still reported success.
+        response = client.delete("/api/v1/documents/does-not-exist", headers=auth_headers)
+        assert response.status_code == 404
 
 
 class TestErrorEnvelope:

@@ -490,4 +490,6 @@ class TestDocumentDeletion:
         assert response.status_code == 200
 
     def test_deletion_requires_authentication(self, client):
-        assert client.delete("/api/v1/documents/some-id").status_code == 401
+        # Issued outside the assert so `python -O` cannot strip the request.
+        response = client.delete("/api/v1/documents/some-id")
+        assert response.status_code == 401
