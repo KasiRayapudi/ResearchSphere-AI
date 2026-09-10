@@ -156,3 +156,39 @@ export interface DocumentStatus {
 
 /** States a document will not move on from without a new request. */
 export const TERMINAL_DOCUMENT_STATUSES = ['indexed', 'failed'] as const;
+
+/** A person's role within one workspace. Distinct from the platform role. */
+export type WorkspaceRole = 'owner' | 'admin' | 'editor' | 'viewer';
+
+export interface WorkspaceMember {
+  id: string;
+  userId: string;
+  email: string;
+  fullName: string | null;
+  role: WorkspaceRole;
+  joinedAt: string;
+  invitedBy: string | null;
+}
+
+export type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired';
+
+export interface WorkspaceInvitation {
+  id: string;
+  email: string;
+  role: WorkspaceRole;
+  expiresAt: string;
+  createdAt: string;
+  invitedBy: string | null;
+  status: InvitationStatus;
+}
+
+/**
+ * What each role may do, mirroring backend PERMISSIONS. Used only to decide
+ * which controls to render: the server enforces this independently, and a
+ * client that got it wrong would be corrected by a 403.
+ */
+export const ROLE_CAN = {
+  manageMembers: (role: WorkspaceRole) => role === 'owner' || role === 'admin',
+  transferOwnership: (role: WorkspaceRole) => role === 'owner',
+  write: (role: WorkspaceRole) => role !== 'viewer',
+} as const;

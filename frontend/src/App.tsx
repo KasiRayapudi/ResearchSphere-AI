@@ -32,6 +32,9 @@ const ReportGeneratorPage = lazy(() =>
 const AnalyticsPage = lazy(() =>
   import('./pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage }))
 );
+const MembersPage = lazy(() =>
+  import('./pages/MembersPage').then((m) => ({ default: m.MembersPage }))
+);
 const AdminPanelPage = lazy(() =>
   import('./pages/AdminPanelPage').then((m) => ({ default: m.AdminPanelPage }))
 );
@@ -94,6 +97,7 @@ const AppRoutes: React.FC = () => (
       <Route path="/workspace" element={<ResearchWorkspacePage />} />
       <Route path="/reports" element={<ReportGeneratorPage />} />
       <Route path="/analytics" element={<AnalyticsPage />} />
+      <Route path="/members" element={<MembersPage />} />
       <Route path="/admin" element={<AdminPanelPage />} />
     </Route>
 

@@ -7,6 +7,7 @@ import {
   Sparkles,
   BarChart3,
   Shield,
+  Users,
   Layers,
   LogOut,
 } from 'lucide-react';
@@ -48,6 +49,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggle }) => {
     { label: 'Research Workspace', path: '/workspace', icon: Sparkles },
     { label: 'Report Generator', path: '/reports', icon: Layers },
     { label: 'Analytics Engine', path: '/analytics', icon: BarChart3 },
+    { label: 'Members', path: '/members', icon: Users },
     { label: 'Admin & System', path: '/admin', icon: Shield },
   ];
 

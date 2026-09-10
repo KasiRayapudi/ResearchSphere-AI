@@ -20,6 +20,9 @@ import type {
   SystemHealth,
   User,
   Workspace,
+  WorkspaceInvitation,
+  WorkspaceMember,
+  WorkspaceRole,
 } from '../types';
 
 export interface AuthResult {
@@ -167,6 +170,86 @@ export class ApiService {
    * backend when identical content already exists in the workspace.
    */
   /** Indexing progress for one document. Polled while an upload finishes. */
+  // ----------------------------------------------------- workspace members --
+
+  static getMembers(workspaceId?: string): Promise<WorkspaceMember[]> {
+    return api.get<WorkspaceMember[]>('/workspace/members', {
+      query: { workspace_id: workspaceId },
+    });
+  }
+
+  static updateMemberRole(
+    memberId: string,
+    role: WorkspaceRole,
+    workspaceId?: string
+  ): Promise<WorkspaceMember> {
+    return api.patch<WorkspaceMember>(`/workspace/members/${encodeURIComponent(memberId)}`, {
+      role,
+      workspace_id: workspaceId,
+    });
+  }
+
+  static removeMember(memberId: string, workspaceId?: string): Promise<{ message: string }> {
+    return api.delete<{ message: string }>(
+      `/workspace/members/${encodeURIComponent(memberId)}`,
+      { query: { workspace_id: workspaceId } }
+    );
+  }
+
+  static transferOwnership(
+    memberId: string,
+    workspaceId?: string
+  ): Promise<WorkspaceMember[]> {
+    return api.post<WorkspaceMember[]>(
+      `/workspace/transfer-ownership?member_id=${encodeURIComponent(memberId)}`,
+      { role: 'owner', workspace_id: workspaceId }
+    );
+  }
+
+  static getInvitations(workspaceId?: string): Promise<WorkspaceInvitation[]> {
+    return api.get<WorkspaceInvitation[]>('/workspace/invitations', {
+      query: { workspace_id: workspaceId },
+    });
+  }
+
+  static inviteMember(
+    email: string,
+    role: WorkspaceRole,
+    workspaceId?: string
+  ): Promise<WorkspaceInvitation> {
+    return api.post<WorkspaceInvitation>('/workspace/invite', {
+      email,
+      role,
+      workspace_id: workspaceId,
+    });
+  }
+
+  static acceptInvitation(
+    token: string
+  ): Promise<{ message: string; workspaceId: string; workspaceName: string; role: string }> {
+    return api.post('/workspace/invite/accept', { token });
+  }
+
+  static revokeInvitation(
+    invitationId: string,
+    workspaceId?: string
+  ): Promise<{ message: string }> {
+    return api.post('/workspace/invite/revoke', {
+      invitation_id: invitationId,
+      workspace_id: workspaceId,
+    });
+  }
+
+  static resendInvitation(
+    invitationId: string,
+    workspaceId?: string
+  ): Promise<WorkspaceInvitation> {
+    return api.post<WorkspaceInvitation>('/workspace/invite/resend', {
+      invitation_id: invitationId,
+      workspace_id: workspaceId,
+    });
+  }
+
   static getDocumentStatus(id: string): Promise<DocumentStatus> {
     return api.get<DocumentStatus>(`/documents/${encodeURIComponent(id)}/status`, {
       // Polled repeatedly; a failed poll is retried by the next tick, so
