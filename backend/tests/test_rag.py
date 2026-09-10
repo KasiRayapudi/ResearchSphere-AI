@@ -391,6 +391,51 @@ class TestStreamingPipeline:
         assert result["response_time_ms"] >= 0
 
     @pytest.mark.asyncio
+    async def test_the_event_loop_stays_free_while_answering(self):
+        """Regression: the pipeline used to run its work on the event loop.
+
+        embed_query, search_similar and the Gemini call are all synchronous
+        and slow. Called directly from the coroutine they froze the worker
+        for the whole request, so one question stalled every other request
+        on that process -- health probes included.
+
+        The stand-in below blocks with time.sleep, which is what a real
+        forward pass does to a thread. A ticker counts how many times the
+        loop got to run meanwhile: on the blocking implementation it cannot
+        tick at all.
+        """
+        import asyncio
+        import time as _time
+
+        from app.rag import pipeline
+
+        def _slow_embed(question):
+            _time.sleep(0.4)
+            return [0.1] * 384
+
+        ticks = 0
+
+        async def _ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        with (
+            patch.object(pipeline, "embed_query", _slow_embed),
+            patch.object(pipeline, "search_similar", return_value=[]),
+        ):
+            ticker = asyncio.create_task(_ticker())
+            try:
+                await pipeline.get_rag_response("q", "ws-1")
+            finally:
+                ticker.cancel()
+
+        # ~40 ticks are possible in 0.4s; anything above a handful proves the
+        # loop kept running. A blocking implementation scores 0.
+        assert ticks > 5, f"event loop was starved during the call (ticks={ticks})"
+
+    @pytest.mark.asyncio
     async def test_non_streaming_reports_empty_index(self):
         from app.rag import pipeline
 

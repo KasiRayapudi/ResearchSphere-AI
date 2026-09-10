@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import google.generativeai as genai
+from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.rag.embeddings import embed_query
@@ -26,6 +27,16 @@ If the context doesn't contain enough information to answer the question, say so
 Always cite your sources using [Source N] notation.
 Format your response in clear markdown with proper headers, bullet points, and code blocks where relevant.
 Be comprehensive, accurate, and professional."""
+
+
+#: Returned by _next_chunk when the underlying generator is exhausted. A
+#: dedicated sentinel is used because None is a value the SDK could yield.
+_STREAM_END = object()
+
+
+def _next_chunk(iterator: Any) -> Any:
+    """Pull one item from a blocking iterator, or the sentinel when done."""
+    return next(iterator, _STREAM_END)
 
 
 def build_context_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
@@ -71,12 +82,17 @@ async def stream_rag_response(
     start_time = time.time()
 
     # Step 1: Embed question
+    # Embedding is a synchronous forward pass through sentence-transformers
+    # and the Qdrant client is a blocking HTTP call. Both are handed to a
+    # worker thread so this coroutine does not hold the event loop while a
+    # question is being answered.
     logger.info(f"RAG: Embedding question for workspace {workspace_id}")
-    query_embedding = embed_query(question)
+    query_embedding = await run_in_threadpool(embed_query, question)
 
     # Step 2: Retrieve relevant chunks from Qdrant
     logger.info(f"RAG: Searching Qdrant (top_k={top_k})")
-    retrieved_chunks = search_similar(
+    retrieved_chunks = await run_in_threadpool(
+        search_similar,
         query_embedding=query_embedding,
         workspace_id=workspace_id,
         top_k=top_k,
@@ -97,10 +113,18 @@ async def stream_rag_response(
     )
 
     logger.info("RAG: Streaming Gemini response")
-    response = model.generate_content(prompt, stream=True)
+    response = await run_in_threadpool(model.generate_content, prompt, stream=True)
 
+    # The SDK returns a synchronous generator whose every step waits on the
+    # network, so the loop is pumped one item at a time from a worker thread.
+    # Iterating it directly would block the event loop for the whole
+    # generation -- the longest single operation in the product.
+    iterator = iter(response)
     full_text = ""
-    for chunk in response:
+    while True:
+        chunk = await run_in_threadpool(_next_chunk, iterator)
+        if chunk is _STREAM_END:
+            break
         if chunk.text:
             full_text += chunk.text
             yield chunk.text
@@ -132,10 +156,11 @@ async def get_rag_response(
     start_time = time.time()
 
     # Embed question
-    query_embedding = embed_query(question)
+    query_embedding = await run_in_threadpool(embed_query, question)
 
     # Retrieve chunks
-    retrieved_chunks = search_similar(
+    retrieved_chunks = await run_in_threadpool(
+        search_similar,
         query_embedding=query_embedding,
         workspace_id=workspace_id,
         top_k=top_k,
@@ -158,7 +183,7 @@ async def get_rag_response(
         system_instruction=SYSTEM_PROMPT,
     )
 
-    response = model.generate_content(prompt)
+    response = await run_in_threadpool(model.generate_content, prompt)
     answer = response.text
 
     elapsed = int((time.time() - start_time) * 1000)

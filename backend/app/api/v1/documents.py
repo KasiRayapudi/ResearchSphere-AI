@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -167,7 +168,7 @@ async def upload_document(
         raise _reject(exc) from exc
 
     # 2d. Antivirus scan while still quarantined
-    scan_result = get_scanner().scan_file(quarantine_path)
+    scan_result = await run_in_threadpool(get_scanner().scan_file, quarantine_path)
     if scan_result.is_infected:
         discard_quarantined(quarantine_path)
         audit(
@@ -265,16 +266,23 @@ async def upload_document(
     db.refresh(doc)
 
     try:
-        # 4. Extract and clean text
-        text = extract_text(file_path, ext)
-        cleaned = clean_text(text)
+        # 4. Extract and clean text.
+        #
+        # Everything from here to the vector upsert is synchronous, CPU- or
+        # network-bound work measured in seconds: PDF parsing, a
+        # sentence-transformers forward pass, and a round trip to Qdrant.
+        # Called directly from this async handler it would hold the event
+        # loop for the whole upload, so the worker would serve no other
+        # request -- health probes included -- until it finished.
+        text = await run_in_threadpool(extract_text, file_path, ext)
+        cleaned = await run_in_threadpool(clean_text, text)
 
         # 5. Chunk text
-        chunks = chunk_text(cleaned)
+        chunks = await run_in_threadpool(chunk_text, cleaned)
 
         # 6. Embed chunks
         contents = [c["content"] for c in chunks]
-        embeddings = embed_texts(contents)
+        embeddings = await run_in_threadpool(embed_texts, contents)
 
         # 7. Write chunks to DB and Vector DB
         chunk_db_objects = []
@@ -296,7 +304,8 @@ async def upload_document(
             db.refresh(db_chunk)
 
         # 8. Upsert into Qdrant
-        point_ids = upsert_chunks(
+        point_ids = await run_in_threadpool(
+            upsert_chunks,
             chunks=chunks,
             embeddings=embeddings,
             document_id=doc.id,
@@ -413,7 +422,7 @@ async def delete_document(
 
     # Delete from Qdrant
     try:
-        delete_document_vectors(doc.id)
+        await run_in_threadpool(delete_document_vectors, doc.id)
     except Exception as e:
         # Orphaned vectors are recoverable; failing the delete is not, so this
         # is logged rather than raised.
