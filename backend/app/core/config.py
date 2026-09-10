@@ -321,8 +321,15 @@ def validate_configuration(config: "Settings" = None) -> dict:
     try:
         if Path(cfg.QUARANTINE_DIR).resolve() == Path(cfg.UPLOAD_DIR).resolve():
             fail("QUARANTINE_DIR must not be the same directory as UPLOAD_DIR.")
-    except Exception:
-        pass
+    except (OSError, ValueError) as exc:
+        # Either path may be unresolvable on this host. Both directories are
+        # already checked for existence and writability above, so this
+        # comparison is a refinement: report it and carry on rather than
+        # failing validation over a path that could not be normalised.
+        warnings.append(
+            f"Could not compare QUARANTINE_DIR with UPLOAD_DIR ({exc}); "
+            "check manually that they are different directories."
+        )
 
     if cfg.MAX_UPLOAD_SIZE_MB <= 0:
         fail(f"MAX_UPLOAD_SIZE_MB must be positive (got {cfg.MAX_UPLOAD_SIZE_MB}).")

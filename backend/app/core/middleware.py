@@ -205,8 +205,11 @@ class RateLimitingMiddleware(BaseHTTPMiddleware):
             # keep extending its own window.
             try:
                 client.zremrangebyrank(redis_key, -1, -1)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Best effort, and deliberately not fatal: the decision to
+                # reject has already been made. Failing here only means this
+                # caller's window stays marginally wider than intended.
+                logger.debug(f"Rate-limit window trim failed: {exc}")
             return False, 0, 60
         return True, max(0, max_rpm - count), 60
 
@@ -299,8 +302,10 @@ class MetricsMiddleware(BaseHTTPMiddleware):
                 # Recorded against the raw path here; the route is not matched
                 # until the request has been routed.
                 request.state.metrics_request_size = int(content_length)
-        except Exception:
-            pass
+        except (TypeError, ValueError) as exc:
+            # Content-Length is client-supplied and optional. Losing the
+            # request-size sample must never affect the request itself.
+            logger.debug(f"Could not record request size: {exc}")
 
         try:
             response = await call_next(request)
