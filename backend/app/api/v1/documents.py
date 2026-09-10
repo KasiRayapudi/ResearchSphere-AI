@@ -1,8 +1,10 @@
-import os
 import time
+import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,6 @@ from app.core.upload_security import (
     UploadValidationError,
     discard_quarantined,
     extract_extension,
-    promote_from_quarantine,
     sanitize_filename,
     stream_to_quarantine,
     validate_content,
@@ -29,6 +30,14 @@ from app.models.membership import WorkspaceMember
 from app.models.user import User
 from app.rag.vector_store import delete_document_vectors
 from app.services.antivirus import get_scanner
+from app.services.storage import (
+    TEMP_PREFIX,
+    ObjectNotFound,
+    StorageError,
+    build_document_key,
+    get_storage,
+    resolve_key,
+)
 from app.worker.dispatch import enqueue_document_processing
 
 router = APIRouter()
@@ -286,8 +295,30 @@ async def upload_document(
                 "message": "This document already exists in the workspace.",
             }
 
-    # 2f. Validation passed - promote out of quarantine into permanent storage
-    file_path = promote_from_quarantine(quarantine_path, settings.UPLOAD_DIR)
+    # 2f. Validation passed - hand the file to the configured storage
+    # provider. The key is generated here and is the only thing recorded:
+    # where the bytes actually live is the provider's business, and a client
+    # never learns it. put() is blocking network I/O for an object store, so
+    # it runs off the event loop.
+    storage = get_storage()
+    storage_key = build_document_key(workspace_id, ext)
+    try:
+        stored = await run_in_threadpool(
+            storage.put, storage_key, quarantine_path, content_type=mime_type
+        )
+    except StorageError as exc:
+        # The bytes are still in quarantine and no row exists yet, so
+        # discarding them leaves nothing behind to sweep up later.
+        discard_quarantined(quarantine_path)
+        logger.error(
+            f"Could not store upload {original_name}: {exc}",
+            extra={"user_id": current_user.id, "action": "document.upload.storage_failed"},
+        )
+        metrics.safe(metrics.uploads_total.labels(outcome="storage_error").inc)
+        raise HTTPException(
+            status_code=503, detail="Document storage is unavailable. Please try again."
+        ) from exc
+
     logger.info(
         f"Upload validated and stored: {original_name} "
         f"(kind={detected_kind}, sha256={content_hash[:12]}...)",
@@ -298,11 +329,15 @@ async def upload_document(
     doc = Document(
         workspace_id=workspace_id,
         uploaded_by=current_user.id,
-        filename=os.path.basename(file_path),
+        filename=storage_key.rsplit("/", 1)[-1],
         original_filename=original_name,
         file_type=ext,
         file_size=file_size,
-        file_path=file_path,
+        # No absolute path: the key is the address, on every provider.
+        file_path=None,
+        storage_provider=storage.name,
+        storage_key=storage_key,
+        storage_metadata=stored.metadata or None,
         content_hash=content_hash,
         mime_type=mime_type,
         status=DocumentStatus.QUEUED,
@@ -414,6 +449,100 @@ async def get_document_status(
     }
 
 
+@router.get("/{id}/download")
+async def download_document(
+    id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch the original file.
+
+    Authorization is identical to reading the document: membership gets the
+    row, ``content.read`` gets the bytes. A document in someone else's
+    workspace is reported as missing, so ids cannot be probed.
+
+    How the bytes are delivered depends on the provider and is invisible to
+    the caller. An object store issues a short-lived signed URL and the
+    client is redirected to it; a filesystem has no URL to sign, so the API
+    streams the file itself. Either way the client never receives a bucket
+    name it can reuse or a path on the server.
+    """
+    doc = (
+        db.query(Document)
+        .join(WorkspaceMember, Document.workspace_id == WorkspaceMember.workspace_id)
+        .filter(Document.id == id, WorkspaceMember.user_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    require_workspace_role(request, doc.workspace_id, "content.read", current_user, db=db)
+
+    object_key = resolve_key(doc.storage_key, doc.file_path)
+    if not object_key:
+        # A row with nothing to point at. Reported as missing rather than as
+        # an error: there is no file to serve and never will be.
+        logger.error(f"Document {doc.id} has no storage key")
+        raise HTTPException(status_code=404, detail="Document file is unavailable")
+
+    storage = get_storage()
+    audit(
+        action=AuditAction.DOCUMENT_DOWNLOAD,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"document:{doc.id}",
+        request=request,
+        metadata={"filename": doc.original_filename, "workspace_id": doc.workspace_id},
+    )
+
+    try:
+        signed = await run_in_threadpool(
+            storage.signed_url,
+            object_key,
+            expires_in=settings.SIGNED_URL_EXPIRE_SECONDS,
+            filename=doc.original_filename,
+        )
+        if signed:
+            # 307 keeps the method and, unlike 301/302, is never cached, so a
+            # URL that has expired cannot be replayed from a shared cache.
+            return RedirectResponse(url=signed, status_code=307)
+
+        # No signed URL: stream the bytes. FileResponse sends them in chunks,
+        # so a large PDF is never held in memory.
+        local = await run_in_threadpool(_local_file_for, storage, object_key)
+        return FileResponse(
+            path=local,
+            filename=doc.original_filename,
+            media_type=doc.mime_type or "application/octet-stream",
+        )
+    except ObjectNotFound as exc:
+        logger.error(f"Stored object missing for document {doc.id}")
+        raise HTTPException(status_code=404, detail="Document file is unavailable") from exc
+    except StorageError as exc:
+        logger.error(f"Storage error serving document {doc.id}: {exc}")
+        raise HTTPException(
+            status_code=503, detail="Document storage is unavailable. Please try again."
+        ) from exc
+
+
+def _local_file_for(storage, key: str) -> str:
+    """A real path for an object, for providers that cannot sign a URL.
+
+    The filesystem provider hands back the file where it already is, so
+    nothing is copied. Any other provider that cannot sign falls back to a
+    temporary copy, which is deleted by the cleanup sweep.
+    """
+    local_path = getattr(storage, "local_path", None)
+    if callable(local_path):
+        return local_path(key)
+
+    temp_dir = Path(settings.QUARANTINE_DIR).parent / TEMP_PREFIX
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    destination = temp_dir / f"{uuid.uuid4().hex}-{key.rsplit('/', 1)[-1]}"
+    return storage.download_to(key, str(destination))
+
+
 @router.delete("/{id}")
 async def delete_document(
     id: str,
@@ -453,17 +582,24 @@ async def delete_document(
         # is logged rather than raised.
         logger.error(f"Failed to delete Qdrant vectors for {doc.id}: {e}")
 
-    # Clean file locally
-    if os.path.exists(doc.file_path):
+    # Remove the stored object. Works the same whichever provider holds it,
+    # and tolerates a document written before storage was abstracted: the key
+    # is derived from the legacy path in that case.
+    object_key = resolve_key(doc.storage_key, doc.file_path)
+    object_removed = False
+    if object_key:
         try:
-            os.remove(doc.file_path)
-        except Exception as e:
-            logger.error(f"Failed to remove local file for {doc.id}: {e}")
+            object_removed = await run_in_threadpool(get_storage().delete, object_key)
+        except StorageError as e:
+            # An object left behind is recoverable -- the cleanup sweep finds
+            # it once the row is gone. Refusing the delete is not.
+            logger.error(f"Failed to remove stored object for {doc.id}: {e}")
 
     deleted_meta = {
         "filename": doc.original_filename,
         "workspace_id": doc.workspace_id,
         "chunk_count": doc.chunk_count,
+        "object_removed": object_removed,
     }
     db.delete(doc)
     db.commit()

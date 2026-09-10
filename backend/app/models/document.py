@@ -44,7 +44,23 @@ class Document(Base):
     original_filename = Column(String(500), nullable=False)
     file_type = Column(String(20), nullable=False)  # pdf, docx, txt, md
     file_size = Column(Integer, nullable=False)  # bytes
-    file_path = Column(String(1000), nullable=False)
+    #: Legacy absolute path, written before storage was abstracted. Kept so
+    #: existing rows stay readable and so a rollback has something to fall
+    #: back on, but nothing writes it any more: an absolute path is host
+    #: state, it leaks the server's directory layout, and it means nothing to
+    #: a second replica or to an object store. New rows carry a key instead.
+    file_path = Column(String(1000), nullable=True)
+
+    #: Which backend holds the bytes. Recorded per row rather than read from
+    #: configuration so a document uploaded before a provider switch can
+    #: still be located afterwards.
+    storage_provider = Column(String(20), nullable=True)
+    #: Opaque object key, e.g. ``documents/<workspace>/<uuid>.pdf``. Never a
+    #: path, never derived from the client's filename, and never returned to
+    #: a client -- downloads go through the API, which authorises first.
+    storage_key = Column(String(512), nullable=True, index=True)
+    #: Backend-reported extras (etag, content type at rest). Diagnostic only.
+    storage_metadata = Column(JSON, nullable=True)
     # SHA-256 of the file content: duplicate detection and integrity checks.
     # Indexed but not unique - the same content may legitimately exist in
     # different workspaces; uniqueness is enforced per workspace in the query.

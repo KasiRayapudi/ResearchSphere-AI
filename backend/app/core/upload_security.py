@@ -305,14 +305,6 @@ def discard_quarantined(path: str) -> None:
     _safe_unlink(path)
 
 
-def promote_from_quarantine(quarantine_path: str, upload_dir: str) -> str:
-    """Move a validated file from quarantine into permanent storage."""
-    os.makedirs(upload_dir, exist_ok=True)
-    final_path = resolve_within(upload_dir, os.path.basename(quarantine_path))
-    os.replace(quarantine_path, final_path)
-    return final_path
-
-
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------

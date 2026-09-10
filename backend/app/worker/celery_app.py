@@ -79,7 +79,15 @@ def build_celery() -> Celery:
             "reap-stalled-documents": {
                 "task": "documents.reap_stalled",
                 "schedule": 300.0,
-            }
+            },
+            # Housekeeping, not a user-facing path: daily is often enough to
+            # keep orphaned objects and abandoned temp files from
+            # accumulating, and rare enough that listing a large bucket is
+            # not a recurring cost.
+            "cleanup-storage": {
+                "task": "storage.cleanup",
+                "schedule": 86400.0,
+            },
         },
     )
     # Declared rather than autodiscovered with force=True: forcing discovery
