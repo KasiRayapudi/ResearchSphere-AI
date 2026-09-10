@@ -367,7 +367,7 @@ class TestDatabaseEngine:
         """The fallback is a development convenience and must stay working."""
         import importlib
 
-        import app.core.database as database_module
+        from app.core import database as database_module
 
         real_create_engine = database_module.create_engine
         calls = []
@@ -399,7 +399,7 @@ class TestDatabaseEngine:
         """
         import importlib
 
-        import app.core.database as database_module
+        from app.core import database as database_module
 
         with (
             patch("sqlalchemy.create_engine", side_effect=OSError("connection refused")),

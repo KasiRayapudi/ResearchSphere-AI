@@ -446,7 +446,11 @@ class TestSecurityHeaders:
 
     def test_docs_receive_a_relaxed_csp(self, client):
         csp = client.get("/docs").headers["content-security-policy"]
-        assert "cdn.jsdelivr.net" in csp
+        # Compare whole directive tokens. A substring test would also be
+        # satisfied by a policy naming "cdn.jsdelivr.net.attacker.example",
+        # so it does not actually establish that this host is allowed.
+        sources = {token for directive in csp.split(";") for token in directive.split()}
+        assert sources & {"cdn.jsdelivr.net", "https://cdn.jsdelivr.net"}
 
 
 class TestRateLimiting:

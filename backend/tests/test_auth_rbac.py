@@ -190,8 +190,10 @@ class TestConfigurationEdges:
         settings = self._settings(
             CORS_ORIGINS="https://a.example.com", FRONTEND_URL="https://app.example.com"
         )
-        # Otherwise the app the API ships with cannot call it.
-        assert "https://app.example.com" in settings.cors_origins
+        # Compared by equality, not containment: an origin allowlist must
+        # match whole origins, never prefixes. Otherwise the app the API
+        # ships with cannot call it.
+        assert any(origin == "https://app.example.com" for origin in settings.cors_origins)
 
     def test_origins_are_de_duplicated(self):
         settings = self._settings(
