@@ -79,7 +79,10 @@ http_request_duration_seconds = Histogram(
 http_requests_in_progress = Gauge(
     "researchsphere_http_requests_in_progress",
     "Requests currently being served.",
-    ["method", "route"],
+    # Method only. The matched route is not known until the request has been
+    # routed, which happens inside call_next, and labelling by raw path would
+    # make this gauge unbounded.
+    ["method"],
     multiprocess_mode="livesum",
 )
 

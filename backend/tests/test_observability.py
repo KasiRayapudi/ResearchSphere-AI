@@ -99,6 +99,22 @@ class TestRequestMetrics:
         body = client.get("/metrics").text
         assert "researchsphere_http_request_duration_seconds_bucket" in body
 
+    def test_in_progress_gauge_is_emitted_and_settles_back(self, client, auth_headers):
+        """Regression: the gauge was declared but never incremented.
+
+        `in_progress` was initialised to None and never reassigned, so the
+        decrement was unreachable and the series was never created. The
+        performance dashboard charts it as "in flight" and always read zero.
+        """
+        client.get("/api/v1/workspaces", headers=auth_headers)
+        samples = _parse_exposition(client.get("/metrics").text)
+
+        key = 'researchsphere_http_requests_in_progress{method="GET"}'
+        assert key in samples, "the in-flight gauge emitted no series"
+        # Every request that incremented has finished, so it must be back at
+        # zero; a gauge that only counts up would climb forever.
+        assert samples[key] == 0.0
+
     def test_health_endpoints_are_excluded(self, client):
         client.get("/api/live")
         body = client.get("/metrics").text

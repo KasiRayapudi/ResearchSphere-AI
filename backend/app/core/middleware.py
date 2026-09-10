@@ -289,7 +289,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
         method = request.method
         started = time.perf_counter()
-        in_progress = None
+
+        in_progress = metrics.http_requests_in_progress.labels(method=method)
+        metrics.safe(in_progress.inc)
 
         try:
             content_length = request.headers.get("content-length")
@@ -316,8 +318,10 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             )
             raise
         finally:
-            if in_progress is not None:
-                metrics.safe(in_progress.dec)
+            # Always paired with the inc above, including when call_next
+            # raised: an in-flight gauge that only counts up is worse than
+            # no gauge at all.
+            metrics.safe(in_progress.dec)
 
         elapsed = time.perf_counter() - started
         route = self._route_template(request)
