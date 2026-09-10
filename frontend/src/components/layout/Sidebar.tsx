@@ -8,13 +8,7 @@ import {
   BarChart3,
   Shield,
   Layers,
-  Settings,
-  Plus,
-  ChevronDown,
-  Database,
-  Cpu,
   LogOut,
-  FolderGit2,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { WorkspaceSwitcher } from './WorkspaceSwitcher';

@@ -1,16 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
-  Shield,
   Activity,
   Users,
-  HardDrive,
   Sliders,
-  CheckCircle2,
-  AlertTriangle,
   Server,
   Database,
   Cpu,
-  Key,
   RefreshCw,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
@@ -23,7 +18,6 @@ import { useAsyncData } from '../hooks/useAsyncData';
 import { useAuth } from '../contexts/AuthContext';
 import { EmptyState, ErrorState, ListSkeleton, Skeleton, TableSkeleton } from '../components/common/States';
 import { ShieldAlert } from 'lucide-react';
-import { SystemHealth, FeatureFlag } from '../types';
 
 export const AdminPanelPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState('health');

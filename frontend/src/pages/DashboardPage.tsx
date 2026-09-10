@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   FileText,
@@ -6,12 +6,8 @@ import {
   Layers,
   Share2,
   HardDrive,
-  TrendingUp,
-  Clock,
-  Plus,
   ArrowUpRight,
   Database,
-  CheckCircle2,
   Activity,
   Cpu,
 } from 'lucide-react';
@@ -29,7 +25,6 @@ import {
   Skeleton,
   StatCardSkeleton,
 } from '../components/common/States';
-import { Document, ResearchSession, MCPConnector, AnalyticsData } from '../types';
 
 export const DashboardPage: React.FC = () => {
   const navigate = useNavigate();

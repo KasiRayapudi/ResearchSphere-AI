@@ -1,14 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import {
-  BarChart3,
   TrendingUp,
   Cpu,
-  Clock,
   Database,
-  HardDrive,
-  CheckCircle2,
-  Activity,
-  Layers,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
 import { Badge } from '../components/common/Badge';
@@ -23,7 +17,6 @@ import {
   Skeleton,
   StatCardSkeleton,
 } from '../components/common/States';
-import { AnalyticsData } from '../types';
 
 export const AnalyticsPage: React.FC = () => {
   const { activeWorkspace, isLoading: workspaceLoading } = useWorkspace();

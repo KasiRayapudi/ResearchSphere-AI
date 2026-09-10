@@ -1,18 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Sparkles,
   Users,
-  FileText,
   Bookmark,
   Plus,
-  Play,
-  CheckCircle2,
-  Clock,
   Cpu,
-  Shield,
-  Layers,
-  Activity,
-  UserCheck,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';
@@ -26,7 +18,6 @@ import { useWorkspace } from '../contexts/WorkspaceContext';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { EmptyState, ErrorState, ListSkeleton, Skeleton } from '../components/common/States';
-import { ResearchSession, AgentStep } from '../types';
 
 export const ResearchWorkspacePage: React.FC = () => {
   const [activeTab, setActiveTab] = useState('canvas');

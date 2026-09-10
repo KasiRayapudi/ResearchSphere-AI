@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   FileText,
   Upload,
@@ -6,14 +6,6 @@ import {
   Filter,
   Trash2,
   Eye,
-  CheckCircle2,
-  Tag,
-  Folder,
-  Layers,
-  Sparkles,
-  RefreshCw,
-  Plus,
-  FileCode,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';

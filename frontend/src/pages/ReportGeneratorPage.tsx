@@ -1,14 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Layers,
-  FileText,
   Download,
   CheckCircle2,
   Plus,
-  Sparkles,
-  Printer,
-  Share2,
-  Copy,
   BookOpen,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
