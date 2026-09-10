@@ -383,6 +383,34 @@ class TestAuditRedaction:
 
         assert redact({"password_reset_required": True})["password_reset_required"] is True
 
+    def test_newlines_are_stripped_from_audit_values(self):
+        """Log forging: one record must not be splittable into several."""
+        from app.core.audit import redact
+
+        forged = "alice\nadmin:2026-01-01 audit:auth.login.success"
+        cleaned = redact({"username": forged})["username"]
+        assert "\n" not in cleaned
+        assert "\r" not in cleaned
+
+    def test_carriage_returns_are_stripped(self):
+        from app.core.audit import redact
+
+        assert "\r" not in redact({"note": "line-one\r\nline-two"})["note"]
+
+    def test_tabs_and_ordinary_text_survive(self):
+        from app.core.audit import scrub_control_characters
+
+        # Over-scrubbing would strip the content an audit record exists for.
+        assert scrub_control_characters("a\tb c") == "a\tb c"
+
+    def test_actor_fields_are_scrubbed(self):
+        from unittest.mock import MagicMock
+
+        from app.core.audit import _describe_actor
+
+        actor = MagicMock(id="u-1", email="a@b.com\nforged: entry", role="member")
+        assert "\n" not in _describe_actor(actor)["username"]
+
     def test_auditing_never_raises(self):
         from app.core.audit import AuditAction, AuditOutcome, audit
 

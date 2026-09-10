@@ -163,6 +163,17 @@ def _looks_like_token(value: str) -> bool:
     return False
 
 
+def scrub_control_characters(value: str) -> str:
+    """Strip characters that would let a value forge log structure.
+
+    Newlines and carriage returns can split one record into several in a
+    line-oriented log, letting a caller invent audit entries; other C0
+    controls can corrupt a terminal reading it. Tabs are kept, being both
+    printable in practice and common in legitimate content.
+    """
+    return "".join(ch for ch in value if ch.isprintable() or ch == "\t")
+
+
 def redact(value: Any, _depth: int = 0) -> Any:
     """Recursively redact sensitive values from arbitrary metadata.
 
@@ -195,6 +206,7 @@ def redact(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, str):
         if _looks_like_token(value):
             return REDACTED
+        value = scrub_control_characters(value)
         if len(value) > _MAX_VALUE_LEN:
             return value[:_MAX_VALUE_LEN] + "...<truncated>"
         return value
@@ -210,6 +222,11 @@ def redact(value: Any, _depth: int = 0) -> Any:
 # ---------------------------------------------------------------------------
 # Actor / request extraction
 # ---------------------------------------------------------------------------
+def _clean(value: Any) -> Any:
+    """Scrub a value placed straight into an audit record, leaving non-strings."""
+    return scrub_control_characters(value) if isinstance(value, str) else value
+
+
 def _describe_actor(actor: Any) -> dict:
     """Normalize an actor into ``{user_id, username, role}``.
 
@@ -234,9 +251,9 @@ def _describe_actor(actor: Any) -> dict:
     # rather than losing the audit record entirely.
     try:
         return {
-            "user_id": getattr(actor, "id", None),
-            "username": getattr(actor, "email", None) or getattr(actor, "full_name", None),
-            "role": getattr(actor, "role", None),
+            "user_id": _clean(getattr(actor, "id", None)),
+            "username": _clean(getattr(actor, "email", None) or getattr(actor, "full_name", None)),
+            "role": _clean(getattr(actor, "role", None)),
         }
     except Exception:
         return {"user_id": None, "username": "<unresolvable-actor>", "role": None}
