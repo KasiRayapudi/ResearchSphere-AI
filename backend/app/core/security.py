@@ -300,26 +300,44 @@ def require_workspace_owner(
     db: Session,
     current_user,
 ):
-    """Return the workspace only when ``current_user`` may access it.
+    """Return the workspace only when ``current_user`` is a member of it.
 
     This is the single choke point for workspace authorization. Callers must
     never query a workspace-scoped resource using a client-supplied
     ``workspace_id`` without going through here.
 
-    A missing workspace and someone else's workspace both return 404, so the
-    endpoint cannot be used to probe which workspace IDs exist.
+    Membership alone is checked. A route that needs more than "is a member"
+    calls ``require_workspace_role`` afterwards, which reads the role this
+    function recorded on the request.
+
+    A workspace that does not exist and one the caller is not a member of
+    both return 404, so the endpoint cannot be used to probe which workspace
+    ids exist.
     """
+    from app.core.workspace_access import record_role, role_in_workspace
+    from app.models.membership import WorkspaceRole
     from app.models.workspace import Workspace
 
     workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
 
-    if workspace is None or workspace.owner_id != current_user.id:
-        # Admins may access any workspace, but only one that exists.
+    role = None
+    if workspace is not None:
+        # Read from the database on every request, never from the token: a
+        # membership revoked a moment ago must not survive in a JWT that is
+        # valid for another hour.
+        role = role_in_workspace(db, workspace_id, current_user.id)
+
+    if workspace is None or role is None:
+        # A platform admin may reach any workspace that exists, for support
+        # and moderation. That is the site-wide User.role, which is separate
+        # from workspace roles and is not implied by either.
         if (
             workspace is not None
             and role_rank((getattr(current_user, "role", "") or "").lower()) >= ROLE_RANKS["admin"]
         ):
+            record_role(request, workspace_id, WorkspaceRole.ADMIN)
             return workspace
+
         metrics.safe(metrics.authz_denials_total.labels(reason="workspace_isolation").inc)
         audit(
             action=AuditAction.PERMISSION_DENIED,
@@ -328,11 +346,12 @@ def require_workspace_owner(
             resource=f"workspace:{workspace_id}",
             request=request,
             metadata={
-                "reason": "not_found" if workspace is None else "not_owner",
+                "reason": "not_found" if workspace is None else "not_a_member",
             },
         )
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    record_role(request, workspace_id, role)
     return workspace
 
 
@@ -342,23 +361,38 @@ def resolve_workspace(
     db: Session,
     current_user,
 ):
-    """Resolve the workspace for a request, enforcing ownership.
+    """Resolve the workspace for a request, enforcing membership.
 
-    When ``workspace_id`` is supplied it is verified against the caller.
-    When omitted, the caller's own first workspace is used - preserving the
-    existing convenience behaviour without ever trusting a client-supplied ID.
+    When ``workspace_id`` is supplied it is verified against the caller's
+    membership. When omitted, the caller's first workspace is used --
+    preserving the existing convenience behaviour without ever trusting a
+    client-supplied id.
 
-    Returns ``None`` when the caller has no workspace at all, so endpoints can
-    keep returning an empty list instead of an error.
+    "First workspace" now means the earliest one they are a member of,
+    which for a user who has only ever had their own is the same workspace
+    as before.
+
+    Returns ``None`` when the caller belongs to no workspace at all, so
+    endpoints can keep returning an empty list instead of an error.
     """
+    from app.core.workspace_access import record_role
+    from app.models.membership import WorkspaceMember
     from app.models.workspace import Workspace
 
     if workspace_id:
         return require_workspace_owner(workspace_id, request, db, current_user)
 
-    return (
-        db.query(Workspace)
-        .filter(Workspace.owner_id == current_user.id)
+    membership = (
+        db.query(WorkspaceMember)
+        .join(Workspace, WorkspaceMember.workspace_id == Workspace.id)
+        .filter(WorkspaceMember.user_id == current_user.id)
         .order_by(Workspace.created_at.asc())
         .first()
     )
+    if membership is None:
+        return None
+
+    workspace = db.query(Workspace).filter(Workspace.id == membership.workspace_id).first()
+    if workspace is not None:
+        record_role(request, workspace.id, membership.role)
+    return workspace

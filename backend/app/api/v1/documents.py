@@ -22,9 +22,10 @@ from app.core.upload_security import (
     validate_content,
     validate_extension,
 )
+from app.core.workspace_access import require_workspace_role
 from app.models.document import Document, DocumentStatus
+from app.models.membership import WorkspaceMember
 from app.models.user import User
-from app.models.workspace import Workspace
 from app.rag.vector_store import delete_document_vectors
 from app.services.antivirus import get_scanner
 from app.worker.dispatch import enqueue_document_processing
@@ -99,6 +100,8 @@ async def upload_document(
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         raise HTTPException(status_code=400, detail="Create a workspace first.")
+    # Uploading is a write: viewers may read a workspace but not add to it.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
     workspace_id = ws.id
 
     # 2. Security pipeline: validate -> quarantine -> scan -> promote.
@@ -336,8 +339,8 @@ async def get_document_status(
     """
     doc = (
         db.query(Document)
-        .join(Workspace, Document.workspace_id == Workspace.id)
-        .filter(Document.id == id, Workspace.owner_id == current_user.id)
+        .join(WorkspaceMember, Document.workspace_id == WorkspaceMember.workspace_id)
+        .filter(Document.id == id, WorkspaceMember.user_id == current_user.id)
         .first()
     )
     if not doc:
@@ -378,8 +381,8 @@ async def delete_document(
     # so ids cannot be probed.
     doc = (
         db.query(Document)
-        .join(Workspace, Document.workspace_id == Workspace.id)
-        .filter(Document.id == id, Workspace.owner_id == current_user.id)
+        .join(WorkspaceMember, Document.workspace_id == WorkspaceMember.workspace_id)
+        .filter(Document.id == id, WorkspaceMember.user_id == current_user.id)
         .first()
     )
     if not doc:
@@ -392,6 +395,9 @@ async def delete_document(
             metadata={"reason": "not_found"},
         )
         raise HTTPException(status_code=404, detail="Document not found")
+
+    # Membership got us the document; deleting it needs more than that.
+    require_workspace_role(request, doc.workspace_id, "content.delete", current_user, db=db)
 
     # Delete from Qdrant
     try:

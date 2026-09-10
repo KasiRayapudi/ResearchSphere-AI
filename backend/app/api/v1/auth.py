@@ -22,6 +22,7 @@ from app.core.security import (
     verify_password,
 )
 from app.core.token_store import revoke_token
+from app.core.workspace_access import create_owner_membership
 from app.models.user import User
 from app.models.workspace import Workspace
 
@@ -160,6 +161,12 @@ async def signup(payload: UserSignup, request: Request, db: Session = Depends(ge
         owner_id=new_user.id,
     )
     db.add(default_ws)
+    db.flush()  # assigns default_ws.id without ending the transaction
+
+    # The owner membership is created with the workspace: authorization reads
+    # workspace_members, so a workspace without one cannot be opened by
+    # anybody, including the account that was just registered.
+    create_owner_membership(db, default_ws, new_user, commit=False)
     db.commit()
 
     metrics.safe(metrics.auth_attempts_total.labels(action="signup", outcome="success").inc)

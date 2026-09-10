@@ -13,6 +13,7 @@ from app.core.database import get_db
 from app.core.logging import get_logger
 from app.core.security import get_current_user, resolve_workspace
 from app.core.tracking import capture_exception
+from app.core.workspace_access import require_workspace_role
 from app.models.chat import ChatMessage, ChatSession
 from app.models.user import User
 from app.rag.pipeline import stream_rag_response
@@ -68,6 +69,8 @@ async def create_session(
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         raise HTTPException(status_code=400, detail="No active workspace found")
+    # Creating a session writes to the workspace.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
     workspace_id = ws.id
 
     session = ChatSession(
@@ -91,6 +94,9 @@ async def chat_stream(
     ws = resolve_workspace(workspace_id, request, db, current_user)
     if not ws:
         raise HTTPException(status_code=400, detail="Workspace required")
+    # A chat turn stores messages against the workspace, so it is a write
+    # even though it reads documents to answer.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
     workspace_id = ws.id
 
     # 2. Get or create session

@@ -7,6 +7,7 @@ from app.agents.graph import LangGraphResearchEngine
 from app.core import metrics
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
+from app.core.workspace_access import require_workspace_role
 from app.models.report import Report as ReportModel
 from app.models.user import User
 
@@ -82,6 +83,8 @@ async def start_session(
     ws = resolve_workspace(payload.workspace_id, request, db, current_user)
     if not ws:
         raise HTTPException(status_code=400, detail="Workspace required")
+    # Same as reports: this writes a record and runs the agent graph.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
     workspace_id = ws.id
 
     # 1. Run multi-agent LangGraph workflow.

@@ -7,10 +7,11 @@ from sqlalchemy.orm import Session
 from app.core.audit import AuditAction, AuditOutcome, audit
 from app.core.database import get_db
 from app.core.security import get_current_user, resolve_workspace
+from app.core.workspace_access import require_workspace_role
 from app.mcp.registry import MCPConnectorRegistry
+from app.models.membership import WorkspaceMember
 from app.models.report import Connector as ConnectorModel
 from app.models.user import User
-from app.models.workspace import Workspace
 
 router = APIRouter()
 registry = MCPConnectorRegistry()
@@ -115,8 +116,11 @@ async def toggle_mcp_connector(
     # else falls through to the 404 below, so ids cannot be probed.
     conn = (
         db.query(ConnectorModel)
-        .join(Workspace, ConnectorModel.workspace_id == Workspace.id)
-        .filter(ConnectorModel.id == connector_id, Workspace.owner_id == current_user.id)
+        .join(WorkspaceMember, ConnectorModel.workspace_id == WorkspaceMember.workspace_id)
+        .filter(
+            ConnectorModel.id == connector_id,
+            WorkspaceMember.user_id == current_user.id,
+        )
         .first()
     )
     if not conn:
@@ -144,6 +148,9 @@ async def toggle_mcp_connector(
             metadata={"reason": "not_owner_or_not_found"},
         )
         raise HTTPException(status_code=404, detail="Connector not found")
+
+    # Membership found the connector; changing its state needs write rights.
+    require_workspace_role(request, conn.workspace_id, "content.write", current_user, db=db)
 
     # Toggle status
     new_status = "disconnected" if conn.status == "connected" else "connected"
