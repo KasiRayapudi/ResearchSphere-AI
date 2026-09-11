@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -56,6 +58,46 @@ CLOSE_SLOW_CONSUMER = 4408
 CLOSE_TIMEOUT = 4400
 CLOSE_GOING_AWAY = 1001
 
+#: How long shutdown waits for connection handlers to finish their own
+#: teardown -- presence cleanup, the offline announcement -- before giving up
+#: on them. Bounded, because a peer that never answers the close must not be
+#: able to hold the process open.
+SHUTDOWN_GRACE_SECONDS = 5.0
+
+
+def may_receive(connection: Connection, event: Event) -> bool:
+    """Whether a socket is entitled to an event. Fails closed.
+
+    The single place audience rules live. Live delivery and reconnect replay
+    both call it, so a restricted event cannot reach someone through the
+    replay path that the live path would have refused.
+    """
+    if event.workspace_id != connection.workspace_id:
+        return False
+    if event.recipient_id is not None and event.recipient_id != connection.user_id:
+        return False
+    if event.permission is not None:
+        # Imported here: workspace_access pulls in the ORM models, which the
+        # event layer should not need just to be imported.
+        from app.core.workspace_access import can
+
+        # can() fails closed on an unknown permission or a missing role.
+        return can(connection.role, event.permission)
+    return True
+
+
+class SocketLike(Protocol):
+    """What the manager needs from a socket: to write to it and to close it.
+
+    Narrower than Starlette's WebSocket on purpose. Reading belongs to the
+    endpoint, and a manager that only writes can be driven by anything that
+    accepts frames.
+    """
+
+    async def send_json(self, data: Any) -> None: ...
+
+    async def close(self, code: int = 1000, reason: str | None = None) -> None: ...
+
 
 @dataclass(eq=False)
 class Connection:
@@ -72,7 +114,7 @@ class Connection:
     """
 
     id: str
-    websocket: object
+    websocket: SocketLike
     user_id: str
     workspace_id: str
     #: Highest sequence number handed to this socket, so a resume knows where
@@ -82,6 +124,19 @@ class Connection:
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=1))
     writer: asyncio.Task | None = None
     closing: bool = False
+    #: The member's role when the socket opened, kept current by
+    #: member.role_changed events. Decides permission-gated delivery.
+    role: str | None = None
+    #: The task serving this socket, when there is one. Shutdown waits on it
+    #: so teardown finishes before the broker goes away, and it is what lets
+    #: a caller observe that a connection has genuinely finished.
+    handler: asyncio.Task | None = None
+    #: When the token this socket authenticated with expires (Unix seconds).
+    #: The socket is closed then, with 4401, and the client reconnects with a
+    #: fresh token: a connection may not outlive its credential.
+    token_expires_at: float | None = None
+    #: The token's jti, so a revocation reaches sockets as well as requests.
+    token_id: str | None = None
 
     def touch(self) -> None:
         self.last_seen_ms = monotonic_ms()
@@ -106,6 +161,13 @@ class ConnectionManager:
         self._by_id: dict[str, Connection] = {}
         self._lock = asyncio.Lock()
         self._heartbeat: asyncio.Task | None = None
+        #: The loop that started this manager. Its tasks and queues belong to
+        #: that loop, so only that loop may stop them.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        #: Called by the reaper every WS_REVALIDATE_SECONDS with the manager;
+        #: see app/realtime/revalidation.py. Optional so the manager stays
+        #: usable without a database.
+        self._validator = None
         self.max_per_user = max_per_user or settings.WS_MAX_CONNECTIONS_PER_USER
         self.max_total = max_total or settings.WS_MAX_CONNECTIONS_TOTAL
         self.queue_size = queue_size or settings.WS_SEND_QUEUE_SIZE
@@ -117,11 +179,36 @@ class ConnectionManager:
             "closed_slow": 0,
             "closed_timeout": 0,
             "dropped_isolation": 0,
+            "filtered": 0,
+            "revoked": 0,
         }
 
     # ------------------------------------------------------------ lifecycle --
-    async def start(self) -> None:
-        """Begin reaping connections that have stopped answering."""
+    async def start(self, validator=None) -> None:
+        """Begin reaping connections that have stopped answering.
+
+        ``validator``, when given, is awaited with the manager every
+        WS_REVALIDATE_SECONDS to close sockets whose authorization has lapsed.
+
+        A manager already running on another, live event loop is left alone:
+        its tasks and queues belong to that loop, and a second lifespan in
+        the same process -- another app instance, or a test -- must not take
+        them over. If the previous owner's loop has died, this loop takes
+        over and anything bound to the dead loop is discarded.
+        """
+        current = asyncio.get_running_loop()
+        if self._loop is not None and self._loop is not current:
+            if not self._loop.is_closed() and self._loop.is_running():
+                logger.warning(
+                    "Realtime manager is already running on another event loop; " "leaving it there"
+                )
+                return
+            self._heartbeat = None
+            self._rooms.clear()
+            self._by_id.clear()
+        self._loop = current
+        if validator is not None:
+            self._validator = validator
         if self._heartbeat is None or self._heartbeat.done():
             self._heartbeat = asyncio.create_task(self._reap_forever())
 
@@ -131,7 +218,15 @@ class ConnectionManager:
         Called on shutdown so clients are told to go away rather than
         discovering it through a broken pipe: a clean close is what makes
         their reconnect immediate instead of waiting for a timeout.
+
+        Only the loop that started the manager can stop it. From any other
+        loop this does nothing: cancelling another loop's tasks from the
+        wrong thread is unsafe, and would tear down sockets that loop is
+        still serving.
         """
+        if self._loop is not None and self._loop is not asyncio.get_running_loop():
+            return
+        self._loop = None
         if self._heartbeat is not None:
             self._heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -142,6 +237,21 @@ class ConnectionManager:
             connections = list(self._by_id.values())
         for connection in connections:
             await self._close(connection, CLOSE_GOING_AWAY, "server shutting down")
+
+        # Closing a socket only starts its teardown; the handler still has
+        # presence to clear and a departure to announce. Waiting here is what
+        # lets the caller stop the broker afterwards without that work
+        # reopening a Redis connection nobody will close.
+        handlers = [
+            c.handler for c in connections if c.handler is not None and not c.handler.done()
+        ]
+        if handlers:
+            _, pending = await asyncio.wait(handlers, timeout=SHUTDOWN_GRACE_SECONDS)
+            if pending:
+                logger.warning(
+                    f"{len(pending)} WebSocket handler(s) did not finish within "
+                    f"{SHUTDOWN_GRACE_SECONDS}s of shutdown"
+                )
 
     # ----------------------------------------------------------- membership --
     async def register(self, connection: Connection) -> None:
@@ -207,7 +317,21 @@ class ConnectionManager:
             return 0
 
         async with self._lock:
-            targets = list(self._rooms.get(event.workspace_id, ()))
+            room = list(self._rooms.get(event.workspace_id, ()))
+
+        # Membership changes are applied to live sockets here, where every
+        # instance sees them -- locally published or arriving over Redis.
+        # Authorization was checked when the socket opened; without this, a
+        # demoted member would keep their old role and a removed one would
+        # keep receiving the workspace until they happened to reconnect.
+        subject = str((event.data or {}).get("userId") or "")
+        if event.type == EventType.MEMBER_ROLE_CHANGED and subject:
+            for connection in room:
+                if connection.user_id == subject:
+                    connection.role = event.data.get("role")
+
+        targets = [c for c in room if may_receive(c, event)]
+        self.stats["filtered"] += len(room) - len(targets)
 
         payload = event.to_wire()
         delivered = 0
@@ -228,6 +352,12 @@ class ConnectionManager:
                 f"(user={connection.user_id}, queue full at {self.queue_size})"
             )
             await self._close(connection, CLOSE_SLOW_CONSUMER, "client too slow")
+
+        if event.type == EventType.MEMBER_REMOVED and subject:
+            for connection in room:
+                if connection.user_id == subject and not connection.closing:
+                    self.stats["revoked"] += 1
+                    await self._close(connection, CLOSE_FORBIDDEN, "membership revoked")
 
         return delivered
 
@@ -264,10 +394,15 @@ class ConnectionManager:
     # ------------------------------------------------------------ heartbeat --
     async def _reap_forever(self) -> None:
         interval = max(1, settings.WS_HEARTBEAT_INTERVAL_SECONDS)
+        last_validated = time.monotonic()
         while True:
             try:
                 await asyncio.sleep(interval)
                 await self.reap_stale()
+                due = max(interval, settings.WS_REVALIDATE_SECONDS)
+                if self._validator is not None and time.monotonic() - last_validated >= due:
+                    last_validated = time.monotonic()
+                    await self._validator(self)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive
@@ -300,7 +435,44 @@ class ConnectionManager:
         with contextlib.suppress(Exception):
             await connection.websocket.close(code=code, reason=reason)
 
+        # The server has decided this connection is over. Its handler must not
+        # then wait for the client to finish the close handshake: a peer the
+        # reaper gave up on is gone and will never answer, and until the
+        # handler returns, that user stays "online". The endpoint treats this
+        # cancellation as a normal end and tears down in its finally block.
+        handler = connection.handler
+        if handler is not None and not handler.done() and handler is not asyncio.current_task():
+            handler.cancel()
+
     # -------------------------------------------------------------- queries --
+    def live(self) -> list[Connection]:
+        """Every connection currently in service."""
+        return [c for c in self._by_id.values() if not c.closing]
+
+    async def close(self, connection: Connection, code: int, reason: str) -> None:
+        """Take one connection out of service with the given close code."""
+        await self._close(connection, code, reason)
+
+    def get(self, connection_id: str) -> Connection | None:
+        return self._by_id.get(connection_id)
+
+    @staticmethod
+    async def wait_for_teardown(
+        connection: Connection, timeout: float = SHUTDOWN_GRACE_SECONDS
+    ) -> bool:
+        """Wait until the task serving a connection has finished. True if it did.
+
+        A client closing its end does not wait for the server to finish
+        cleaning up, so anything that needs the cleanup to have happened --
+        shutdown ordering, or a test asserting on it -- waits on the handler
+        itself rather than on the clock.
+        """
+        handler = connection.handler
+        if handler is None or handler.done():
+            return True
+        done, _ = await asyncio.wait({handler}, timeout=timeout)
+        return bool(done)
+
     def room_size(self, workspace_id: str) -> int:
         return len(self._rooms.get(workspace_id, ()))
 
@@ -344,6 +516,8 @@ def reset_manager() -> None:
 
 
 __all__ = [
+    "SHUTDOWN_GRACE_SECONDS",
+    "may_receive",
     "CLOSE_FORBIDDEN",
     "CLOSE_GOING_AWAY",
     "CLOSE_SLOW_CONSUMER",

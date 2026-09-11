@@ -18,9 +18,21 @@ different one. Tenancy is not a property of the caller remembering to filter.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy import Column
+
+    #: An id as callers hold it. The models declare their columns in
+    #: SQLAlchemy's classic style, so an attribute read off a row is typed
+    #: Column[str] even though its runtime value is a str. make_event coerces
+    #: every id with str(), so accepting either is exact rather than lax --
+    #: and None is still refused.
+    RowId = str | Column[str]
+else:
+    RowId = str
 
 #: Bumped when the envelope changes shape in a way an old client cannot read.
 #: The client sends the version it speaks and the server refuses a mismatch,
@@ -40,7 +52,6 @@ class EventType:
     # --- documents ---
     DOCUMENT_CREATED = "document.created"
     DOCUMENT_STATUS = "document.status"
-    DOCUMENT_UPDATED = "document.updated"
     DOCUMENT_DELETED = "document.deleted"
 
     # --- workspace collaboration ---
@@ -60,24 +71,29 @@ class EventType:
     # --- presence ---
     PRESENCE_ONLINE = "presence.online"
     PRESENCE_OFFLINE = "presence.offline"
-    PRESENCE_SNAPSHOT = "presence.snapshot"
 
     #: Connection-level frames. Not workspace events: they never carry a
     #: sequence number and are never replayed.
     CONNECTED = "connection.ready"
     PONG = "connection.pong"
     ERROR = "connection.error"
-
-
-#: Events a client may not send. The socket is a downstream channel: state
-#: changes go through the REST API, which owns authorization, validation and
-#: auditing. Accepting mutations here would mean a second, weaker front door.
-CLIENT_FRAMES = frozenset({"ping", "subscribe", "resume"})
+    #: Answer to a resume: how much was replayed and whether that was
+    #: everything, so a client knows whether it must refetch.
+    RESUMED = "connection.resumed"
 
 
 @dataclass(frozen=True)
 class Event:
-    """One thing that happened, addressed to one workspace."""
+    """One thing that happened, addressed to one workspace.
+
+    ``recipient_id`` and ``permission`` narrow the audience *within* that
+    workspace, and both are enforced by the delivery layer rather than left
+    to publishers. They exist because not everything in a workspace is
+    visible to everyone in it: chat sessions belong to the person who had
+    them, and pending invitations are readable only by members who may
+    invite. Broadcasting either to the whole room would hand out over the
+    socket what the REST API refuses to return.
+    """
 
     type: str
     workspace_id: str
@@ -85,20 +101,29 @@ class Event:
     #: Assigned by the broker at publish time, not by the caller. 0 means
     #: "not sequenced" and is used only for connection-level frames.
     seq: int = 0
+    #: Which sequence ``seq`` belongs to. A counter can restart -- a process
+    #: without Redis restarts it on every reload, and Redis can lose data --
+    #: and a client comparing a new seq 1 against its remembered seq 37 would
+    #: otherwise discard every event as a duplicate. A changed epoch tells it
+    #: to drop its position and resynchronise instead.
+    epoch: str = ""
     ts: str = ""
     #: The user whose action caused this, when there was one. Lets a client
     #: skip an echo of its own change, which it has already applied
     #: optimistically.
     actor_id: str | None = None
+    #: Deliver only to this user's connections.
+    recipient_id: str | None = None
+    #: Deliver only to connections whose workspace role grants this
+    #: permission, as named in app.core.workspace_access.PERMISSIONS.
+    permission: str | None = None
 
-    def with_sequence(self, seq: int) -> Event:
-        return Event(
-            type=self.type,
-            workspace_id=self.workspace_id,
-            data=self.data,
+    def with_sequence(self, seq: int, epoch: str = "") -> Event:
+        return replace(
+            self,
             seq=seq,
+            epoch=epoch or self.epoch,
             ts=self.ts or datetime.now(UTC).isoformat(),
-            actor_id=self.actor_id,
         )
 
     def to_wire(self) -> dict:
@@ -119,16 +144,22 @@ class Event:
             workspace_id=str(payload.get("workspace_id", "")),
             data=payload.get("data") or {},
             seq=int(payload.get("seq") or 0),
+            epoch=str(payload.get("epoch") or ""),
             ts=str(payload.get("ts") or ""),
             actor_id=payload.get("actor_id"),
+            recipient_id=payload.get("recipient_id"),
+            permission=payload.get("permission"),
         )
 
 
 def make_event(
     event_type: str,
-    workspace_id: str,
+    workspace_id: RowId,
     data: dict | None = None,
-    actor_id: str | None = None,
+    actor_id: RowId | None = None,
+    *,
+    recipient_id: RowId | None = None,
+    permission: str | None = None,
 ) -> Event:
     """Build an unsequenced event, timestamped now."""
     return Event(
@@ -137,6 +168,8 @@ def make_event(
         data=data or {},
         ts=datetime.now(UTC).isoformat(),
         actor_id=str(actor_id) if actor_id else None,
+        recipient_id=str(recipient_id) if recipient_id else None,
+        permission=permission or None,
     )
 
 

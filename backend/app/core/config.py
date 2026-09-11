@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     #: a busy workspace can occupy in Redis, and caps how far behind a client
     #: can be and still catch up without refetching.
     WS_REPLAY_BUFFER_SIZE: int = 200
+    #: How often live sockets are re-checked against the database and their
+    #: token: expiry, revocation, account status, membership and role. Bounds
+    #: how long a socket can outlive the authorization it opened with when
+    #: the event that should have closed it was lost.
+    WS_REVALIDATE_SECONDS: int = 60
 
     #: How long an object must have existed before the sweep will consider
     #: it orphaned. Generous on purpose: an upload writes the object before

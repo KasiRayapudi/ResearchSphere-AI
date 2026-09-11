@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 import uuid
 from collections import defaultdict, deque
 
@@ -59,9 +60,20 @@ def log_key(workspace_id: str) -> str:
     return f"researchsphere:realtime:log:{workspace_id}"
 
 
-#: How long a workspace's replay log and counter survive without activity.
-#: Long enough that a client can be away for a while, short enough that a
-#: workspace nobody touches stops costing anything.
+def epoch_key(workspace_id: str) -> str:
+    return f"researchsphere:realtime:epoch:{workspace_id}"
+
+
+#: How long a workspace's replay log survives without activity. Long enough
+#: that a client can be away for a while, short enough that a workspace
+#: nobody touches stops holding a log.
+#:
+#: The sequence counter and its epoch deliberately do NOT expire. A counter
+#: that lapses while a tab sits open in a quiet workspace restarts at 1, and
+#: the client -- still holding seq 37 -- would discard every new event as a
+#: duplicate. Two small keys per workspace is the price of that not
+#: happening; if Redis loses them anyway, the epoch changes with them and
+#: clients resynchronise rather than going silently stale.
 STATE_TTL_SECONDS = 24 * 3600
 
 #: Backoff bounds for the subscriber when Redis is unreachable. It must keep
@@ -69,18 +81,40 @@ STATE_TTL_SECONDS = 24 * 3600
 RECONNECT_MIN_SECONDS = 1
 RECONNECT_MAX_SECONDS = 30
 
+#: After a failed connection attempt, how long every caller skips Redis and
+#: goes straight to the process-local path. Without a window, each publish,
+#: presence update and handshake while Redis is down would pay its own
+#: connect timeout. Short, because a Redis that has come back should be
+#: used again soon.
+UNAVAILABLE_BACKOFF_SECONDS = 5.0
+
 
 class EventBroker:
     """Sequences events, records them for replay, and fans them out."""
 
     def __init__(self, manager: ConnectionManager | None = None, instance_id: str | None = None):
-        self.manager = manager or get_manager()
+        #: Resolved on use unless one was given. Capturing get_manager() at
+        #: construction pinned the broker to whichever manager existed then,
+        #: so replacing the process manager left the broker delivering into a
+        #: room nobody was in.
+        self._manager = manager
         #: Identifies this process on the wire so it can ignore its own
         #: messages coming back through pub/sub.
         self.instance_id = instance_id or uuid.uuid4().hex
         self._redis = None
+        #: Monotonic time before which no connection attempt is made.
+        self._unavailable_until = 0.0
         self._subscriber: asyncio.Task | None = None
         self._running = False
+        #: Set while subscribed to the channel, cleared while not. Anything
+        #: that depends on cross-instance delivery -- readiness, a test --
+        #: waits on this instead of guessing how long a subscription takes.
+        self.subscribed = asyncio.Event()
+        #: The loop this broker was started on. Captured so a thread that is
+        #: not the loop -- inline ingestion runs in one -- can hand work back
+        #: to it. None in a process with no loop at all, such as a real
+        #: Celery worker.
+        self.loop: asyncio.AbstractEventLoop | None = None
 
         # In-process fallback, used when Redis is not configured or is down.
         # Correct for a single process, which is the only deployment where
@@ -91,6 +125,12 @@ class EventBroker:
         )
         self._local_lock = asyncio.Lock()
 
+        # Presence shares the broker's Redis connection and its degradation
+        # policy rather than opening a second one with rules of its own.
+        from .presence import PresenceTracker
+
+        self.presence = PresenceTracker(self)
+
         self.stats = {
             "published": 0,
             "received": 0,
@@ -99,10 +139,30 @@ class EventBroker:
             "replayed": 0,
         }
 
+    @property
+    def manager(self) -> ConnectionManager:
+        return self._manager or get_manager()
+
     # ------------------------------------------------------------ lifecycle --
     async def start(self) -> None:
-        """Connect to Redis and begin listening. Safe without Redis."""
+        """Connect to Redis and begin listening. Safe without Redis.
+
+        Owned by the loop that starts it, like the manager: a start from
+        another loop leaves a live owner alone, and takes over only from one
+        that has died -- dropping the Redis client and subscriber bound to it.
+        """
+        current = asyncio.get_running_loop()
+        if self.loop is not None and self.loop is not current:
+            if not self.loop.is_closed() and self.loop.is_running():
+                logger.warning(
+                    "Realtime broker is already running on another event loop; leaving it there"
+                )
+                return
+            self._subscriber = None
+            self._redis = None
+            self.subscribed.clear()
         self._running = True
+        self.loop = current
         if not self._redis_configured():
             logger.info(
                 "Realtime is running without Redis: events reach clients on this "
@@ -113,7 +173,14 @@ class EventBroker:
             self._subscriber = asyncio.create_task(self._subscribe_forever())
 
     async def stop(self) -> None:
+        # Only the owning loop stops the broker. From another loop this would
+        # clear the loop worker threads hand events to, and every one after
+        # that would be dropped.
+        if self.loop is not None and self.loop is not asyncio.get_running_loop():
+            return
         self._running = False
+        self.loop = None
+        self.subscribed.clear()
         if self._subscriber is not None:
             self._subscriber.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -138,6 +205,8 @@ class EventBroker:
             return self._redis
         if not self._redis_configured():
             return None
+        if time.monotonic() < self._unavailable_until:
+            return None
         try:
             import redis.asyncio as aioredis
 
@@ -152,7 +221,11 @@ class EventBroker:
             return client
         except Exception as exc:
             self.stats["redis_errors"] += 1
-            logger.warning(f"Realtime Redis unavailable ({exc}); staying process-local.")
+            self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
+            logger.warning(
+                f"Realtime Redis unavailable ({exc}); staying process-local for "
+                f"{UNAVAILABLE_BACKOFF_SECONDS:.0f}s."
+            )
             self._redis = None
             return None
 
@@ -168,7 +241,8 @@ class EventBroker:
             logger.error(f"Refusing to publish {event.type} with no workspace")
             return event
 
-        sequenced = event.with_sequence(await self._next_sequence(event.workspace_id))
+        seq, epoch = await self._next_sequence(event.workspace_id)
+        sequenced = event.with_sequence(seq, epoch)
         await self._record(sequenced)
         self.stats["published"] += 1
 
@@ -176,22 +250,73 @@ class EventBroker:
         await self._fan_out(sequenced)
         return sequenced
 
-    async def _next_sequence(self, workspace_id: str) -> int:
+    async def _next_sequence(self, workspace_id: str) -> tuple[int, str]:
+        """The next sequence number for a workspace, and the epoch it belongs to.
+
+        One MULTI/EXEC round trip: increment, create the epoch if this is the
+        first event it has ever seen, read it back. SET NX means concurrent
+        publishers converge on whichever epoch was written first.
+        """
         client = await self._client()
         if client is not None:
             try:
-                key = sequence_key(workspace_id)
-                value = await client.incr(key)
-                await client.expire(key, STATE_TTL_SECONDS)
-                return int(value)
+                pipe = client.pipeline()
+                pipe.incr(sequence_key(workspace_id))
+                pipe.set(epoch_key(workspace_id), uuid.uuid4().hex, nx=True)
+                pipe.get(epoch_key(workspace_id))
+                seq, _, epoch = await pipe.execute()
+                return int(seq), str(epoch)
             except Exception as exc:
                 self.stats["redis_errors"] += 1
                 logger.warning(f"Sequence allocation failed ({exc}); using local counter.")
                 self._redis = None
 
+        # Process-local: the epoch is this process, so a restart -- including
+        # every dev-server reload -- is visible to clients as an epoch change.
         async with self._local_lock:
             self._local_seq[workspace_id] += 1
-            return self._local_seq[workspace_id]
+            return self._local_seq[workspace_id], self.instance_id
+
+    async def current_position(self, workspace_id: str) -> tuple[int, str]:
+        """The latest sequence issued for a workspace and its epoch.
+
+        Sent to a client when it connects, so a socket that receives nothing
+        still knows where it stands and can resume from the right place.
+        """
+        client = await self._client()
+        if client is not None:
+            try:
+                pipe = client.pipeline()
+                pipe.get(sequence_key(workspace_id))
+                pipe.set(epoch_key(workspace_id), uuid.uuid4().hex, nx=True)
+                pipe.get(epoch_key(workspace_id))
+                seq, _, epoch = await pipe.execute()
+                return int(seq or 0), str(epoch)
+            except Exception as exc:
+                self.stats["redis_errors"] += 1
+                logger.warning(f"Position lookup failed ({exc}); using local counter.")
+                self._redis = None
+
+        async with self._local_lock:
+            return self._local_seq.get(workspace_id, 0), self.instance_id
+
+    async def oldest_retained(self, workspace_id: str) -> int:
+        """Sequence of the oldest event still in the replay log, or 0 if empty."""
+        client = await self._client()
+        if client is not None:
+            try:
+                raw = await client.lindex(log_key(workspace_id), 0)
+                if not raw:
+                    return 0
+                return Event.from_wire(json.loads(raw)).seq
+            except Exception as exc:
+                self.stats["redis_errors"] += 1
+                logger.warning(f"Replay log read failed ({exc}); using local buffer.")
+                self._redis = None
+
+        async with self._local_lock:
+            log = self._local_log.get(workspace_id)
+            return log[0].seq if log else 0
 
     async def _record(self, event: Event) -> None:
         """Append to the workspace's replay log, oldest entries falling off."""
@@ -239,6 +364,7 @@ class EventBroker:
                     raise ConnectionError("Redis unavailable")
                 pubsub = client.pubsub(ignore_subscribe_messages=True)
                 await pubsub.subscribe(CHANNEL)
+                self.subscribed.set()
                 logger.info(f"Realtime subscriber listening on {CHANNEL}")
                 delay = RECONNECT_MIN_SECONDS
 
@@ -251,6 +377,7 @@ class EventBroker:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self.subscribed.clear()
                 self.stats["redis_errors"] += 1
                 self._redis = None
                 logger.warning(f"Realtime subscriber dropped ({exc}); retrying in {delay}s.")
@@ -283,13 +410,20 @@ class EventBroker:
         await self.manager.publish(Event.from_wire(payload))
 
     # -------------------------------------------------------------- replay --
-    async def replay(self, workspace_id: str, after_seq: int, limit: int = 0) -> list[Event]:
+    async def replay(
+        self, workspace_id: str, after_seq: int, limit: int = 0, epoch: str | None = None
+    ) -> list[Event]:
         """Events for this workspace newer than ``after_seq``, in order.
 
         What a client gets after a reconnect. Bounded by the log size, so a
-        client that has been away too long receives what is left rather than
-        everything -- it can tell, because the first sequence it gets back is
-        further ahead than the one it asked for, and refetch instead.
+        client that has been away too long receives only what is left.
+        Whether that was everything is answered by the caller comparing
+        ``oldest_retained`` with the position asked for -- not by looking for
+        gaps, because restricted events legitimately leave gaps in what any
+        one client sees.
+
+        ``epoch`` limits the replay to one sequence space; numbers from
+        different epochs are not comparable.
         """
         limit = limit or max(1, settings.WS_REPLAY_BUFFER_SIZE)
         events: list[Event] = []
@@ -311,7 +445,13 @@ class EventBroker:
             async with self._local_lock:
                 events = list(self._local_log.get(workspace_id, ()))
 
-        missed = [e for e in events if e.seq > after_seq and e.workspace_id == workspace_id]
+        missed = [
+            e
+            for e in events
+            if e.seq > after_seq
+            and e.workspace_id == workspace_id
+            and (epoch is None or e.epoch == epoch)
+        ]
         missed.sort(key=lambda e: e.seq)
         self.stats["replayed"] += len(missed)
         return missed[-limit:]
@@ -320,7 +460,7 @@ class EventBroker:
         return {
             "instance": self.instance_id,
             "redis": self._redis is not None,
-            "listening": bool(self._subscriber and not self._subscriber.done()),
+            "listening": self.subscribed.is_set(),
             "stats": dict(self.stats),
         }
 
@@ -369,11 +509,13 @@ def publish_from_worker(event: Event) -> bool:
         return False
 
     try:
-        key = sequence_key(event.workspace_id)
-        seq = int(client.incr(key))
-        client.expire(key, STATE_TTL_SECONDS)
+        allocate = client.pipeline()
+        allocate.incr(sequence_key(event.workspace_id))
+        allocate.set(epoch_key(event.workspace_id), uuid.uuid4().hex, nx=True)
+        allocate.get(epoch_key(event.workspace_id))
+        seq, _, epoch = allocate.execute()
 
-        sequenced = event.with_sequence(seq)
+        sequenced = event.with_sequence(int(seq), str(epoch))
         payload = sequenced.to_wire()
         # No origin: this process serves no sockets, so every subscriber
         # should deliver it rather than mistake it for its own echo.
@@ -399,6 +541,7 @@ def publish_from_worker(event: Event) -> bool:
 __all__ = [
     "CHANNEL",
     "EventBroker",
+    "epoch_key",
     "get_broker",
     "log_key",
     "publish",
