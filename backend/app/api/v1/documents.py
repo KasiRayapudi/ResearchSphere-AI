@@ -29,6 +29,7 @@ from app.models.document import Document, DocumentStatus
 from app.models.membership import WorkspaceMember
 from app.models.user import User
 from app.rag.vector_store import delete_document_vectors
+from app.realtime import notify
 from app.services.antivirus import get_scanner
 from app.services.storage import (
     TEMP_PREFIX,
@@ -348,6 +349,12 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
 
+    # Announced before it is handed to a worker, not after. Inline, or on a
+    # fast worker, every status event through "indexed" would otherwise reach
+    # the workspace ahead of the document it describes. The row is committed,
+    # so what is announced here is real.
+    await notify.document_created(doc, actor_id=current_user.id, uploaded_by=current_user.full_name)
+
     # 4. Hand the document to a worker.
     #
     # Extraction, embedding and the vector upsert used to run here, inside
@@ -595,6 +602,8 @@ async def delete_document(
             # it once the row is gone. Refusing the delete is not.
             logger.error(f"Failed to remove stored object for {doc.id}: {e}")
 
+    # Kept before the row goes, for the event announcing that it went.
+    deleted_workspace = doc.workspace_id
     deleted_meta = {
         "filename": doc.original_filename,
         "workspace_id": doc.workspace_id,
@@ -611,4 +620,5 @@ async def delete_document(
         request=request,
         metadata=deleted_meta,
     )
+    await notify.document_deleted(deleted_workspace, id, actor_id=current_user.id)
     return {"message": "Document successfully deleted"}

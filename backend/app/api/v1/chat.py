@@ -18,6 +18,7 @@ from app.core.workspace_access import require_workspace_role
 from app.models.chat import ChatMessage, ChatSession
 from app.models.user import User
 from app.rag.pipeline import stream_rag_response
+from app.realtime import notify
 
 router = APIRouter()
 logger = get_logger("chat")
@@ -109,7 +110,58 @@ async def create_session(
     db.add(session)
     db.commit()
     db.refresh(session)
+    await notify.chat_created(ws.id, session, actor_id=current_user.id)
     return {"id": session.id, "title": session.title}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete one of the caller's own conversations, messages included.
+
+    Scoped exactly as reading one is: the session must belong to the caller.
+    Someone else's session -- even in a workspace both can read -- is
+    reported as missing, so ids cannot be probed. Membership of the workspace
+    is still required: leaving a workspace leaves no rights over it behind.
+    Messages go with the session through the relationship's cascade.
+    """
+    session = (
+        db.query(ChatSession)
+        .filter(ChatSession.id == session_id, ChatSession.user_id == current_user.id)
+        .first()
+    )
+    if session is None:
+        audit(
+            action=AuditAction.PERMISSION_DENIED,
+            actor=current_user,
+            outcome=AuditOutcome.DENIED,
+            resource=f"chat_session:{session_id}",
+            request=request,
+            metadata={"reason": "not_owner_or_not_found"},
+        )
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
+    workspace_id = session.workspace_id
+    require_workspace_role(request, workspace_id, "workspace.read", current_user, db=db)
+
+    db.delete(session)
+    db.commit()
+    audit(
+        action=AuditAction.CHAT_SESSION_DELETE,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"chat_session:{session_id}",
+        request=request,
+        metadata={"workspace_id": workspace_id},
+    )
+    await notify.chat_deleted(
+        workspace_id, session_id, owner_id=current_user.id, actor_id=current_user.id
+    )
+    return {"message": "Chat session deleted"}
 
 
 @router.post("/stream")
@@ -146,6 +198,9 @@ async def chat_stream(
             db.add(session)
             db.commit()
             db.refresh(session)
+            # The one creation path that used to say nothing: a first message
+            # sent with no session creates one here.
+            await notify.chat_created(ws.id, session, actor_id=current_user.id)
         session_id = session.id
     else:
         # Never trust a client-supplied session id: it must belong to this
@@ -172,6 +227,9 @@ async def chat_stream(
         if session.title == "New Chat Session":
             session.title = payload.prompt[:40]
             db.commit()
+            # The sidebar shows this title; without an event it would keep
+            # saying "New Chat Session" until the page was reloaded.
+            await notify.chat_renamed(session, actor_id=current_user.id)
 
     # 3. Add User message to DB
     user_msg = ChatMessage(
@@ -179,6 +237,7 @@ async def chat_stream(
     )
     db.add(user_msg)
     db.commit()
+    await notify.chat_message(session, user_msg, actor_id=current_user.id)
 
     async def event_generator():
         stream_started = time.perf_counter()
@@ -244,6 +303,7 @@ async def chat_stream(
             )
             db.add(assistant_msg)
             db.commit()
+            await notify.chat_message(session, assistant_msg)
         except Exception as exc:
             logger.error(f"Failed to persist assistant message: {exc}", exc_info=True)
             db.rollback()

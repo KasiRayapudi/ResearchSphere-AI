@@ -33,6 +33,7 @@ from app.core.workspace_access import membership_for, require_workspace_role
 from app.models.membership import WorkspaceInvitation, WorkspaceMember, WorkspaceRole
 from app.models.user import User
 from app.models.workspace import Workspace
+from app.realtime import notify
 from app.services.email import send_email
 
 router = APIRouter()
@@ -241,6 +242,7 @@ async def update_member_role(
     member.role = new_role
     db.commit()
     db.refresh(member)
+    await notify.member_role_changed(ws.id, member, actor_id=current_user.id)
 
     audit(
         action=AuditAction.WORKSPACE_MEMBER_ROLE_CHANGED,
@@ -313,6 +315,7 @@ async def remove_member(
         request=request,
         metadata={"target_user_id": target_user_id, "self_removal": leaving},
     )
+    await notify.member_removed(ws.id, member_id, target_user_id, actor_id=current_user.id)
     return {"message": "Member removed"}
 
 
@@ -373,6 +376,11 @@ async def transfer_ownership(
             "to_user_id": target.user_id,
         },
     )
+    # Two roles changed. Announced separately because each is a change to a
+    # different member's live sockets, and to the member list.
+    if current_owner is not None:
+        await notify.member_role_changed(ws.id, current_owner, actor_id=current_user.id)
+    await notify.member_role_changed(ws.id, target, actor_id=current_user.id)
 
     members = (
         db.query(WorkspaceMember)
@@ -513,6 +521,10 @@ async def invite_member(
             "transport is configured. Set EMAIL_BACKEND=smtp to send invitations."
         )
 
+    # Never carries the token: it is a credential issued to one address,
+    # and this reaches every connected member of the workspace.
+    await notify.invitation_sent(ws.id, invitation, actor_id=current_user.id)
+
     return InvitationResponse(
         id=invitation.id,
         email=invitation.email,
@@ -576,15 +588,16 @@ async def accept_invitation(
         raise HTTPException(status_code=404, detail="That workspace no longer exists.")
 
     existing = membership_for(db, invitation.workspace_id, current_user.id)
+    # Kept so the new membership can be announced without reading it back.
+    joined: WorkspaceMember | None = None
     if existing is None:
-        db.add(
-            WorkspaceMember(
-                workspace_id=invitation.workspace_id,
-                user_id=current_user.id,
-                role=invitation.role,
-                invited_by=invitation.invited_by,
-            )
+        joined = WorkspaceMember(
+            workspace_id=invitation.workspace_id,
+            user_id=current_user.id,
+            role=invitation.role,
+            invited_by=invitation.invited_by,
         )
+        db.add(joined)
     invitation.accepted_at = datetime.utcnow()
     db.commit()
 
@@ -600,6 +613,15 @@ async def accept_invitation(
             "already_member": existing is not None,
         },
     )
+
+    # Two things happened: an invitation was used, and (usually) a member
+    # joined. The members list and the pending-invitations list are separate
+    # screens, so both are told rather than one being inferred from the other.
+    await notify.invitation_accepted(invitation.workspace_id, invitation.id, current_user.id)
+    if joined is not None:
+        await notify.member_added(
+            invitation.workspace_id, joined, current_user, actor_id=current_user.id
+        )
     return {
         "message": "Invitation accepted",
         "workspaceId": workspace.id,
@@ -646,6 +668,7 @@ async def revoke_invitation(
         request=request,
         metadata={"invitation_id": invitation.id, "email": invitation.email},
     )
+    await notify.invitation_revoked(ws.id, invitation.id, actor_id=current_user.id)
     return {"message": "Invitation revoked"}
 
 
@@ -707,6 +730,10 @@ async def resend_invitation(
             "resend": True,
         },
     )
+    # A resend is a revocation and a new invitation with a new id; a
+    # manager's list must drop the one and show the other.
+    await notify.invitation_revoked(ws.id, invitation.id, actor_id=current_user.id)
+    await notify.invitation_sent(ws.id, replacement, actor_id=current_user.id)
     return InvitationResponse(
         id=replacement.id,
         email=replacement.email,

@@ -94,6 +94,10 @@ class AuditAction(str, Enum):
     #: from DOCUMENT_UPLOAD, which now records acceptance of the file only.
     DOCUMENT_INDEXED = "document.indexed"
 
+    # Chat
+    #: A user deleted one of their own conversations.
+    CHAT_SESSION_DELETE = "chat.session.delete"
+
     # Reports
     REPORT_GENERATE = "report.generate"
 

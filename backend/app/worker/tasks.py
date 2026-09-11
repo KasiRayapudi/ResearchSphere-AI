@@ -53,6 +53,7 @@ from app.models.document import Document, DocumentChunk, DocumentStatus
 from app.rag.document_processor import chunk_text, clean_text, extract_text
 from app.rag.embeddings import embed_texts
 from app.rag.vector_store import upsert_chunks
+from app.realtime import notify
 from app.services.storage import (
     DOCUMENT_PREFIX,
     TEMP_PREFIX,
@@ -103,17 +104,22 @@ def _session():
 def _set_state(
     db, doc: Document, *, status: str | None = None, progress: int | None = None
 ) -> None:
-    """Persist a status/progress step immediately.
+    """Persist a status/progress step and tell anyone watching.
 
-    Committed as its own transaction rather than batched at the end: the
-    whole point of these fields is to be readable by a client polling the
-    status endpoint while the work is still running.
+    Committed as its own transaction rather than batched at the end: these
+    fields exist to be readable while the work is still running, and the
+    event published here is what moves a progress bar in the browser without
+    it having to ask.
+
+    The notification happens after the commit, so a client that reacts by
+    fetching cannot read state older than the event that prompted it.
     """
     if status is not None:
         doc.status = status
     if progress is not None:
         doc.progress = progress
     db.commit()
+    notify.document_status_changed(doc)
 
 
 class DocumentIngestTask(Task):
@@ -134,10 +140,12 @@ class DocumentIngestTask(Task):
             doc = db.get(Document, document_id)
             if doc is None:
                 return
-            doc.status = DocumentStatus.FAILED
             doc.error_message = f"{type(exc).__name__}: {exc}"[:1000]
             doc.processing_completed_at = _utcnow()
-            db.commit()
+            # Through _set_state, like every other transition, so the failure
+            # is announced to whoever is watching and not only discovered on
+            # the next page load.
+            _set_state(db, doc, status=DocumentStatus.FAILED)
 
             metrics.safe(metrics.uploads_total.labels(outcome="failed").inc)
             capture_exception(exc, task="documents.process", document_id=document_id)
@@ -337,19 +345,20 @@ def reap_stalled_documents() -> dict:
             .all()
         )
         for doc in stalled:
-            doc.status = DocumentStatus.FAILED
             doc.error_message = (
                 "Indexing did not complete: the worker processing this document "
                 "stopped responding. Upload the document again to retry."
             )
             doc.processing_completed_at = _utcnow()
+            # One commit per document rather than one for the batch: each
+            # failure is then announced as it is recorded, and a crash midway
+            # leaves the ones already reaped reaped.
+            _set_state(db, doc, status=DocumentStatus.FAILED)
             logger.error(
                 f"Reaped stalled document {doc.id} "
                 f"(processing since {doc.processing_started_at})",
                 extra={"action": "document.index.stalled", "resource_type": "document"},
             )
-        if stalled:
-            db.commit()
         return {"reaped": len(stalled)}
     finally:
         db.close()
