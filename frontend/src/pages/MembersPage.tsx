@@ -15,6 +15,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { useWorkspace } from '../contexts/WorkspaceContext';
 import { useAsyncData } from '../hooks/useAsyncData';
+import { useRealtime, useRealtimeEvent } from '../hooks/useRealtime';
+import { EVENTS, RESYNC } from '../services/realtime';
 import { InvitationStatus, ROLE_CAN, WorkspaceMember, WorkspaceRole } from '../types';
 
 const ASSIGNABLE_ROLES: WorkspaceRole[] = ['admin', 'editor', 'viewer'];
@@ -56,6 +58,36 @@ export const MembersPage: React.FC = () => {
   );
 
   const pending = (invitations.data ?? []).filter((i) => i.status === 'pending');
+
+  // Changes made by other people arrive over the workspace socket. The lists
+  // are refetched rather than patched: invitation events deliberately carry
+  // only an id, so the server re-applies authorization when the list is
+  // read. My own changes are skipped -- withBusy has already refreshed.
+  const { online } = useRealtime();
+  useRealtimeEvent(
+    [
+      EVENTS.MEMBER_ADDED,
+      EVENTS.MEMBER_REMOVED,
+      EVENTS.MEMBER_ROLE_CHANGED,
+      EVENTS.INVITATION_SENT,
+      EVENTS.INVITATION_REVOKED,
+      EVENTS.INVITATION_ACCEPTED,
+      RESYNC,
+    ],
+    (event) => {
+      if (event.type === RESYNC) {
+        void members.refresh();
+        if (canManage) void invitations.refresh();
+        return;
+      }
+      if (event.actor_id && event.actor_id === user?.id) return;
+      if (event.type.startsWith('invitation.')) {
+        if (canManage) void invitations.refresh();
+        return;
+      }
+      void members.refresh();
+    }
+  );
 
   const withBusy = async (id: string, action: () => Promise<unknown>, success: string) => {
     setBusyId(id);
@@ -137,6 +169,13 @@ export const MembersPage: React.FC = () => {
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm text-slate-200">
                       {member.fullName ?? member.email}
+                      {online.includes(member.userId) && (
+                        <span
+                          className="ml-2 inline-block h-2 w-2 rounded-full bg-emerald-400 align-middle"
+                          title="Online now"
+                          aria-label="online"
+                        />
+                      )}
                       {isMe && <span className="ml-2 text-[11px] text-slate-500">(you)</span>}
                     </p>
                     <p className="truncate text-[11px] text-slate-500">

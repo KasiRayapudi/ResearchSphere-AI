@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, Copy, FileUp, Loader2, UploadCloud, X } from 'lucide-react';
 import { ApiService } from '../../services/api';
 import { ApiError } from '../../services/apiClient';
+import { EVENTS, RESYNC, RealtimeEvent } from '../../services/realtime';
+import { useRealtime, useRealtimeEvent } from '../../hooks/useRealtime';
 import { Button } from '../common/Button';
 import { Document } from '../../types';
 
@@ -12,8 +14,8 @@ const MAX_SIZE_MB = 50;
 /**
  * `indexing` is the state between a successful upload and the document
  * being searchable. The server accepts the file, queues it and returns
- * immediately; a worker does the extraction and embedding, so the client
- * polls until the document reaches a terminal state.
+ * immediately; the worker announces each step over the workspace socket,
+ * and that is what moves the bar. Nothing here polls.
  */
 type ItemStatus = 'queued' | 'uploading' | 'indexing' | 'done' | 'duplicate' | 'error';
 
@@ -25,20 +27,28 @@ interface QueueItem {
   progress: number;
   message?: string;
   controller?: AbortController;
-  /** Set once the server has accepted the file; the key for polling. */
+  /** Set once the server has accepted the file; status events match on it. */
   documentId?: string;
 }
 
-/** How often to ask the server for indexing progress. */
-const POLL_INTERVAL_MS = 2500;
-
 /**
- * Stop polling after this long. Indexing that has not finished by now has
- * almost certainly failed in a way the server will report on its own; the
- * server-side reaper marks such documents failed, and continuing to poll a
- * document nobody is watching just burns requests.
+ * How long to wait for a terminal status before telling the user to check
+ * back later. Not a poll: nothing is requested when it fires. A document
+ * whose worker died is failed by the server-side reaper, and that failure is
+ * announced like any other status; this is the backstop for a socket that
+ * could not be re-established in the meantime.
  */
-const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+const INDEXING_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Status events remembered for documents not (yet) in the queue. */
+const EARLY_EVENTS_LIMIT = 200;
+
+interface StatusUpdate {
+  seq: number;
+  status: string;
+  progress: number;
+  error?: string | null;
+}
 
 function describe(status: string, progress: number): string {
   if (status === 'queued') return 'Queued for indexing...';
@@ -81,9 +91,134 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
   const [isDragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const { status: realtimeStatus } = useRealtime();
+  const realtimeOpen = useRef(realtimeStatus === 'open');
+  useEffect(() => {
+    realtimeOpen.current = realtimeStatus === 'open';
+  }, [realtimeStatus]);
+
+  const itemsRef = useRef(items);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  /**
+   * Latest status event per document -- including documents whose upload has
+   * not returned yet. On a fast worker the first events can arrive before
+   * the upload response that tells us the document's id.
+   */
+  const latest = useRef(new Map<string, StatusUpdate>());
+  /**
+   * Sequence of the last update applied per document. Events can arrive out
+   * of order, and a late "processing 70" must not move a finished bar back.
+   */
+  const applied = useRef(new Map<string, number>());
+  const timeouts = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    const pending = timeouts.current;
+    return () => {
+      pending.forEach((handle) => window.clearTimeout(handle));
+      pending.clear();
+    };
+  }, []);
+
   const update = useCallback((id: string, patch: Partial<QueueItem>) => {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   }, []);
+
+  const clearTimeoutFor = useCallback((documentId: string) => {
+    const handle = timeouts.current.get(documentId);
+    if (handle !== undefined) {
+      window.clearTimeout(handle);
+      timeouts.current.delete(documentId);
+    }
+  }, []);
+
+  const applyStatus = useCallback(
+    (documentId: string, next: StatusUpdate) => {
+      if (next.status === 'indexed' || next.status === 'failed') clearTimeoutFor(documentId);
+      setItems((prev) =>
+        prev.map((it) => {
+          if (it.documentId !== documentId || it.status !== 'indexing') return it;
+          if (next.status === 'indexed') {
+            return { ...it, status: 'done', progress: 100, message: undefined };
+          }
+          if (next.status === 'failed') {
+            return { ...it, status: 'error', message: next.error ?? 'Indexing failed.' };
+          }
+          return { ...it, progress: next.progress, message: describe(next.status, next.progress) };
+        })
+      );
+    },
+    [clearTimeoutFor]
+  );
+
+  /**
+   * One REST read per document still indexing. Only when the socket could
+   * not have told us: after a resume the server reported incomplete, or for
+   * an upload that returned while the socket was down.
+   */
+  const reconcile = useCallback(
+    async (documentIds: string[]) => {
+      await Promise.all(
+        documentIds.map(async (documentId) => {
+          const before = applied.current.get(documentId);
+          try {
+            const current = await ApiService.getDocumentStatus(documentId);
+            // An event that arrived while this was in flight is newer.
+            if (applied.current.get(documentId) !== before) return;
+            applyStatus(documentId, {
+              seq: before ?? 0,
+              status: current.status,
+              progress: current.progress,
+              error: current.error,
+            });
+          } catch {
+            /* the next event, or the next resync, will settle it */
+          }
+        })
+      );
+    },
+    [applyStatus]
+  );
+
+  useRealtimeEvent([EVENTS.DOCUMENT_STATUS, RESYNC], (event: RealtimeEvent) => {
+    if (event.type === RESYNC) {
+      const ids = itemsRef.current
+        .filter((i) => i.status === 'indexing' && i.documentId)
+        .map((i) => i.documentId as string);
+      if (ids.length) void reconcile(ids);
+      return;
+    }
+
+    const data = event.data as {
+      id?: string;
+      status?: string;
+      progress?: number;
+      error?: string | null;
+    };
+    if (!data.id || !data.status) return;
+    const next: StatusUpdate = {
+      seq: event.seq,
+      status: data.status,
+      progress: data.progress ?? 0,
+      error: data.error,
+    };
+
+    const seen = latest.current.get(data.id);
+    if (!seen || next.seq > seen.seq) {
+      latest.current.set(data.id, next);
+      if (latest.current.size > EARLY_EVENTS_LIMIT) {
+        const oldest = latest.current.keys().next().value;
+        if (oldest !== undefined) latest.current.delete(oldest);
+      }
+    }
+
+    if (next.seq <= (applied.current.get(data.id) ?? -1)) return;
+    applied.current.set(data.id, next.seq);
+    applyStatus(data.id, next);
+  });
 
   const uploadOne = useCallback(
     async (item: QueueItem) => {
@@ -98,7 +233,7 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
         });
         // The backend returns 200 with duplicate:true when identical content
         // already exists, so this is a normal outcome, not an error.
-        if ((doc as any)?.duplicate) {
+        if (doc.duplicate) {
           update(item.id, {
             status: 'duplicate',
             progress: 100,
@@ -109,13 +244,39 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
           // document can already be finished by the time this returns.
           update(item.id, { status: 'done', progress: 100 });
         } else {
-          // Accepted and queued. Indexing progress is polled from here.
+          // Accepted and queued. Progress arrives as events from here.
           update(item.id, {
             status: 'indexing',
             progress: 0,
             documentId: doc.id,
             message: describe(doc.status, 0),
           });
+          timeouts.current.set(
+            doc.id,
+            window.setTimeout(() => {
+              timeouts.current.delete(doc.id);
+              setItems((prev) =>
+                prev.map((it) =>
+                  it.documentId === doc.id && it.status === 'indexing'
+                    ? {
+                        ...it,
+                        status: 'error',
+                        message: 'Still indexing after 10 minutes. Check the document list later.',
+                      }
+                    : it
+                )
+              );
+            }, INDEXING_TIMEOUT_MS)
+          );
+
+          const early = latest.current.get(doc.id);
+          if (early) {
+            // Heard about before we knew the id; apply it to the item now.
+            applyStatus(doc.id, early);
+          } else if (!realtimeOpen.current) {
+            // The socket is down, so nothing is coming; ask once.
+            void reconcile([doc.id]);
+          }
         }
         onUploaded(doc);
       } catch (err) {
@@ -130,7 +291,7 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
         });
       }
     },
-    [folder, workspaceId, onUploaded, update]
+    [folder, workspaceId, onUploaded, update, applyStatus, reconcile]
   );
 
   const enqueue = useCallback(
@@ -157,78 +318,9 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
     [uploadOne]
   );
 
-  // Poll every document that is still indexing. One timer for the whole
-  // queue rather than one per file: the number of requests then depends on
-  // how long indexing takes, not on how many files were dropped at once.
-  const indexingIds = items
-    .filter((i) => i.status === 'indexing' && i.documentId)
-    .map((i) => i.documentId as string)
-    .join(',');
-
-  useEffect(() => {
-    if (!indexingIds) return;
-    let cancelled = false;
-    const startedAt = Date.now();
-
-    const tick = async () => {
-      const ids = indexingIds.split(',').filter(Boolean);
-      await Promise.all(
-        ids.map(async (documentId) => {
-          try {
-            const status = await ApiService.getDocumentStatus(documentId);
-            if (cancelled) return;
-            setItems((prev) =>
-              prev.map((it) => {
-                if (it.documentId !== documentId || it.status !== 'indexing') return it;
-                if (status.status === 'indexed') {
-                  return { ...it, status: 'done', progress: 100, message: undefined };
-                }
-                if (status.status === 'failed') {
-                  return {
-                    ...it,
-                    status: 'error',
-                    message: status.error ?? 'Indexing failed.',
-                  };
-                }
-                return {
-                  ...it,
-                  progress: status.progress,
-                  message: describe(status.status, status.progress),
-                };
-              })
-            );
-          } catch {
-            // A single failed poll is not meaningful: the next tick retries,
-            // and the timeout below stops this eventually.
-          }
-        })
-      );
-
-      if (!cancelled && Date.now() - startedAt > POLL_TIMEOUT_MS) {
-        setItems((prev) =>
-          prev.map((it) =>
-            it.status === 'indexing'
-              ? {
-                  ...it,
-                  status: 'error',
-                  message: 'Still indexing after 10 minutes. Check the document list later.',
-                }
-              : it
-          )
-        );
-      }
-    };
-
-    void tick();
-    const timer = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [indexingIds]);
-
   const cancel = (item: QueueItem) => {
     item.controller?.abort();
+    if (item.documentId) clearTimeoutFor(item.documentId);
     setItems((prev) => prev.filter((i) => i.id !== item.id));
   };
 
@@ -286,6 +378,7 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
           type="file"
           multiple
           hidden
+          data-testid="upload-input"
           accept={ACCEPTED_EXTENSIONS.map((e) => `.${e}`).join(',')}
           onChange={(e) => {
             if (e.target.files?.length) enqueue(e.target.files);
@@ -321,7 +414,10 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
                       <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
                     )}
                     {item.status === 'done' && (
-                      <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                      <CheckCircle2
+                        className="h-4 w-4 text-emerald-400"
+                        aria-label={`${item.file.name} indexed`}
+                      />
                     )}
                     {item.status === 'duplicate' && <Copy className="h-4 w-4 text-amber-400" />}
                     {item.status === 'error' && <AlertCircle className="h-4 w-4 text-rose-400" />}

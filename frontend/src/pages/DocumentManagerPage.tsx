@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   FileText,
   Upload,
@@ -17,6 +17,8 @@ import { useAsyncData } from '../hooks/useAsyncData';
 import { useWorkspace } from '../contexts/WorkspaceContext';
 import { useToast } from '../contexts/ToastContext';
 import { UploadQueue } from '../components/documents/UploadQueue';
+import { EVENTS, RESYNC } from '../services/realtime';
+import { useRealtimeEvent } from '../hooks/useRealtime';
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { EmptyState, ErrorState, ListSkeleton, Skeleton } from '../components/common/States';
 import { Document } from '../types';
@@ -49,6 +51,41 @@ export const DocumentManagerPage: React.FC = () => {
     enabled: Boolean(workspaceId),
   });
   const documents = useMemo(() => data ?? [], [data]);
+
+  // Uploads, deletions and indexing progress from anyone in the workspace,
+  // applied as they happen. Status is applied per document only when newer
+  // than the last one seen: events can arrive out of order, and a late
+  // "processing" must not overwrite "indexed".
+  const statusSeq = useRef(new Map<string, number>());
+  useRealtimeEvent(
+    [EVENTS.DOCUMENT_CREATED, EVENTS.DOCUMENT_DELETED, EVENTS.DOCUMENT_STATUS, RESYNC],
+    (event) => {
+      if (event.type === RESYNC) {
+        void refresh();
+        return;
+      }
+      const incoming = event.data as unknown as Document & { id: string };
+      if (event.type === EVENTS.DOCUMENT_DELETED) {
+        setData((prev) => (prev ?? []).filter((d) => d.id !== incoming.id));
+        return;
+      }
+      if (event.type === EVENTS.DOCUMENT_CREATED) {
+        setData((prev) =>
+          (prev ?? []).some((d) => d.id === incoming.id) ? prev : [incoming, ...(prev ?? [])]
+        );
+        return;
+      }
+      if (event.seq <= (statusSeq.current.get(incoming.id) ?? 0)) return;
+      statusSeq.current.set(incoming.id, event.seq);
+      setData((prev) =>
+        (prev ?? []).map((d) =>
+          d.id === incoming.id
+            ? { ...d, status: incoming.status, chunkCount: incoming.chunkCount ?? d.chunkCount }
+            : d
+        )
+      );
+    }
+  );
 
   const handleUploaded = useCallback(
     (doc: Document & { duplicate?: boolean }) => {

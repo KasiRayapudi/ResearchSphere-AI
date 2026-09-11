@@ -25,7 +25,15 @@ export interface Document {
   title: string;
   fileType: 'pdf' | 'docx' | 'txt' | 'md' | 'csv' | 'pptx';
   fileSizeKb: number;
-  status: 'indexed' | 'chunking' | 'embedding' | 'ocr_processing' | 'failed';
+  status:
+    | 'queued'
+    | 'processing'
+    | 'pending'
+    | 'indexed'
+    | 'chunking'
+    | 'embedding'
+    | 'ocr_processing'
+    | 'failed';
   chunkCount: number;
   tags: string[];
   uploadedBy: string;

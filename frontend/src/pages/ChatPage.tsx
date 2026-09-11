@@ -24,6 +24,8 @@ import { ApiService } from '../services/api';
 import { useWorkspace } from '../contexts/WorkspaceContext';
 import { useToast } from '../contexts/ToastContext';
 import { ChatMessage, Document, SourceCitation } from '../types';
+import { EVENTS } from '../services/realtime';
+import { useRealtimeEvent } from '../hooks/useRealtime';
 
 interface UiMessage extends ChatMessage {
   /** Set when the request failed, enabling a retry action. */
@@ -67,6 +69,18 @@ export const ChatPage: React.FC = () => {
       cancelled = true;
     };
   }, [activeWorkspace?.id]);
+
+  // A document uploaded mid-conversation should cite by name, not by id.
+  useRealtimeEvent([EVENTS.DOCUMENT_CREATED, EVENTS.DOCUMENT_DELETED], (event) => {
+    const incoming = event.data as unknown as Document;
+    if (event.type === EVENTS.DOCUMENT_DELETED) {
+      setDocuments((prev) => prev.filter((d) => d.id !== incoming.id));
+    } else {
+      setDocuments((prev) =>
+        prev.some((d) => d.id === incoming.id) ? prev : [...prev, incoming]
+      );
+    }
+  });
 
   const titleFor = useCallback(
     (documentId: string) => documents.find((d) => d.id === documentId)?.title ?? '',

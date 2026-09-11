@@ -31,6 +31,9 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
+        // Upgrade requests for /api/v1/ws too; without this the dev server
+        // answers the WebSocket handshake itself and it never reaches the API.
+        ws: true,
       },
     },
   },

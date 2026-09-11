@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-route
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { WorkspaceProvider } from './contexts/WorkspaceContext';
+import { RealtimeProvider } from './contexts/RealtimeContext';
 import { ToastProvider } from './contexts/ToastContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { FullPageLoader } from './components/common/States';
@@ -111,12 +112,15 @@ export const App: React.FC = () => (
       <ToastProvider>
         <AuthProvider>
           <WorkspaceProvider>
-            <BrowserRouter>
-              <Suspense fallback={<FullPageLoader label="Loading workspace" />}>
-                <AppRoutes />
-              </Suspense>
-              <SessionExpiredDialog />
-            </BrowserRouter>
+            {/* Inside WorkspaceProvider: the socket follows the active workspace. */}
+            <RealtimeProvider>
+              <BrowserRouter>
+                <Suspense fallback={<FullPageLoader label="Loading workspace" />}>
+                  <AppRoutes />
+                </Suspense>
+                <SessionExpiredDialog />
+              </BrowserRouter>
+            </RealtimeProvider>
           </WorkspaceProvider>
         </AuthProvider>
       </ToastProvider>
