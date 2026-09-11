@@ -7,6 +7,7 @@ from app.api.v1.mcp import router as mcp_router
 from app.api.v1.members import router as members_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.research import router as research_router
+from app.api.v1.websocket import router as websocket_router
 from app.api.v1.workspaces import router as workspaces_router
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "analytics_router",
     "members_router",
     "admin_router",
+    "websocket_router",
 ]

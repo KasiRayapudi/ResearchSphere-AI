@@ -25,6 +25,7 @@ from app.api.v1 import (
     members_router,
     reports_router,
     research_router,
+    websocket_router,
     workspaces_router,
 )
 from app.core import metrics
@@ -46,6 +47,9 @@ from app.core.middleware import (
     SecurityHeadersMiddleware,
 )
 from app.core.schema import verify_schema
+from app.realtime.broker import get_broker
+from app.realtime.manager import get_manager
+from app.realtime.revalidation import revalidate
 
 # Optional external services imports for health checks
 try:
@@ -285,6 +289,16 @@ async def lifespan(app: FastAPI):
     if checks["database"] == "ok":
         await run_in_threadpool(verify_schema, engine)
 
+    # Realtime. The manager owns the heartbeat reaper and the broker owns the
+    # Redis subscriber; both are background tasks, and a background task with
+    # no owner is a leak. Neither needs Redis in order to start.
+    if settings.WS_ENABLED:
+        # The reaper also re-checks each socket's authorization; see
+        # app/realtime/revalidation.py.
+        await get_manager().start(validator=revalidate)
+        await get_broker().start()
+        logger.info("[startup] realtime: listening")
+
     degraded = [n for n, s in checks.items() if s not in _HEALTHY_STATUSES]
     if degraded:
         logger.warning(f"Startup complete with degraded dependencies: {', '.join(degraded)}")
@@ -295,6 +309,20 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown ----------------------------------------------------------
     logger.info("Shutdown initiated - releasing resources")
+    # First: connected clients are told to go away rather than left to
+    # discover a broken pipe, which is what makes their reconnect
+    # immediate instead of a heartbeat timeout away.
+    #
+    # Manager before broker. Closing a socket starts its teardown, and the
+    # teardown publishes the departure through the broker; stopping the
+    # broker first made that publish open a fresh Redis connection that
+    # nothing would ever close. stop() waits for the handlers to finish.
+    try:
+        await get_manager().stop()
+        await get_broker().stop()
+        logger.info("[shutdown] realtime connections closed")
+    except Exception as exc:
+        logger.error(f"[shutdown] error closing realtime connections: {exc}")
     if qdrant_client is not None:
         try:
             qdrant_client.close()
@@ -418,6 +446,10 @@ def create_app() -> FastAPI:
     app.include_router(mcp_router, prefix="/api/v1/mcp", tags=["MCP Connectors"])
     app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["Analytics Telemetry"])
     app.include_router(admin_router, prefix="/api/v1/admin", tags=["Admin & System Health"])
+    # One endpoint rather than a resource, so no prefix of its own. Note
+    # that every HTTP middleware above skips it -- see the module docstring
+    # in app/api/v1/websocket.py for what that means.
+    app.include_router(websocket_router, prefix="/api/v1", tags=["Realtime"])
 
     # -------------------------------------------------------------------
     # Health endpoints - liveness, readiness and full diagnostics
