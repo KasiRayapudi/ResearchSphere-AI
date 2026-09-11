@@ -2,9 +2,10 @@
 Embedding Service using SentenceTransformers (local, no API key needed).
 Model: all-MiniLM-L6-v2 (384 dimensions, fast, high quality)
 """
+
 import logging
-from typing import List
-from functools import lru_cache
+
+from app.core import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -16,24 +17,30 @@ def get_embedding_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
+
         from app.core.config import settings
+
         logger.info(f"Loading embedding model: {settings.EMBEDDING_MODEL}")
         _model = SentenceTransformer(settings.EMBEDDING_MODEL)
         logger.info("Embedding model loaded successfully")
     return _model
 
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def embed_texts(texts: list[str]) -> list[list[float]]:
     """Generate embeddings for a list of texts."""
     if not texts:
         return []
     model = get_embedding_model()
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+    metrics.safe(metrics.embedding_batch_size.observe, len(texts))
+    with metrics.track_duration(metrics.embedding_duration_seconds):
+        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
     return embeddings.tolist()
 
 
-def embed_query(query: str) -> List[float]:
+def embed_query(query: str) -> list[float]:
     """Generate embedding for a single query string."""
     model = get_embedding_model()
-    embedding = model.encode([query], show_progress_bar=False)
+    metrics.safe(metrics.embedding_batch_size.observe, 1)
+    with metrics.track_duration(metrics.embedding_duration_seconds):
+        embedding = model.encode([query], show_progress_bar=False)
     return embedding[0].tolist()

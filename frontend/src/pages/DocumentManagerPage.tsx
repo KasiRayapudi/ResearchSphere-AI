@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   FileText,
   Upload,
@@ -6,14 +6,6 @@ import {
   Filter,
   Trash2,
   Eye,
-  CheckCircle2,
-  Tag,
-  Folder,
-  Layers,
-  Sparkles,
-  RefreshCw,
-  Plus,
-  FileCode,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';
@@ -21,39 +13,176 @@ import { Input } from '../components/common/Input';
 import { Badge } from '../components/common/Badge';
 import { Modal } from '../components/common/Modal';
 import { ApiService } from '../services/api';
+import { useAsyncData } from '../hooks/useAsyncData';
+import { useWorkspace } from '../contexts/WorkspaceContext';
+import { useToast } from '../contexts/ToastContext';
+import { UploadQueue } from '../components/documents/UploadQueue';
+import { EVENTS, RESYNC } from '../services/realtime';
+import { useRealtimeEvent } from '../hooks/useRealtime';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
+import { EmptyState, ErrorState, ListSkeleton, Skeleton } from '../components/common/States';
 import { Document } from '../types';
 
+type SortKey = 'newest' | 'oldest' | 'name' | 'size' | 'chunks';
+const PAGE_SIZE = 12;
+
 export const DocumentManagerPage: React.FC = () => {
-  const [documents, setDocuments] = useState<Document[]>([]);
+  const { activeWorkspace, isLoading: workspaceLoading } = useWorkspace();
+  const workspaceId = activeWorkspace?.id;
+  const toast = useToast();
+
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [sortKey, setSortKey] = useState<SortKey>('newest');
+  const [page, setPage] = useState(1);
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<Document | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Document | null>(null);
+  const [isDeleting, setDeleting] = useState(false);
 
-  useEffect(() => {
-    const fetchDocs = async () => {
-      const docs = await ApiService.getDocuments();
-      setDocuments(docs);
-    };
-    fetchDocs();
-  }, []);
-
-  const handleFileUpload = async (file: File) => {
-    setIsUploading(true);
-    const newDoc = await ApiService.uploadDocument(file);
-    setDocuments((prev) => [newDoc, ...prev]);
-    setIsUploading(false);
-    setUploadModalOpen(false);
-  };
-
-  const filteredDocs = documents.filter((d) => {
-    const matchesSearch = d.title.toLowerCase().includes(searchQuery.toLowerCase()) || d.tags.some(t => t.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesTag = selectedTag ? d.tags.includes(selectedTag) : true;
-    return matchesSearch && matchesTag;
+  const {
+    data,
+    isInitialLoading,
+    error,
+    refresh,
+    setData,
+  } = useAsyncData(() => ApiService.getDocuments(workspaceId), [workspaceId], {
+    enabled: Boolean(workspaceId),
   });
+  const documents = useMemo(() => data ?? [], [data]);
+
+  // Uploads, deletions and indexing progress from anyone in the workspace,
+  // applied as they happen. Status is applied per document only when newer
+  // than the last one seen: events can arrive out of order, and a late
+  // "processing" must not overwrite "indexed".
+  const statusSeq = useRef(new Map<string, number>());
+  useRealtimeEvent(
+    [EVENTS.DOCUMENT_CREATED, EVENTS.DOCUMENT_DELETED, EVENTS.DOCUMENT_STATUS, RESYNC],
+    (event) => {
+      if (event.type === RESYNC) {
+        void refresh();
+        return;
+      }
+      const incoming = event.data as unknown as Document & { id: string };
+      if (event.type === EVENTS.DOCUMENT_DELETED) {
+        setData((prev) => (prev ?? []).filter((d) => d.id !== incoming.id));
+        return;
+      }
+      if (event.type === EVENTS.DOCUMENT_CREATED) {
+        setData((prev) =>
+          (prev ?? []).some((d) => d.id === incoming.id) ? prev : [incoming, ...(prev ?? [])]
+        );
+        return;
+      }
+      if (event.seq <= (statusSeq.current.get(incoming.id) ?? 0)) return;
+      statusSeq.current.set(incoming.id, event.seq);
+      setData((prev) =>
+        (prev ?? []).map((d) =>
+          d.id === incoming.id
+            ? { ...d, status: incoming.status, chunkCount: incoming.chunkCount ?? d.chunkCount }
+            : d
+        )
+      );
+    }
+  );
+
+  const handleUploaded = useCallback(
+    (doc: Document & { duplicate?: boolean }) => {
+      if (doc.duplicate) {
+        toast.info('Already indexed', `“${doc.title}” is already in this workspace.`);
+        return;
+      }
+      setData((prev) => [doc, ...(prev ?? []).filter((d) => d.id !== doc.id)]);
+      toast.success('Document indexed', `“${doc.title}” is ready to query.`);
+    },
+    [setData, toast]
+  );
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      await ApiService.deleteDocument(pendingDelete.id);
+      setData((prev) => (prev ?? []).filter((d) => d.id !== pendingDelete.id));
+      toast.success('Document deleted', `“${pendingDelete.title}” and its vectors were removed.`);
+      setPendingDelete(null);
+    } catch (err) {
+      toast.fromError(err, 'Could not delete the document');
+    } finally {
+      setDeleting(false);
+    }
+  }, [pendingDelete, setData, toast]);
+
+  const filteredDocs = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const rows = documents.filter((d) => {
+      const matchesSearch =
+        !q ||
+        d.title.toLowerCase().includes(q) ||
+        (d.tags ?? []).some((t) => t.toLowerCase().includes(q)) ||
+        d.fileType.toLowerCase().includes(q);
+      const matchesTag = selectedTag ? (d.tags ?? []).includes(selectedTag) : true;
+      const matchesStatus = statusFilter === 'all' ? true : d.status === statusFilter;
+      return matchesSearch && matchesTag && matchesStatus;
+    });
+
+    const sorted = [...rows];
+    switch (sortKey) {
+      case 'oldest':
+        sorted.sort((a, b) => (a.uploadedAt ?? '').localeCompare(b.uploadedAt ?? ''));
+        break;
+      case 'name':
+        sorted.sort((a, b) => a.title.localeCompare(b.title));
+        break;
+      case 'size':
+        sorted.sort((a, b) => b.fileSizeKb - a.fileSizeKb);
+        break;
+      case 'chunks':
+        sorted.sort((a, b) => b.chunkCount - a.chunkCount);
+        break;
+      default:
+        sorted.sort((a, b) => (b.uploadedAt ?? '').localeCompare(a.uploadedAt ?? ''));
+    }
+    return sorted;
+  }, [documents, searchQuery, selectedTag, statusFilter, sortKey]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredDocs.length / PAGE_SIZE));
+  // Clamp during render rather than resetting from an effect: when filters
+  // shrink the result set, the current page may no longer exist.
+  const currentPage = Math.min(page, totalPages);
+  const pagedDocs = filteredDocs.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const allTags = Array.from(new Set(documents.flatMap((d) => d.tags)));
+
+  if (!workspaceLoading && !activeWorkspace) {
+    return (
+      <EmptyState
+        title="No workspace yet"
+        description="Create a workspace from the sidebar before uploading documents."
+      />
+    );
+  }
+
+  if (isInitialLoading || workspaceLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-72" />
+        <Skeleton className="h-16 w-full" />
+        <ListSkeleton rows={6} />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <ErrorState
+        title="Could not load documents"
+        message={error.message}
+        onRetry={refresh}
+      />
+    );
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -114,6 +243,34 @@ export const DocumentManagerPage: React.FC = () => {
             </button>
           ))}
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="sr-only" htmlFor="doc-status">Filter by status</label>
+          <select
+            id="doc-status"
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="rounded-lg border border-slate-700 bg-slate-950/60 px-2.5 py-1.5 text-xs text-slate-300 outline-none focus:border-brand-500"
+          >
+            <option value="all">All statuses</option>
+            <option value="indexed">Indexed</option>
+            <option value="processing">Processing</option>
+            <option value="failed">Failed</option>
+          </select>
+
+          <label className="sr-only" htmlFor="doc-sort">Sort documents</label>
+          <select
+            id="doc-sort"
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as SortKey)}
+            className="rounded-lg border border-slate-700 bg-slate-950/60 px-2.5 py-1.5 text-xs text-slate-300 outline-none focus:border-brand-500"
+          >
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="name">Name A-Z</option>
+            <option value="size">Largest first</option>
+            <option value="chunks">Most chunks</option>
+          </select>
+        </div>
       </Card>
 
       {/* Document Table */}
@@ -132,7 +289,7 @@ export const DocumentManagerPage: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-slate-200">
-              {filteredDocs.map((doc) => (
+              {pagedDocs.map((doc) => (
                 <tr key={doc.id} className="hover:bg-slate-900/60 transition-colors">
                   <td className="p-4 font-semibold text-slate-100 flex items-center gap-3">
                     <div className="p-2 rounded-lg bg-slate-800 text-brand-400 border border-slate-700">
@@ -172,55 +329,105 @@ export const DocumentManagerPage: React.FC = () => {
                       >
                         Inspect
                       </Button>
+                      <button
+                        onClick={() => setPendingDelete(doc)}
+                        aria-label={`Delete ${doc.title}`}
+                        title="Delete document"
+                        className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-slate-800 hover:text-rose-400"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
                     </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+
+          {filteredDocs.length === 0 && (
+            <div className="p-6">
+              <EmptyState
+                title={documents.length === 0 ? 'No documents yet' : 'No documents match your filters'}
+                description={
+                  documents.length === 0
+                    ? 'Upload a PDF, DOCX, TXT, Markdown or CSV file to build your knowledge base.'
+                    : 'Try a different search term, status or tag.'
+                }
+                action={
+                  documents.length === 0
+                    ? { label: 'Upload a document', onClick: () => setUploadModalOpen(true) }
+                    : { label: 'Clear filters', onClick: () => {
+                        setSearchQuery('');
+                        setSelectedTag(null);
+                        setStatusFilter('all');
+                      } }
+                }
+              />
+            </div>
+          )}
         </div>
+
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between border-t border-slate-800 px-4 py-3">
+            <span className="text-[11px] text-slate-500">
+              Showing {(currentPage - 1) * PAGE_SIZE + 1}-
+              {Math.min(currentPage * PAGE_SIZE, filteredDocs.length)} of {filteredDocs.length}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={currentPage === 1}
+                onClick={() => setPage(Math.max(1, currentPage - 1))}
+              >
+                Previous
+              </Button>
+              <span className="font-mono text-[11px] text-slate-400">
+                {currentPage} / {totalPages}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={currentPage === totalPages}
+                onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* Upload Modal */}
       <Modal
         isOpen={uploadModalOpen}
         onClose={() => setUploadModalOpen(false)}
-        title="Upload & Index Enterprise Document"
-        description="Supported formats: PDF, DOCX, TXT, MD, CSV, PPTX. Tesseract OCR runs automatically."
+        title="Upload documents"
+        description="Files are validated, scanned and de-duplicated before indexing."
+        maxWidth="lg"
       >
-        <div className="space-y-6 pt-2">
-          <div
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              if (e.dataTransfer.files.length > 0) {
-                handleFileUpload(e.dataTransfer.files[0]);
-              }
-            }}
-            className="border-2 border-dashed border-slate-700 hover:border-brand-500 rounded-2xl p-8 text-center bg-slate-950/60 transition-colors cursor-pointer space-y-3"
-          >
-            <Upload className="h-10 w-10 text-brand-400 mx-auto" />
-            <div className="text-sm font-bold text-white">Drag and drop file here, or click to browse</div>
-            <p className="text-xs text-slate-400">PDF, DOCX, MD, CSV up to 100MB per file</p>
-            <input
-              type="file"
-              className="hidden"
-              id="file-upload-input"
-              onChange={(e) => {
-                if (e.target.files && e.target.files[0]) handleFileUpload(e.target.files[0]);
-              }}
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => document.getElementById('file-upload-input')?.click()}
-              isLoading={isUploading}
-            >
-              Select File
-            </Button>
-          </div>
+        <div className="pt-1">
+          <UploadQueue
+            workspaceId={workspaceId}
+            onUploaded={handleUploaded}
+          />
         </div>
       </Modal>
+
+      {/* Delete confirmation */}
+      <ConfirmDialog
+        isOpen={Boolean(pendingDelete)}
+        title="Delete this document?"
+        description={
+          pendingDelete
+            ? `“${pendingDelete.title}” and its ${pendingDelete.chunkCount} indexed chunks will be permanently removed. This cannot be undone.`
+            : ''
+        }
+        confirmLabel="Delete document"
+        isBusy={isDeleting}
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
 
       {/* Preview Modal */}
       {previewDoc && (

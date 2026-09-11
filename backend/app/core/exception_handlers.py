@@ -2,21 +2,12 @@
 FastAPI exception handlers for ResearchSphere AI.
 Provides JSON error responses using the `format_error_response` utility.
 """
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
 
-from app.core.exceptions import (
-    AppException,
-    ResourceNotFoundException,
-    AuthenticationException,
-    AuthorizationException,
-    ValidationException,
-    RateLimitException,
-    RAGProcessingException,
-    FileValidationException,
-    format_error_response,
-)
+from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.core.exceptions import AppException, ValidationException, format_error_response
 
 
 async def app_exception_handler(request: Request, exc: AppException):
@@ -45,9 +36,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     ]
     app_exc = ValidationException(message="Validation error", details=details)
     return await app_exception_handler(request, app_exc)
+
+
 async def generic_exception_handler(request: Request, exc: Exception):
     """Handle unexpected exceptions and return a standardized JSON response."""
     from app.core.logging import get_logger
+
     logger = get_logger("exception")
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     app_exc = AppException(message="Internal server error", code="INTERNAL_ERROR", status_code=500)

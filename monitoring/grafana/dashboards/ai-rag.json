@@ -1,0 +1,401 @@
+{
+  "uid": "rs-ai",
+  "title": "ResearchSphere - AI and RAG",
+  "description": "Retrieval quality, model latency and agent workflow outcomes.",
+  "tags": [
+    "researchsphere",
+    "ai",
+    "rag"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Chat outcomes",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_chat_messages_total{job=\"researchsphere-backend\"}[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to first token",
+      "description": "What users perceive as responsiveness. Total stream duration hides this entirely.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(researchsphere_chat_time_to_first_token_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(researchsphere_chat_time_to_first_token_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Retrieval latency",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(researchsphere_retrieval_duration_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Chunks returned per search",
+      "description": "A drift toward zero means retrieval is returning nothing and answers are ungrounded - the single most useful RAG health signal.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(researchsphere_retrieval_results_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.10, sum(rate(researchsphere_retrieval_results_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p10",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Embedding latency",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(researchsphere_embedding_duration_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Model latency by operation",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(researchsphere_llm_duration_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le, operation))",
+          "legendFormat": "{{operation}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Reports and research runs",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_reports_generated_total{job=\"researchsphere-backend\"}[15m])) by (outcome)",
+          "legendFormat": "report {{outcome}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_research_sessions_total{job=\"researchsphere-backend\"}[15m])) by (outcome)",
+          "legendFormat": "research {{outcome}}",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

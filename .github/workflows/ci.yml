@@ -1,0 +1,337 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "sprint-*", "step-*"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run: nothing is gained by
+# finishing CI for a commit that has already been superseded.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_DEFAULT: "3.11"
+  NODE_DEFAULT: "20"
+
+jobs:
+  # ---------------------------------------------------------------- backend --
+  backend-quality:
+    name: Backend quality (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Formatting and lint are blocking: they are deterministic and every
+      # finding is mechanically fixable.
+      - name: Black (formatting)
+        working-directory: backend
+        run: black --check --diff .
+
+      - name: isort (import order)
+        working-directory: backend
+        run: isort --check-only --diff .
+
+      - name: Ruff (lint)
+        working-directory: backend
+        run: ruff check --output-format=github .
+
+      # MyPy is advisory. The codebase predates type annotations and currently
+      # reports ~66 errors, mostly FastAPI handler-signature variance. The
+      # report is published as an artifact so the backlog stays visible.
+      - name: MyPy (types, advisory)
+        id: mypy
+        working-directory: backend
+        continue-on-error: true
+        run: mypy app main.py --no-error-summary > mypy-report.txt 2>&1 || true
+
+      - name: Upload MyPy report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mypy-report
+          path: backend/mypy-report.txt
+          retention-days: 14
+
+  backend-tests:
+    name: Backend tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # The suite provisions its own SQLite database and fakeredis, and asserts
+      # that Qdrant- and Gemini-dependent paths degrade rather than crash, so
+      # no service containers are needed.
+      - name: Run tests with coverage
+        working-directory: backend
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-report=html \
+            --junitxml=junit.xml
+
+      - name: Upload coverage and test reports
+        if: always() && matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: |
+            backend/coverage.xml
+            backend/htmlcov/
+            backend/junit.xml
+          retention-days: 14
+
+      - name: Publish coverage summary
+        if: matrix.python-version == '3.11'
+        working-directory: backend
+        run: |
+          {
+            echo "### Backend coverage"
+            echo ""
+            coverage report --format=markdown || coverage report
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  backend-config:
+    name: Backend configuration validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # The same validator the container entrypoint runs. Proves both that a
+      # correct production configuration passes and that an incomplete one is
+      # rejected - a validator that never fails is not a validator.
+      - name: Production config must be accepted when complete
+        working-directory: backend
+        env:
+          ENVIRONMENT: production
+          SECRET_KEY: ci-only-secret-key-long-enough-for-validation-1234
+          GEMINI_API_KEY: ci-placeholder
+          DATABASE_URL: postgresql://user:pass@db:5432/researchsphere
+          REDIS_URL: redis://redis:6379
+          FRONTEND_URL: https://app.example.com
+          CORS_ORIGINS: https://app.example.com
+          TRUSTED_HOSTS: app.example.com
+          DEBUG: "false"
+        run: python -m app.cli.validate_config
+
+      - name: Production config must be rejected when incomplete
+        working-directory: backend
+        env:
+          ENVIRONMENT: production
+        run: |
+          if python -m app.cli.validate_config; then
+            echo "::error::Validator accepted an invalid production configuration"
+            exit 1
+          fi
+          echo "Validator correctly rejected the incomplete configuration."
+
+  # --------------------------------------------------------------- frontend --
+  frontend:
+    name: Frontend (node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: TypeScript
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: ESLint
+        working-directory: frontend
+        run: npx eslint . --max-warnings 200 --format stylish
+
+      - name: Unit tests with coverage
+        working-directory: frontend
+        run: npm run test:coverage
+
+      # `npm run build` type-checks before bundling, so a type error fails here
+      # as well as in the dedicated step above.
+      - name: Production build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend coverage
+        if: always() && matrix.node-version == '20'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 14
+
+      - name: Upload built assets
+        if: matrix.node-version == '20'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ----------------------------------------------------------------- docker --
+  docker-build:
+    name: Docker build verification
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Images are built but not pushed here; publishing happens in release.yml.
+      # GitHub Actions cache keeps rebuild times reasonable despite the large
+      # ML dependency tree in the backend image.
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: false
+          load: true
+          tags: researchsphere/backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: false
+          load: true
+          tags: researchsphere/frontend:ci
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      # A built image that cannot start is not a passing build.
+      - name: Backend image starts and validates its configuration
+        run: |
+          docker run --rm \
+            -e ENVIRONMENT=development \
+            -e SKIP_DEPENDENCY_WAIT=true \
+            researchsphere/backend:ci validate
+
+      - name: Backend image runs as a non-root user
+        run: |
+          user="$(docker run --rm --entrypoint sh researchsphere/backend:ci -c 'id -u')"
+          if [ "$user" = "0" ]; then
+            echo "::error::Backend image runs as root"
+            exit 1
+          fi
+          echo "Backend image UID: $user"
+
+      - name: Frontend image serves its health endpoint
+        run: |
+          docker run -d --name fe -p 8080:8080 researchsphere/frontend:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "Frontend healthy."
+              docker rm -f fe
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Frontend image did not become healthy"
+          docker logs fe
+          docker rm -f fe
+          exit 1
+
+      - name: Report image sizes
+        run: |
+          {
+            echo "### Image sizes"
+            echo ""
+            echo '```'
+            docker images researchsphere/backend:ci --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+            docker images researchsphere/frontend:ci --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------- gate --
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build]
+    steps:
+      # A single required status check for branch protection. Without this,
+      # protection rules have to enumerate every matrix leg by name.
+      - name: Fail if any job failed
+        run: |
+          if echo '${{ join(needs.*.result, ',') }}' | grep -qE 'failure|cancelled'; then
+            echo "::error::One or more CI jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs succeeded."

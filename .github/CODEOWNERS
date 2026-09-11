@@ -1,0 +1,15 @@
+# Default owner for everything.
+*                       @KasiRayapudi
+
+# Security-sensitive areas warrant a deliberate look on every change.
+/backend/app/core/security.py        @KasiRayapudi
+/backend/app/core/password_*.py      @KasiRayapudi
+/backend/app/core/token_store.py     @KasiRayapudi
+/backend/app/core/refresh_service.py @KasiRayapudi
+/backend/app/core/upload_security.py @KasiRayapudi
+/backend/app/api/v1/admin.py         @KasiRayapudi
+
+# Deployment and pipeline configuration.
+/.github/                @KasiRayapudi
+/docker-compose*.yml     @KasiRayapudi
+/nginx/                  @KasiRayapudi

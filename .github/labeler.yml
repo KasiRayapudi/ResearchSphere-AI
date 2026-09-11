@@ -1,0 +1,48 @@
+backend:
+  - changed-files:
+      - any-glob-to-any-file: ["backend/**"]
+
+frontend:
+  - changed-files:
+      - any-glob-to-any-file: ["frontend/**"]
+
+security:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "backend/app/core/security.py"
+          - "backend/app/core/password_*.py"
+          - "backend/app/core/token_store.py"
+          - "backend/app/core/refresh_service.py"
+          - "backend/app/core/upload_security.py"
+          - "backend/app/services/antivirus.py"
+          - ".github/workflows/security.yml"
+
+infrastructure:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docker-compose*.yml"
+          - "**/Dockerfile*"
+          - "nginx/**"
+          - "Makefile"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: [".github/**"]
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ["**/*.md", "docs/**"]
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "backend/tests/**"
+          - "frontend/src/**/*.test.ts"
+          - "frontend/src/**/*.test.tsx"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "backend/requirements*.txt"
+          - "frontend/package.json"
+          - "frontend/package-lock.json"

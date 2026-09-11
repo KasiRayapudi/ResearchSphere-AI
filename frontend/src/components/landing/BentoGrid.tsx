@@ -1,5 +1,5 @@
 import React from 'react';
-import { Database, Cpu, Share2, FileCheck2, ShieldCheck, Zap, Lock, Sparkles, Layers } from 'lucide-react';
+import { Database, Cpu, Share2, FileCheck2 } from 'lucide-react';
 import { Card } from '../common/Card';
 import { Badge } from '../common/Badge';
 

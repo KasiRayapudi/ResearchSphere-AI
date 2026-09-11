@@ -55,3 +55,28 @@ backend/uploads/
 
 # Docker dev file (optional)
 Dockerfile.dev
+
+# Production secrets - only the example template is tracked
+.env.prod
+nginx/certs/*
+!nginx/certs/.gitkeep
+
+# Test and coverage artefacts
+backend/htmlcov/
+backend/coverage.xml
+backend/coverage.json
+backend/junit.xml
+backend/.coverage
+backend/mypy-report.txt
+backend/bandit-report.json
+backend/pip-audit.*
+backend/sbom-*.json
+backend/licenses-*.json
+backend/licenses-*.md
+backend/dependency-tree.*
+backend/openapi.json
+backend/openapi-summary.md
+frontend/coverage/
+frontend/module-graph.json
+frontend/circular.txt
+frontend/npm-audit.json

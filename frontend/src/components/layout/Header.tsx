@@ -1,5 +1,5 @@
 import React from 'react';
-import { Search, Moon, Sun, Bell, Command, Menu, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react';
+import { Search, Moon, Sun, Bell, Command, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
 import { Button } from '../common/Button';

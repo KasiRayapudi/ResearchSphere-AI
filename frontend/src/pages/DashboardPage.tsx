@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   FileText,
@@ -6,12 +6,8 @@ import {
   Layers,
   Share2,
   HardDrive,
-  TrendingUp,
-  Clock,
-  Plus,
   ArrowUpRight,
   Database,
-  CheckCircle2,
   Activity,
   Cpu,
 } from 'lucide-react';
@@ -19,32 +15,123 @@ import { Card } from '../components/common/Card';
 import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { ApiService } from '../services/api';
-import { Document, ResearchSession, MCPConnector, AnalyticsData } from '../types';
+import { useAsyncData } from '../hooks/useAsyncData';
+import { useWorkspace } from '../contexts/WorkspaceContext';
+import { QueryTrendChart } from '../components/analytics/QueryTrendChart';
+import {
+  EmptyState,
+  ErrorState,
+  ListSkeleton,
+  Skeleton,
+  StatCardSkeleton,
+} from '../components/common/States';
 
 export const DashboardPage: React.FC = () => {
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [sessions, setSessions] = useState<ResearchSession[]>([]);
-  const [connectors, setConnectors] = useState<MCPConnector[]>([]);
-  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
   const navigate = useNavigate();
+  const { activeWorkspace, isLoading: workspaceLoading } = useWorkspace();
+  const workspaceId = activeWorkspace?.id;
 
-  useEffect(() => {
-    const fetchData = async () => {
-      const [docs, sess, conn, aly] = await Promise.all([
-        ApiService.getDocuments(),
-        ApiService.getResearchSessions(),
-        ApiService.getMCPConnectors(),
-        ApiService.getAnalytics(),
-      ]);
-      setDocuments(docs);
-      setSessions(sess);
-      setConnectors(conn);
-      setAnalytics(aly);
-    };
-    fetchData();
-  }, []);
+  // Each panel loads independently so one failing endpoint no longer leaves
+  // the whole dashboard blank (and no longer silently renders mock data).
+  const documentsQuery = useAsyncData(
+    () => ApiService.getDocuments(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const sessionsQuery = useAsyncData(
+    () => ApiService.getResearchSessions(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const connectorsQuery = useAsyncData(
+    () => ApiService.getMCPConnectors(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const analyticsQuery = useAsyncData(
+    () => ApiService.getAnalytics(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const reportsQuery = useAsyncData(
+    () => ApiService.getReports(workspaceId),
+    [workspaceId],
+    { enabled: Boolean(workspaceId) }
+  );
+  const healthQuery = useAsyncData(() => ApiService.getHealth(), []);
+
+  const documents = documentsQuery.data ?? [];
+  const sessions = sessionsQuery.data ?? [];
+  const connectors = connectorsQuery.data ?? [];
+  const reports = reportsQuery.data ?? [];
+  const analytics = analyticsQuery.data;
+  const health = healthQuery.data as
+    | { status?: string; checks?: Record<string, string>; uptime_seconds?: number; version?: string }
+    | null;
+
+  const isLoading =
+    workspaceLoading ||
+    documentsQuery.isInitialLoading ||
+    analyticsQuery.isInitialLoading;
+
+  const loadError = documentsQuery.error ?? analyticsQuery.error;
+
+  const refreshAll = () => {
+    void documentsQuery.refresh();
+    void sessionsQuery.refresh();
+    void connectorsQuery.refresh();
+    void reportsQuery.refresh();
+    void analyticsQuery.refresh();
+    void healthQuery.refresh();
+  };
 
   const connectedSourcesCount = connectors.filter((c) => c.status === 'connected').length;
+
+  // Recent activity, newest first.
+  const recentUploads = [...documents]
+    .sort((a, b) => (b.uploadedAt ?? '').localeCompare(a.uploadedAt ?? ''))
+    .slice(0, 5);
+
+  if (!workspaceLoading && !activeWorkspace) {
+    return (
+      <EmptyState
+        icon={<FileText className="h-6 w-6" />}
+        title="No workspace yet"
+        description="Create a workspace from the sidebar to start uploading documents and running research."
+      />
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-64" />
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <StatCardSkeleton key={i} />
+          ))}
+        </div>
+        <div className="grid gap-6 lg:grid-cols-12">
+          <div className="lg:col-span-8">
+            <ListSkeleton rows={4} />
+          </div>
+          <div className="lg:col-span-4">
+            <ListSkeleton rows={3} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <ErrorState
+        title="Could not load your dashboard"
+        message={loadError.message}
+        onRetry={refreshAll}
+      />
+    );
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -89,9 +176,9 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-2xl font-extrabold text-white">{documents.length || 128}</div>
-            <div className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1 mt-1">
-              <TrendingUp className="h-3 w-3" /> +12% this week
+            <div className="text-2xl font-extrabold text-white">{documents.length}</div>
+            <div className="text-[11px] text-slate-400 mt-1">
+              {analytics ? `${analytics.embeddingsGeneratedTotal} chunks indexed` : '\u2014'}
             </div>
           </div>
         </Card>
@@ -104,9 +191,9 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-2xl font-extrabold text-white">{sessions.length || 24}</div>
-            <div className="text-[11px] text-purple-400 font-semibold flex items-center gap-1 mt-1">
-              <Cpu className="h-3 w-3" /> 8 Agents Active
+            <div className="text-2xl font-extrabold text-white">{sessions.length}</div>
+            <div className="text-[11px] text-slate-400 flex items-center gap-1 mt-1">
+              <Cpu className="h-3 w-3" /> LangGraph workflow
             </div>
           </div>
         </Card>
@@ -119,8 +206,8 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-2xl font-extrabold text-white">18</div>
-            <div className="text-[11px] text-slate-400 mt-1">PDF & Markdown</div>
+            <div className="text-2xl font-extrabold text-white">{reports.length}</div>
+            <div className="text-[11px] text-slate-400 mt-1">Markdown export</div>
           </div>
         </Card>
 
@@ -132,8 +219,10 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-2xl font-extrabold text-white">{connectedSourcesCount} / 8</div>
-            <div className="text-[11px] text-cyan-400 font-semibold mt-1">GitHub, Drive, Local</div>
+            <div className="text-2xl font-extrabold text-white">{connectedSourcesCount} / {connectors.length}</div>
+            <div className="text-[11px] text-slate-400 mt-1">
+              {connectors.length === 0 ? 'None configured' : 'MCP connectors'}
+            </div>
           </div>
         </Card>
 
@@ -145,9 +234,25 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-2xl font-extrabold text-white">12.8 GB</div>
+            <div className="text-2xl font-extrabold text-white">
+              {analytics ? `${analytics.storageUsageMb.toFixed(1)} MB` : '\u2014'}
+            </div>
             <div className="w-full bg-slate-800 rounded-full h-1.5 mt-2">
-              <div className="bg-brand-500 h-1.5 rounded-full w-[25%]" />
+              <div
+                className="bg-brand-500 h-1.5 rounded-full transition-all"
+                style={{
+                  width: `${
+                    analytics
+                      ? Math.min(
+                          100,
+                          (analytics.storageUsageMb /
+                            Math.max(1, analytics.storageCapacityMb)) *
+                            100
+                        )
+                      : 0
+                  }%`,
+                }}
+              />
             </div>
           </div>
         </Card>
@@ -155,67 +260,34 @@ export const DashboardPage: React.FC = () => {
 
       {/* Main Grid: Visual Activity Chart & Connected Sources */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Visual Daily Activity Chart */}
+        {/* Real daily query volume. This was a fixed decorative Bezier path
+            with a hardcoded "184ms" latency badge. */}
         <Card className="lg:col-span-8 p-6 space-y-6">
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-base font-bold text-white flex items-center gap-2">
-                <Activity className="h-4 w-4 text-brand-400" /> Daily Query Volume & Hybrid Latency
+                <Activity className="h-4 w-4 text-brand-400" /> Daily Query Volume
               </h3>
-              <p className="text-xs text-slate-400">Sub-200ms Reciprocal Rank Fusion response time across Qdrant vector store</p>
+              <p className="text-xs text-slate-400">
+                Questions asked per day in this workspace
+              </p>
             </div>
-            <span className="px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-300 font-mono text-xs border border-emerald-500/20">
-              Avg Latency: 184ms
-            </span>
+            {analytics && analytics.avgResponseTimeMs > 0 && (
+              <span className="rounded-md border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 font-mono text-xs text-emerald-300">
+                Avg latency: {analytics.avgResponseTimeMs}ms
+              </span>
+            )}
           </div>
 
-          {/* Dynamic SVG Visual Chart */}
-          <div className="h-56 w-full pt-4">
-            <svg className="w-full h-full overflow-visible" viewBox="0 0 600 180">
-              {/* Grid Lines */}
-              <line x1="0" y1="30" x2="600" y2="30" stroke="rgba(255,255,255,0.05)" strokeDasharray="4 4" />
-              <line x1="0" y1="80" x2="600" y2="80" stroke="rgba(255,255,255,0.05)" strokeDasharray="4 4" />
-              <line x1="0" y1="130" x2="600" y2="130" stroke="rgba(255,255,255,0.05)" strokeDasharray="4 4" />
-
-              {/* Area Gradient Fill */}
-              <defs>
-                <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#6366f1" stopOpacity="0.4" />
-                  <stop offset="100%" stopColor="#6366f1" stopOpacity="0.0" />
-                </linearGradient>
-              </defs>
-
-              <path
-                d="M 0 140 Q 100 110, 200 80 T 400 40 T 600 30 L 600 160 L 0 160 Z"
-                fill="url(#chartGradient)"
-              />
-
-              <path
-                d="M 0 140 Q 100 110, 200 80 T 400 40 T 600 30"
-                fill="none"
-                stroke="#6366f1"
-                strokeWidth="3"
-              />
-
-              {/* Data points */}
-              {[[0, 140], [100, 115], [200, 80], [300, 65], [400, 40], [500, 35], [600, 30]].map(([x, y], idx) => (
-                <circle key={idx} cx={x} cy={y} r="4" fill="#6366f1" stroke="#ffffff" strokeWidth="2" />
-              ))}
-            </svg>
-
-            <div className="flex justify-between text-[11px] font-mono text-slate-500 pt-2 border-t border-slate-800">
-              <span>Feb 6</span>
-              <span>Feb 7</span>
-              <span>Feb 8</span>
-              <span>Feb 9</span>
-              <span>Feb 10</span>
-              <span>Feb 11</span>
-              <span>Feb 12 (Today)</span>
-            </div>
-          </div>
+          {analyticsQuery.isInitialLoading ? (
+            <ListSkeleton rows={3} />
+          ) : analytics ? (
+            <QueryTrendChart data={analytics.dailyQueries} height={200} />
+          ) : (
+            <EmptyState title="No query activity yet" />
+          )}
         </Card>
 
-        {/* Connected Sources & Connectors */}
         <Card className="lg:col-span-4 p-6 space-y-6">
           <div className="flex items-center justify-between">
             <h3 className="text-base font-bold text-white flex items-center gap-2">
@@ -289,6 +361,143 @@ export const DashboardPage: React.FC = () => {
           ))}
         </div>
       </Card>
+
+      {/* Recent uploads + live system status */}
+      <div className="grid gap-6 lg:grid-cols-12">
+        <Card className="lg:col-span-7 p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-bold text-white flex items-center gap-2">
+              <FileText className="h-4 w-4 text-emerald-400" /> Recent Uploads
+            </h3>
+            <Button variant="ghost" size="sm" onClick={() => navigate('/documents')}>
+              View all
+            </Button>
+          </div>
+
+          {recentUploads.length === 0 ? (
+            <EmptyState
+              title="No documents yet"
+              description="Upload a PDF, DOCX, TXT, Markdown or CSV file to build your knowledge base."
+              action={{ label: 'Upload a document', onClick: () => navigate('/documents') }}
+            />
+          ) : (
+            <ul className="space-y-2">
+              {recentUploads.map((doc) => (
+                <li
+                  key={doc.id}
+                  className="flex items-center gap-3 rounded-lg border border-slate-800/60 bg-slate-900/40 p-3"
+                >
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-800 text-[10px] font-bold uppercase text-slate-400">
+                    {doc.fileType}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-xs font-medium text-slate-200">{doc.title}</p>
+                    <p className="text-[10px] text-slate-500">
+                      {doc.chunkCount} chunks · {Math.max(1, Math.round(doc.fileSizeKb))} KB
+                    </p>
+                  </div>
+                  <Badge
+                    size="sm"
+                    variant={
+                      doc.status === 'indexed'
+                        ? 'success'
+                        : doc.status === 'failed'
+                          ? 'error'
+                          : 'warning'
+                    }
+                  >
+                    {doc.status}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="lg:col-span-5 p-6 space-y-4">
+          <h3 className="text-base font-bold text-white flex items-center gap-2">
+            <Database className="h-4 w-4 text-brand-400" /> System Status
+          </h3>
+
+          {healthQuery.isInitialLoading ? (
+            <ListSkeleton rows={3} />
+          ) : healthQuery.error ? (
+            <ErrorState
+              title="Health unavailable"
+              message={healthQuery.error.message}
+              onRetry={healthQuery.refresh}
+            />
+          ) : (
+            <>
+              <ul className="space-y-2">
+                {Object.entries(health?.checks ?? {}).map(([name, status]) => {
+                  const healthy = status === 'ok' || status === 'configured';
+                  const optional = status === 'disabled' || status === 'unavailable';
+                  return (
+                    <li
+                      key={name}
+                      className="flex items-center justify-between rounded-lg border border-slate-800/60 bg-slate-900/40 px-3 py-2"
+                    >
+                      <span className="text-xs capitalize text-slate-300">{name}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span
+                          className={`h-1.5 w-1.5 rounded-full ${
+                            healthy
+                              ? 'bg-emerald-400'
+                              : optional
+                                ? 'bg-slate-500'
+                                : 'bg-rose-400'
+                          }`}
+                        />
+                        <span
+                          className={`font-mono text-[10px] ${
+                            healthy
+                              ? 'text-emerald-400'
+                              : optional
+                                ? 'text-slate-500'
+                                : 'text-rose-400'
+                          }`}
+                        >
+                          {status}
+                        </span>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              {health?.uptime_seconds !== undefined && (
+                <p className="text-[10px] text-slate-500">
+                  Uptime {Math.floor(health.uptime_seconds / 3600)}h{' '}
+                  {Math.floor((health.uptime_seconds % 3600) / 60)}m
+                  {health.version ? ` · v${health.version}` : ''}
+                </p>
+              )}
+            </>
+          )}
+
+          {analytics && (
+            <div className="border-t border-slate-800 pt-3">
+              <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                <span className="text-slate-400">Storage used</span>
+                <span className="font-mono text-slate-300">
+                  {analytics.storageUsageMb.toFixed(1)} / {analytics.storageCapacityMb} MB
+                </span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-brand-500 to-indigo-500"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (analytics.storageUsageMb / Math.max(1, analytics.storageCapacityMb)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   );
 };
