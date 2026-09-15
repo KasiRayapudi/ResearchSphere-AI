@@ -280,6 +280,40 @@ describe('reconnecting', () => {
     ]);
   });
 
+  it('a second ready on an open socket resumes without reconnecting', () => {
+    // Sent by a server whose link to the other servers dropped and came
+    // back: what they published meanwhile never reached this socket.
+    const { client, events } = build();
+    client.connect('ws-1');
+    latest().ready({ seq: 10 });
+    latest().event(11);
+    latest().ready({ seq: 13 });
+
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(client.status).toBe('open');
+    expect(latest().sent.filter((f) => f.type === 'resume')).toEqual([
+      { type: 'resume', after: Math.max(10, 11 - REORDER_WINDOW), epoch: 'E1' },
+    ]);
+
+    latest().event(11); // replayed, already seen live
+    latest().event(12);
+    latest().event(13);
+    latest().deliver({ type: 'connection.resumed', data: { complete: true, seq: 13, epoch: 'E1' } });
+    expect(events.map((e) => e.seq).slice(1)).toEqual([11, 12, 13]);
+    expect(types(events).filter((t) => t === RESYNC)).toHaveLength(1);
+  });
+
+  it('a second ready in a new epoch refetches instead', () => {
+    const { client, events } = build();
+    client.connect('ws-1');
+    latest().ready({ seq: 10, epoch: 'E1' });
+    latest().ready({ seq: 2, epoch: 'E2' });
+
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(latest().sent.find((f) => f.type === 'resume')).toBeUndefined();
+    expect(events[1].data).toEqual({ reason: 'epoch-changed' });
+  });
+
   it('after a restart (new epoch) it refetches instead of resuming', () => {
     const { client, events } = build();
     client.connect('ws-1');

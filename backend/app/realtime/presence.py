@@ -25,7 +25,6 @@ several. There is no third option that does not invent state.
 
 from __future__ import annotations
 
-import contextlib
 from datetime import UTC, datetime
 
 from app.core.logging import get_logger
@@ -86,16 +85,21 @@ class PresenceTracker:
             size = await client.scard(key)
             return bool(added) and size == 1
         except Exception as exc:
-            logger.warning(f"Could not record presence for {user_id}: {exc}")
-            return False
+            # Through the broker, so a Redis that has stopped answering is
+            # left alone for a while rather than timing out every call of
+            # the handshake in turn.
+            self._broker._lost_redis(exc, f"Recording presence for {user_id}", "using this process")
+            return len(self._broker.manager.connections_for(user_id, workspace_id)) <= 1
 
     async def refresh(self, workspace_id: str, user_id: str) -> None:
         """Push the expiry out while a connection is still alive."""
         client = await self._client()
         if client is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             await client.expire(presence_key(workspace_id, user_id), PRESENCE_TTL_SECONDS)
+        except Exception as exc:
+            self._broker._lost_redis(exc, f"Refreshing presence for {user_id}", "skipped")
 
     async def depart(self, workspace_id: str, user_id: str, connection_id: str) -> bool:
         """Drop a connection. True when the user has no others left."""
@@ -120,8 +124,8 @@ class PresenceTracker:
                 return True
             return False
         except Exception as exc:
-            logger.warning(f"Could not clear presence for {user_id}: {exc}")
-            return False
+            self._broker._lost_redis(exc, f"Clearing presence for {user_id}", "using this process")
+            return not self._broker.manager.connections_for(user_id, workspace_id)
 
     async def online(self, workspace_id: str) -> list[str]:
         """Every user currently present, across every instance."""
@@ -138,7 +142,9 @@ class PresenceTracker:
                 if await client.scard(key):
                     found.add(str(key)[len(prefix) :])
         except Exception as exc:
-            logger.warning(f"Could not read presence for {workspace_id}: {exc}")
+            self._broker._lost_redis(
+                exc, f"Reading presence for {workspace_id}", "using this process"
+            )
             return sorted(self._broker.manager.users_in(workspace_id))
         return sorted(found)
 
@@ -149,7 +155,8 @@ class PresenceTracker:
             return None
         try:
             return await client.get(last_seen_key(workspace_id, user_id))
-        except Exception:
+        except Exception as exc:
+            self._broker._lost_redis(exc, "Reading last seen", "reported as unknown")
             return None
 
 

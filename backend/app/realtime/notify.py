@@ -309,6 +309,23 @@ async def chat_message(session, message, actor_id: RowId | None = None):
     )
 
 
+# ----------------------------------------------------------------- sessions --
+async def token_revoked(token_id: str | None) -> None:
+    """Close the sockets opened with a token that has just been revoked.
+
+    At once and on every instance, not at the next re-validation sweep: REST
+    refuses the token from this moment, and a socket should not outlive that.
+    Regardless of whether the blacklist write reached Redis -- the sockets
+    this deployment can reach are closed either way. Never raises.
+    """
+    if not token_id:
+        return
+    try:
+        await get_broker().revoke_token(token_id)
+    except Exception as exc:
+        logger.warning(f"Could not close the sockets of a revoked token: {exc}")
+
+
 __all__ = [
     "chat_created",
     "chat_deleted",
@@ -325,4 +342,5 @@ __all__ = [
     "member_added",
     "member_removed",
     "member_role_changed",
+    "token_revoked",
 ]

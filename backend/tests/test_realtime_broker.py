@@ -8,19 +8,23 @@ really discards the oldest entries. That is what makes a two-broker test
 meaningful -- the fan-out logic is exercised, not asserted against a
 recording of itself.
 
-What it does not cover is a real Redis server over a real socket: none is
-reachable in this environment. Reconnection against a genuinely restarting
-server is therefore unproven here, and is called out as such.
+What it cannot cover is the wire. fakeredis's connection applies no read
+timeout, never loses its socket, and has no server that can stall or drop a
+client -- which is what breaks a pub/sub subscriber in production. The same
+broker runs against a real Redis in ``test_realtime_redis.py``.
 
 No test waits on the clock. Subscription is awaited through the broker's
 ``subscribed`` event; arrival through the sink's frame signal; and absence is
 proved with a sentinel -- pub/sub delivers one channel in order to one
 subscriber, so once a later message has been handled, an earlier one has
-been too.
+been too. The subscriber's own timers are the exception: pings and
+reconnection happen on its schedule, not in answer to anything a test does,
+so ``until`` watches for their effect, bounded.
 """
 
 import asyncio
 import json
+import math
 
 import fakeredis
 import fakeredis.aioredis
@@ -28,6 +32,7 @@ import pytest
 import pytest_asyncio
 
 from app.core.config import settings
+from app.realtime import broker as broker_module
 from app.realtime import manager as manager_module
 from app.realtime.broker import (
     CHANNEL,
@@ -38,7 +43,7 @@ from app.realtime.broker import (
     sequence_key,
 )
 from app.realtime.events import EventType, make_event
-from app.realtime.manager import Connection, ConnectionManager
+from app.realtime.manager import CLOSE_UNAUTHORIZED, Connection, ConnectionManager
 from app.realtime.presence import last_seen_key, presence_key
 
 from .test_realtime_manager import FAIL_AFTER, SocketSink
@@ -77,6 +82,66 @@ async def listening(broker: EventBroker) -> None:
     await asyncio.wait_for(broker.subscribed.wait(), FAIL_AFTER)
 
 
+async def until(broker: EventBroker, condition, timeout: float = FAIL_AFTER) -> None:
+    """Wait, bounded, for the subscriber to reach a state.
+
+    Wakes on the broker's ``changed`` signal rather than polling: pings and
+    reconnection happen on the subscriber's schedule, not in answer to
+    anything the test does. Checking and clearing happen with no await
+    between them, so a change cannot slip past unseen.
+    """
+
+    async def watch() -> None:
+        while not condition():
+            broker.changed.clear()
+            await broker.changed.wait()
+
+    await asyncio.wait_for(watch(), timeout)
+
+
+async def subscribers(client) -> int:
+    """How many subscriptions the server itself holds on the channel."""
+    return dict(await client.pubsub_numsub(CHANNEL)).get(CHANNEL, 0)
+
+
+def running_subscribers() -> list[asyncio.Task]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done()
+        and getattr(task.get_coro(), "__qualname__", "") == "EventBroker._subscribe_forever"
+    ]
+
+
+class Backoff:
+    """The subscriber's reconnect backoff, driven by the test instead of the clock.
+
+    Each wait the subscriber asks for is recorded and held until the test
+    releases it, so a test sees every delay, can change the world between
+    attempts, and can stop the broker part-way through a wait.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[float] = []
+        self._requested = asyncio.Event()
+        self._released = asyncio.Event()
+
+    async def pause(self, seconds: float) -> None:
+        self.asked.append(seconds)
+        self._released.clear()
+        self._requested.set()
+        await self._released.wait()
+
+    async def next(self) -> float:
+        """The next delay asked for, once the subscriber is waiting it out."""
+        await asyncio.wait_for(self._requested.wait(), FAIL_AFTER)
+        self._requested.clear()
+        return self.asked[-1]
+
+    def release(self) -> None:
+        self._released.set()
+
+
 @pytest.fixture
 def redis_url(monkeypatch):
     monkeypatch.setattr(settings, "REDIS_URL", "redis://fake:6379")
@@ -90,6 +155,22 @@ async def broker(redis_server, redis_url):
         yield instance
     finally:
         await shut(instance)
+
+
+@pytest.fixture
+def reconnecting(redis_server, redis_url, monkeypatch):
+    """Let a broker that loses Redis find it again, quickly.
+
+    A reconnecting broker builds its own client from REDIS_URL; here that is
+    fakeredis on the shared server, as make_broker's first client is. The
+    loss itself is fakeredis's own emulation of a server going away.
+    """
+    monkeypatch.setattr("redis.asyncio.from_url", lambda *args, **kwargs: client_for(redis_server))
+    monkeypatch.setattr(broker_module, "RECONNECT_MIN_SECONDS", 0.01)
+    monkeypatch.setattr(broker_module, "RECONNECT_MAX_SECONDS", 0.05)
+    monkeypatch.setattr(broker_module, "UNAVAILABLE_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(broker_module, "SUBSCRIBER_POLL_SECONDS", 0.01)
+    return redis_server
 
 
 @pytest.mark.asyncio
@@ -449,6 +530,318 @@ class TestDegradation:
         assert instance.snapshot()["listening"] is True
         await shut(instance)
         assert instance.subscribed.is_set() is False
+
+
+@pytest.mark.asyncio
+class TestSubscription:
+    """The subscriber's own life: staying up while quiet, and coming back."""
+
+    async def test_a_quiet_subscription_is_pinged_not_dropped(
+        self, redis_server, redis_url, monkeypatch
+    ):
+        """Regression: silence used to end the subscription.
+
+        ``pubsub.listen()`` read under the client's command timeout, so against
+        a real Redis every five quiet seconds tore the subscription down, and
+        whatever other instances published while it came back was lost.
+        fakeredis applies no read timeout, so that half is proved against a
+        real server in test_realtime_redis.py. This half: silence leads to a
+        ping, and its answer keeps the subscription -- a second ping is sent
+        only once the first has been answered, so three pings on one
+        subscription mean two answers were recognised.
+        """
+        monkeypatch.setattr(broker_module, "SUBSCRIBER_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(broker_module, "SUBSCRIBER_PING_SECONDS", 0.02)
+        listener, publisher = make_broker(redis_server, "api-2"), make_broker(redis_server, "api-1")
+        connection = connect(listener.manager, "u1", "ws-1")
+        await listener.manager.register(connection)
+        try:
+            await listening(listener)
+            await until(listener, lambda: listener.stats["pings"] >= 3)
+            await publisher.publish(make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "after"}))
+
+            assert (await connection.websocket.wait_frames(1))[0]["data"]["id"] == "after"
+            assert listener.stats["redis_errors"] == 0
+            assert listener.stats["subscriptions"] == 1, "the subscription was replaced"
+        finally:
+            await shut(listener, publisher)
+
+    async def test_a_lost_subscription_comes_back_and_says_where_things_stand(self, reconnecting):
+        server = reconnecting
+        listener, publisher = make_broker(server, "api-2"), make_broker(server, "api-1")
+        connection = connect(listener.manager, "u1", "ws-1")
+        await listener.manager.register(connection)
+        try:
+            await listening(listener)
+            seen = await publisher.publish(
+                make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "seen"})
+            )
+            await connection.websocket.wait_frames(1)
+
+            server.connected = False
+            # Stays down until the server is back, so this cannot be missed.
+            await until(listener, lambda: not listener.subscribed.is_set())
+            server.connected = True
+
+            ready = (await connection.websocket.wait_frames(2))[1]
+            assert ready["type"] == EventType.CONNECTED
+            assert ready["data"]["connectionId"] == connection.id
+            assert (ready["data"]["seq"], ready["data"]["epoch"]) == (seen.seq, seen.epoch)
+            assert listener.stats["subscriptions"] == 2
+            assert listener.stats["reannounced"] == 1
+
+            # The new subscription replaced the old one rather than joining
+            # it, so what is published now arrives once. (That the server
+            # holds exactly one is asserted against a real Redis in
+            # test_realtime_redis.py: fakeredis's async connection never
+            # closes its socket, so the old subscription stays registered.)
+            for marker in ("once", "sentinel"):
+                await publisher.publish(
+                    make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": marker})
+                )
+            frames = await connection.websocket.wait_frames(4)
+            assert [f["data"]["id"] for f in frames[2:]] == ["once", "sentinel"]
+        finally:
+            await shut(listener, publisher)
+
+    async def test_what_was_missed_is_in_the_log_the_new_position_points_to(self, reconnecting):
+        """The gap a lost subscription leaves is recoverable, and the client is told where it ends."""
+        server = reconnecting
+        listener, publisher = make_broker(server, "api-2"), make_broker(server, "api-1")
+        connection = connect(listener.manager, "u1", "ws-1")
+        await listener.manager.register(connection)
+        try:
+            await listening(listener)
+            seen = await publisher.publish(
+                make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "seen"})
+            )
+            await connection.websocket.wait_frames(1)
+
+            # Held off Redis before losing it, so the listener cannot come
+            # back until the other instance has published: the event is
+            # certain to be missed, not merely likely to be.
+            listener._unavailable_until = math.inf
+            server.connected = False
+            await until(listener, lambda: not listener.subscribed.is_set())
+            server.connected = True
+            missed = await publisher.publish(
+                make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "missed"})
+            )
+            listener._unavailable_until = 0.0
+
+            ready = (await connection.websocket.wait_frames(2))[1]
+            assert ready["type"] == EventType.CONNECTED, "the missed event arrived live after all"
+            assert ready["data"]["seq"] == missed.seq
+            replayed = await listener.replay(
+                "ws-1", after_seq=seen.seq, epoch=ready["data"]["epoch"]
+            )
+            assert [e.data["id"] for e in replayed] == ["missed"]
+        finally:
+            await shut(listener, publisher)
+
+    async def test_redis_arriving_after_startup_moves_sockets_to_the_shared_sequence(
+        self, reconnecting
+    ):
+        """Sockets served process-locally while Redis was away are told when it returns."""
+        server = reconnecting
+        server.connected = False
+        listener = EventBroker(manager=ConnectionManager(), instance_id="api-2")
+        connection = connect(listener.manager, "u1", "ws-1")
+        await listener.manager.register(connection)
+        try:
+            await listener.start()
+            # Nothing else has touched Redis yet: this is the subscriber failing.
+            await until(listener, lambda: listener.stats["redis_errors"] >= 1)
+            local = await listener.publish(make_event(EventType.DOCUMENT_CREATED, "ws-1"))
+            assert local.epoch == "api-2"
+
+            server.connected = True
+            ready = (await connection.websocket.wait_frames(2))[1]
+            assert ready["type"] == EventType.CONNECTED
+            assert ready["data"]["epoch"] not in (
+                "",
+                "api-2",
+            ), "the socket was left in the process-local sequence"
+        finally:
+            await shut(listener)
+
+    async def test_a_first_subscription_announces_nothing(self, redis_server, redis_url):
+        """Nothing was missed before there was anything to miss."""
+        listener = make_broker(redis_server, "api-2")
+        connection = connect(listener.manager, "u1", "ws-1")
+        await listener.manager.register(connection)
+        try:
+            await listening(listener)
+            await make_broker(redis_server, "api-1").publish(
+                make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "first-frame"})
+            )
+            frames = await connection.websocket.wait_frames(1)
+            assert frames[0]["data"]["id"] == "first-frame"
+            assert listener.stats["reannounced"] == 0
+        finally:
+            await shut(listener)
+
+    async def test_retries_back_off_to_a_ceiling_and_start_over_once_subscribed(
+        self, reconnecting, monkeypatch
+    ):
+        """Bounded both ways: every failed attempt waits, and no wait grows without limit."""
+        server = reconnecting
+        monkeypatch.setattr(broker_module, "RECONNECT_MIN_SECONDS", 1)
+        monkeypatch.setattr(broker_module, "RECONNECT_MAX_SECONDS", 8)
+        attempts = 0
+
+        def connection_attempt(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            return client_for(server)
+
+        monkeypatch.setattr("redis.asyncio.from_url", connection_attempt)
+        server.connected = False
+        listener = EventBroker(manager=ConnectionManager(), instance_id="api-2")
+        backoff = Backoff()
+        listener._pause = backoff.pause  # type: ignore[method-assign]
+        try:
+            await listener.start()
+            asked: list[float] = []
+            for _ in range(6):
+                asked.append(await backoff.next())
+                assert attempts == len(asked), "an attempt was made without waiting first"
+                if len(asked) == 6:
+                    server.connected = True
+                backoff.release()
+            assert asked == [1, 2, 4, 8, 8, 8]
+
+            await until(listener, listener.subscribed.is_set)
+            server.connected = False
+            assert await backoff.next() == 1, "the backoff did not start over after a success"
+        finally:
+            await shut(listener)
+
+    async def test_stopping_while_waiting_to_reconnect_ends_it_there(self, reconnecting):
+        server = reconnecting
+        server.connected = False
+        listener = EventBroker(manager=ConnectionManager(), instance_id="api-2")
+        backoff = Backoff()
+        listener._pause = backoff.pause  # type: ignore[method-assign]
+        observer = client_for(server)
+        try:
+            await listener.start()
+            task = listener._subscriber
+            await backoff.next()
+            # An attempt made now would succeed; stopping must mean none is.
+            server.connected = True
+
+            await asyncio.wait_for(listener.stop(), FAIL_AFTER)
+            assert task is not None and task.done()
+            assert listener._subscriber is None
+            assert running_subscribers() == []
+            assert listener.stats["subscriptions"] == 0
+            assert await subscribers(observer) == 0
+        finally:
+            await shut(listener)
+            await observer.aclose()
+
+    async def test_stopping_an_idle_subscriber_leaves_nothing_behind(self, redis_server, redis_url):
+        """Stopped mid-read, not left waiting on a channel that may stay silent for hours.
+
+        That the server releases the subscription as well is asserted against
+        a real Redis in test_realtime_redis.py; fakeredis keeps it registered
+        after the connection holding it has closed.
+        """
+        listener = make_broker(redis_server, "api-2")
+        observer = client_for(redis_server)
+        try:
+            await listening(listener)
+            assert await subscribers(observer) == 1
+            task = listener._subscriber
+
+            await asyncio.wait_for(listener.stop(), FAIL_AFTER)
+            assert task is not None and task.done()
+            assert listener._subscriber is None
+            assert running_subscribers() == []
+            assert listener.subscribed.is_set() is False
+            assert listener._redis is None
+        finally:
+            await shut(listener)
+            await observer.aclose()
+
+    async def test_a_failing_redis_is_left_alone_for_the_backoff_window(
+        self, reconnecting, monkeypatch
+    ):
+        """Regression: after one call failed, the next call tried Redis again.
+
+        Presence swallowed its errors without telling the broker, and a failed
+        command dropped the client without opening the window a failed connect
+        opens. Against a Redis that has stopped answering, each call a
+        handshake makes paid the full command timeout in turn. One failure now
+        opens the window, and what follows goes straight to this process.
+        """
+        monkeypatch.setattr(broker_module, "UNAVAILABLE_BACKOFF_SECONDS", 60.0)
+        server = reconnecting
+        instance = make_broker(server, "api-1")
+        connection = connect(instance.manager, "u1", "ws-1")
+        await instance.manager.register(connection)
+        try:
+            server.connected = False
+            assert await instance.presence.arrive("ws-1", "u1", connection.id) is True
+            assert await instance.presence.online("ws-1") == ["u1"]
+            await instance.presence.refresh("ws-1", "u1")
+            event = await instance.publish(make_event(EventType.DOCUMENT_CREATED, "ws-1"))
+            assert await instance.current_position("ws-1") == (event.seq, "api-1")
+
+            assert instance.stats["redis_errors"] == 1, "a call after the failure tried Redis again"
+            assert event.epoch == "api-1"
+        finally:
+            await shut(instance)
+
+
+@pytest.mark.asyncio
+class TestRevocation:
+    async def test_a_revoked_token_closes_its_sockets_on_every_instance(
+        self, redis_server, redis_url
+    ):
+        here, there = make_broker(redis_server, "api-1"), make_broker(redis_server, "api-2")
+
+        def opened_with(token_id: str, name: str) -> Connection:
+            return Connection(
+                id=name,
+                websocket=SocketSink(),
+                user_id="u1",
+                workspace_id="ws-1",
+                token_id=token_id,
+            )
+
+        revoked_here = opened_with("jti-1", "here")
+        revoked_there = opened_with("jti-1", "there")
+        other_token = opened_with("jti-2", "other")
+        await here.manager.register(revoked_here)
+        await there.manager.register(revoked_there)
+        await there.manager.register(other_token)
+        try:
+            await listening(there)
+            assert await here.revoke_token("jti-1") == 1
+
+            await asyncio.wait_for(revoked_there.websocket.closed.wait(), FAIL_AFTER)
+            for connection in (revoked_here, revoked_there):
+                assert connection.websocket.closed_with == (CLOSE_UNAUTHORIZED, "token revoked")
+
+            # Handled after the revocation on the same channel, so if the
+            # other token's socket were going to be closed, it would be now.
+            await here.publish(make_event(EventType.DOCUMENT_CREATED, "ws-1", {"id": "sentinel"}))
+            assert (await other_token.websocket.wait_frames(1))[0]["data"]["id"] == "sentinel"
+            assert other_token.websocket.closed_with is None
+        finally:
+            await shut(here, there)
+
+    async def test_an_unknown_instruction_is_ignored(self, broker):
+        connection = Connection(
+            id="c", websocket=SocketSink(), user_id="u1", workspace_id="ws-1", token_id="jti-1"
+        )
+        await broker.manager.register(connection)
+        await broker._handle(json.dumps({"control": "close-everything", "origin": "elsewhere"}))
+        await broker._handle(json.dumps({"control": "revoke_token", "origin": "elsewhere"}))
+        assert connection.websocket.closed_with is None
+        assert connection.websocket.frames == []
 
 
 @pytest.mark.asyncio

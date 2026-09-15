@@ -35,8 +35,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.realtime.broker import get_broker
-from app.realtime.events import PROTOCOL_VERSION, Event, EventType, make_event
+from app.realtime.broker import get_broker, ready_event
+from app.realtime.events import Event, EventType, make_event
 from app.realtime.manager import (
     CLOSE_FORBIDDEN,
     CLOSE_UNAUTHORIZED,
@@ -263,22 +263,7 @@ async def _announce(broker, manager, connection: Connection, display_name: str) 
     # returning client whether its remembered position means anything here.
     seq, epoch = await broker.current_position(connection.workspace_id)
 
-    await manager.send_to(
-        connection,
-        Event(
-            type=EventType.CONNECTED,
-            workspace_id=connection.workspace_id,
-            data={
-                "connectionId": connection.id,
-                "userId": connection.user_id,
-                "protocol": PROTOCOL_VERSION,
-                "heartbeatSeconds": settings.WS_HEARTBEAT_INTERVAL_SECONDS,
-                "online": online,
-                "seq": seq,
-                "epoch": epoch,
-            },
-        ),
-    )
+    await manager.send_to(connection, ready_event(connection, online=online, seq=seq, epoch=epoch))
 
     if newly_online:
         # Only a genuine arrival is announced. A second tab is the same
@@ -411,10 +396,15 @@ async def _resume(broker, manager, connection: Connection, frame: dict) -> None:
         replayed, complete = 0, True
     else:
         missed = await broker.replay(workspace_id, after_seq=after, epoch=epoch)
-        oldest = await broker.oldest_retained(workspace_id)
-        # Complete only if the log still reaches back to the event right
-        # after the client's position. Otherwise some were trimmed away.
-        complete = oldest != 0 and oldest <= after + 1
+        # Complete only if every event after the client's position, up to the
+        # position read above, is still in the log. Not "the log's first
+        # entry is old enough": entries are appended in the order publishers
+        # finish, not the order their numbers were issued, so a log trimmed
+        # between two racing publishers -- or missing an append that failed
+        # after its number was taken -- can begin below a number it no
+        # longer holds.
+        held = {event.seq for event in missed}
+        complete = len(held) >= seq - after and all(n in held for n in range(after + 1, seq + 1))
         replayed = 0
         for event in missed:
             # The same predicate as live delivery, so a restricted event

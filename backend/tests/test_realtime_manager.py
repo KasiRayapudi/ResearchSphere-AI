@@ -15,6 +15,7 @@ waiting a while and seeing nothing.
 """
 
 import asyncio
+import time
 
 import pytest
 import pytest_asyncio
@@ -26,6 +27,7 @@ from app.realtime.manager import (
     CLOSE_SLOW_CONSUMER,
     CLOSE_TIMEOUT,
     CLOSE_TOO_MANY,
+    CLOSE_UNAUTHORIZED,
     Connection,
     ConnectionManager,
     ConnectionRefused,
@@ -537,6 +539,55 @@ class TestLifecycle:
         await manager.register(connection)
         assert manager.get(connection.id) is connection
         assert manager.get("nope") is None
+
+
+@pytest.mark.asyncio
+class TestTokenLifetime:
+    """A socket goes when its token does, not when a sweep next looks."""
+
+    async def test_an_expired_token_is_closed_straight_away(self, manager):
+        connection = build(manager, "u1", "ws-1")
+        connection.token_expires_at = time.time() - 1
+        await manager.register(connection)
+
+        await asyncio.wait_for(connection.websocket.closed.wait(), FAIL_AFTER)
+        assert connection.websocket.closed_with == (CLOSE_UNAUTHORIZED, "token expired")
+        assert manager.stats["expired"] == 1
+        assert manager.total_connections() == 0
+
+    async def test_the_close_is_timed_for_the_expiry_and_cancelled_with_the_socket(self, manager):
+        loop = asyncio.get_running_loop()
+        connection = build(manager, "u1", "ws-1")
+        connection.token_expires_at = time.time() + 3600
+        await manager.register(connection)
+
+        timer = connection.expiry
+        assert timer is not None
+        assert 3590 < timer.when() - loop.time() <= 3600
+        await manager.unregister(connection)
+        assert timer.cancelled() and connection.expiry is None
+        assert connection.websocket.closed_with is None
+
+    async def test_a_socket_without_an_expiry_has_no_timer(self, manager):
+        connection = build(manager, "u1", "ws-1")
+        await manager.register(connection)
+        assert connection.expiry is None
+
+    async def test_closing_a_token_leaves_the_users_other_sockets_open(self, manager):
+        revoked = [build(manager, "u1", workspace) for workspace in ("ws-1", "ws-2")]
+        other = build(manager, "u1", "ws-1")
+        for connection in revoked:
+            connection.token_id = "jti-1"
+        other.token_id = "jti-2"
+        for connection in (*revoked, other):
+            await manager.register(connection)
+
+        assert await manager.close_token("jti-1") == 2
+        assert await manager.close_token("jti-1") == 0, "a repeated revocation closed something"
+        for connection in revoked:
+            assert connection.websocket.closed_with == (CLOSE_UNAUTHORIZED, "token revoked")
+        assert other.websocket.closed_with is None
+        assert manager.get(other.id) is other
 
 
 class TestLoopOwnership:

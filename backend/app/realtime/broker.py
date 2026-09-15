@@ -43,13 +43,17 @@ from collections import defaultdict, deque
 from app.core.config import settings
 from app.core.logging import get_logger
 
-from .events import Event
-from .manager import ConnectionManager, get_manager
+from .events import PROTOCOL_VERSION, Event, EventType
+from .manager import Connection, ConnectionManager, get_manager
 
 logger = get_logger("realtime.broker")
 
 #: One channel for every workspace. See the module docstring.
 CHANNEL = "researchsphere:realtime:events"
+
+#: A message on the channel that tells every instance to close the sockets
+#: opened with one token, rather than carrying an event for clients.
+CONTROL_REVOCATION = "revoke_token"
 
 
 def sequence_key(workspace_id: str) -> str:
@@ -88,6 +92,24 @@ RECONNECT_MAX_SECONDS = 30
 #: used again soon.
 UNAVAILABLE_BACKOFF_SECONDS = 5.0
 
+#: Timeouts for the commands on the realtime path. Each is one small round
+#: trip, so a command that takes seconds means Redis is in trouble and the
+#: caller is better off falling back.
+CONNECT_TIMEOUT_SECONDS = 2
+COMMAND_TIMEOUT_SECONDS = 5
+
+#: The subscription reads in slices this long. A slice that ends with nothing
+#: means only that the channel was quiet -- see ``EventBroker._listen``.
+SUBSCRIBER_POLL_SECONDS = 1.0
+
+#: A subscription that has heard nothing for SUBSCRIBER_PING_SECONDS pings
+#: Redis, and one whose ping goes unanswered for
+#: SUBSCRIBER_REPLY_TIMEOUT_SECONDS is given up as dead. The interval is well
+#: under the idle timeouts of common load balancers and NAT gateways, which
+#: drop a silent connection without telling either end.
+SUBSCRIBER_PING_SECONDS = 15.0
+SUBSCRIBER_REPLY_TIMEOUT_SECONDS = 5.0
+
 
 class EventBroker:
     """Sequences events, records them for replay, and fans them out."""
@@ -110,6 +132,11 @@ class EventBroker:
         #: that depends on cross-instance delivery -- readiness, a test --
         #: waits on this instead of guessing how long a subscription takes.
         self.subscribed = asyncio.Event()
+        #: Set whenever the subscriber moves -- subscribed, lost, pinged,
+        #: re-announced -- or a Redis call fails. Something watching it, a
+        #: health check or a test, clears it and waits for the next change
+        #: instead of polling for one.
+        self.changed = asyncio.Event()
         #: The loop this broker was started on. Captured so a thread that is
         #: not the loop -- inline ingestion runs in one -- can hand work back
         #: to it. None in a process with no loop at all, such as a real
@@ -137,11 +164,35 @@ class EventBroker:
             "ignored_own": 0,
             "redis_errors": 0,
             "replayed": 0,
+            # More than one subscription in a process's life means it lost
+            # one: each is a window in which other instances went unheard.
+            "subscriptions": 0,
+            "pings": 0,
+            "reannounced": 0,
         }
 
     @property
     def manager(self) -> ConnectionManager:
         return self._manager or get_manager()
+
+    def _tally(self, stat: str, by: int = 1) -> None:
+        self.stats[stat] += by
+        self.changed.set()
+
+    def _lost_redis(self, exc: Exception, attempt: str, fallback: str) -> None:
+        """A Redis call failed: fall back, and leave Redis alone for a while.
+
+        The client is dropped so the next attempt starts on a fresh
+        connection, and the same window a failed connect opens is opened
+        here. Without it a Redis that has stopped answering costs every call
+        its full command timeout, and a handshake makes several: each new
+        socket would stall for many seconds instead of one call paying once
+        per window.
+        """
+        self._tally("redis_errors")
+        self._redis = None
+        self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
+        logger.warning(f"{attempt} failed ({exc}); {fallback}.")
 
     # ------------------------------------------------------------ lifecycle --
     async def start(self) -> None:
@@ -212,15 +263,15 @@ class EventBroker:
 
             client = aioredis.from_url(
                 settings.REDIS_URL,
-                socket_connect_timeout=2,
-                socket_timeout=5,
+                socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                socket_timeout=COMMAND_TIMEOUT_SECONDS,
                 decode_responses=True,
             )
             await client.ping()
             self._redis = client
             return client
         except Exception as exc:
-            self.stats["redis_errors"] += 1
+            self._tally("redis_errors")
             self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
             logger.warning(
                 f"Realtime Redis unavailable ({exc}); staying process-local for "
@@ -267,9 +318,7 @@ class EventBroker:
                 seq, _, epoch = await pipe.execute()
                 return int(seq), str(epoch)
             except Exception as exc:
-                self.stats["redis_errors"] += 1
-                logger.warning(f"Sequence allocation failed ({exc}); using local counter.")
-                self._redis = None
+                self._lost_redis(exc, "Sequence allocation", "using the local counter")
 
         # Process-local: the epoch is this process, so a restart -- including
         # every dev-server reload -- is visible to clients as an epoch change.
@@ -293,9 +342,7 @@ class EventBroker:
                 seq, _, epoch = await pipe.execute()
                 return int(seq or 0), str(epoch)
             except Exception as exc:
-                self.stats["redis_errors"] += 1
-                logger.warning(f"Position lookup failed ({exc}); using local counter.")
-                self._redis = None
+                self._lost_redis(exc, "Position lookup", "using the local counter")
 
         async with self._local_lock:
             return self._local_seq.get(workspace_id, 0), self.instance_id
@@ -310,9 +357,7 @@ class EventBroker:
                     return 0
                 return Event.from_wire(json.loads(raw)).seq
             except Exception as exc:
-                self.stats["redis_errors"] += 1
-                logger.warning(f"Replay log read failed ({exc}); using local buffer.")
-                self._redis = None
+                self._lost_redis(exc, "Replay log read", "using the local buffer")
 
         async with self._local_lock:
             log = self._local_log.get(workspace_id)
@@ -331,9 +376,7 @@ class EventBroker:
                 await pipe.execute()
                 return
             except Exception as exc:
-                self.stats["redis_errors"] += 1
-                logger.warning(f"Replay log append failed ({exc}); using local buffer.")
-                self._redis = None
+                self._lost_redis(exc, "Replay log append", "using the local buffer")
 
         async with self._local_lock:
             self._local_log[event.workspace_id].append(event)
@@ -348,47 +391,185 @@ class EventBroker:
             payload["origin"] = self.instance_id
             await client.publish(CHANNEL, json.dumps(payload))
         except Exception as exc:
-            self.stats["redis_errors"] += 1
-            logger.warning(f"Realtime fan-out failed ({exc}); event stayed process-local.")
-            self._redis = None
+            self._lost_redis(exc, "Realtime fan-out", "the event stayed process-local")
+
+    async def revoke_token(self, token_id: str) -> int:
+        """Close every socket, on every instance, that opened with this token.
+
+        Called when a token is revoked -- a logout -- so its sockets go at
+        once. Otherwise they would last until the next re-validation sweep,
+        up to a minute, while REST already refuses the same token. Returns
+        how many sockets this instance closed; the others close theirs when
+        the message reaches them, and the sweep remains the backstop for an
+        instance it never reaches.
+        """
+        if not token_id:
+            return 0
+        closed = await self.manager.close_token(token_id)
+        client = await self._client()
+        if client is not None:
+            try:
+                await client.publish(
+                    CHANNEL,
+                    json.dumps(
+                        {
+                            "control": CONTROL_REVOCATION,
+                            "token_id": token_id,
+                            "origin": self.instance_id,
+                        }
+                    ),
+                )
+            except Exception as exc:
+                self._lost_redis(
+                    exc, "Revocation fan-out", "other instances close at their next sweep"
+                )
+        return closed
 
     # ------------------------------------------------------------- receive --
     async def _subscribe_forever(self) -> None:
         """Listen for events from other instances, reconnecting as needed."""
         delay = RECONNECT_MIN_SECONDS
+        # Whether this instance has been deaf to the others at some point
+        # since it started: the subscription would not come up, or came up
+        # and was lost. Sockets it served meanwhile must be told.
+        deaf = False
         while self._running:
             pubsub = None
+            failure: Exception | None = None
             try:
                 client = await self._client()
                 if client is None:
                     raise ConnectionError("Redis unavailable")
-                pubsub = client.pubsub(ignore_subscribe_messages=True)
+                pubsub = client.pubsub()
                 await pubsub.subscribe(CHANNEL)
+                await self._confirmed(pubsub)
                 self.subscribed.set()
+                self._tally("subscriptions")
                 logger.info(f"Realtime subscriber listening on {CHANNEL}")
                 delay = RECONNECT_MIN_SECONDS
-
-                async for message in pubsub.listen():
-                    if not self._running:
-                        break
-                    if message.get("type") != "message":
-                        continue
-                    await self._handle(message.get("data"))
+                if deaf:
+                    await self._reannounce()
+                    deaf = False
+                await self._listen(pubsub)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.subscribed.clear()
-                self.stats["redis_errors"] += 1
-                self._redis = None
-                logger.warning(f"Realtime subscriber dropped ({exc}); retrying in {delay}s.")
-                await asyncio.sleep(delay)
-                # Backing off matters: a Redis that is down stays down for a
-                # while, and a tight retry loop turns one outage into two.
-                delay = min(RECONNECT_MAX_SECONDS, delay * 2)
+                failure = exc
             finally:
+                # Before any backoff: a subscription given up on must not
+                # stay registered on the server while this waits to replace
+                # it, still being sent messages nobody reads.
                 if pubsub is not None:
                     with contextlib.suppress(Exception):
                         await pubsub.aclose()
+            if failure is None:
+                continue  # _listen returned: the broker is stopping
+            deaf = True
+            self.subscribed.clear()
+            self._redis = None
+            self._tally("redis_errors")
+            logger.warning(f"Realtime subscriber dropped ({failure}); retrying in {delay}s.")
+            # Backing off matters: a Redis that is down stays down for a
+            # while, and a tight retry loop turns one outage into two.
+            await self._pause(delay)
+            delay = min(RECONNECT_MAX_SECONDS, delay * 2)
+
+    async def _pause(self, seconds: float) -> None:
+        """Wait out one reconnect backoff.
+
+        A method of its own so the schedule can be observed and driven: a
+        test replaces it to see each delay the subscriber asks for, and to
+        stop the broker part-way through one, without waiting on the clock.
+        """
+        await asyncio.sleep(seconds)
+
+    async def _confirmed(self, pubsub) -> None:
+        """Wait for Redis to confirm the subscription.
+
+        SUBSCRIBE has no reply in the usual sense: redis-py writes it and
+        returns. Until the confirmation comes back, an event published by
+        another instance may or may not reach this one, so neither the
+        ``subscribed`` signal nor a re-announcement may go out before it.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SUBSCRIBER_REPLY_TIMEOUT_SECONDS
+        while (remaining := deadline - loop.time()) > 0:
+            message = await pubsub.get_message(timeout=remaining)
+            if message is not None and message.get("type") == "subscribe":
+                return
+        raise ConnectionError("Redis did not confirm the subscription")
+
+    async def _listen(self, pubsub) -> None:
+        """Deliver what arrives until the connection fails or the broker stops.
+
+        Not ``pubsub.listen()``. That reads under the client's command
+        timeout, and a channel is silent for as long as nobody publishes, so
+        against a real Redis a quiet deployment tore its subscription down
+        every few seconds and lost whatever other instances published while
+        it came back. Reads here wait in bounded slices, and a slice that
+        ends empty means only that nothing was sent.
+
+        That timeout was also, by accident, the only thing that noticed a
+        dead connection, so silence is now tested on purpose: after
+        SUBSCRIBER_PING_SECONDS with nothing heard Redis is pinged, and a ping
+        unanswered for SUBSCRIBER_REPLY_TIMEOUT_SECONDS ends the connection.
+        """
+        loop = asyncio.get_running_loop()
+        heard = loop.time()
+        pinged_at: float | None = None
+        while self._running:
+            message = await pubsub.get_message(timeout=SUBSCRIBER_POLL_SECONDS)
+            now = loop.time()
+            if message is not None:
+                # Anything at all -- an event, a pong -- proves the connection.
+                heard, pinged_at = now, None
+                if message.get("type") == "message":
+                    await self._handle(message.get("data"))
+                continue
+            if pinged_at is not None:
+                if now - pinged_at >= SUBSCRIBER_REPLY_TIMEOUT_SECONDS:
+                    raise ConnectionError(f"Redis has not answered for {now - heard:.1f}s")
+            elif now - heard >= SUBSCRIBER_PING_SECONDS:
+                await pubsub.ping()
+                self._tally("pings")
+                pinged_at = now
+
+    async def _reannounce(self) -> int:
+        """Tell every socket on this instance where its workspace stands now.
+
+        Runs when a subscription comes up after a period without one.
+        Whatever other instances published in between never arrived here,
+        and nothing downstream could tell: a client does not look for gaps,
+        because restricted events leave gaps by design. A fresh
+        ``connection.ready`` is the prompt a client already acts on -- in the
+        same epoch it resumes from a little behind what it has seen and the
+        replay log fills the gap; in a new one it refetches. The subscription
+        is confirmed before this runs, so anything published after the
+        position read here is delivered live.
+
+        Returns how many sockets were told. Never raises: a failure here must
+        not take down the subscription it follows.
+        """
+        rooms: dict[str, list[Connection]] = defaultdict(list)
+        for connection in self.manager.live():
+            rooms[connection.workspace_id].append(connection)
+
+        told = 0
+        for workspace_id, connections in rooms.items():
+            try:
+                online = await self.presence.online(workspace_id)
+                seq, epoch = await self.current_position(workspace_id)
+                for connection in connections:
+                    frame = ready_event(connection, online=online, seq=seq, epoch=epoch)
+                    if await self.manager.send_to(connection, frame):
+                        told += 1
+            except Exception as exc:
+                logger.warning(f"Could not re-announce to workspace {workspace_id}: {exc}")
+
+        self._tally("reannounced", told)
+        if told:
+            logger.info(f"Realtime subscription restored; told {told} socket(s) to resume")
+        return told
 
     async def _handle(self, raw) -> None:
         """Deliver one event that arrived from another instance."""
@@ -407,7 +588,19 @@ class EventBroker:
             self.stats["ignored_own"] += 1
             return
 
+        if "control" in payload:
+            # An instruction to this instance, never an event for a client.
+            # Events cannot collide: their envelope has no such key.
+            await self._control(payload)
+            return
+
         await self.manager.publish(Event.from_wire(payload))
+
+    async def _control(self, payload: dict) -> None:
+        if payload.get("control") == CONTROL_REVOCATION and payload.get("token_id"):
+            await self.manager.close_token(str(payload["token_id"]))
+            return
+        logger.warning(f"Ignoring unknown realtime control message {payload.get('control')!r}")
 
     # -------------------------------------------------------------- replay --
     async def replay(
@@ -436,9 +629,7 @@ class EventBroker:
                     with contextlib.suppress(TypeError, ValueError):
                         events.append(Event.from_wire(json.loads(raw)))
             except Exception as exc:
-                self.stats["redis_errors"] += 1
-                logger.warning(f"Replay read failed ({exc}); falling back to local buffer.")
-                self._redis = None
+                self._lost_redis(exc, "Replay read", "falling back to the local buffer")
                 events = []
 
         if not events:
@@ -463,6 +654,29 @@ class EventBroker:
             "listening": self.subscribed.is_set(),
             "stats": dict(self.stats),
         }
+
+
+def ready_event(connection: Connection, *, online: list[str], seq: int, epoch: str) -> Event:
+    """The ``connection.ready`` frame: who this socket is, and where its workspace stands.
+
+    Sent when a socket opens, and again after this instance may have missed
+    what the others published (``EventBroker._reannounce``). ``seq`` and
+    ``epoch`` are what a client resumes from; ``online`` replaces its
+    presence list, which may have missed changes too.
+    """
+    return Event(
+        type=EventType.CONNECTED,
+        workspace_id=connection.workspace_id,
+        data={
+            "connectionId": connection.id,
+            "userId": connection.user_id,
+            "protocol": PROTOCOL_VERSION,
+            "heartbeatSeconds": settings.WS_HEARTBEAT_INTERVAL_SECONDS,
+            "online": online,
+            "seq": seq,
+            "epoch": epoch,
+        },
+    )
 
 
 _broker: EventBroker | None = None
@@ -546,6 +760,7 @@ __all__ = [
     "log_key",
     "publish",
     "publish_from_worker",
+    "ready_event",
     "reset_broker",
     "sequence_key",
 ]

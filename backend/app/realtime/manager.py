@@ -137,6 +137,8 @@ class Connection:
     token_expires_at: float | None = None
     #: The token's jti, so a revocation reaches sockets as well as requests.
     token_id: str | None = None
+    #: The timer that closes this socket when its token expires.
+    expiry: asyncio.TimerHandle | None = None
 
     def touch(self) -> None:
         self.last_seen_ms = monotonic_ms()
@@ -168,6 +170,9 @@ class ConnectionManager:
         #: see app/realtime/revalidation.py. Optional so the manager stays
         #: usable without a database.
         self._validator = None
+        #: Closes started by a timer rather than awaited by a caller. Held so
+        #: they are not garbage-collected mid-close, and so shutdown can wait.
+        self._closers: set[asyncio.Task] = set()
         self.max_per_user = max_per_user or settings.WS_MAX_CONNECTIONS_PER_USER
         self.max_total = max_total or settings.WS_MAX_CONNECTIONS_TOTAL
         self.queue_size = queue_size or settings.WS_SEND_QUEUE_SIZE
@@ -181,6 +186,7 @@ class ConnectionManager:
             "dropped_isolation": 0,
             "filtered": 0,
             "revoked": 0,
+            "expired": 0,
         }
 
     # ------------------------------------------------------------ lifecycle --
@@ -232,6 +238,8 @@ class ConnectionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat
             self._heartbeat = None
+        if self._closers:
+            await asyncio.gather(*list(self._closers), return_exceptions=True)
 
         async with self._lock:
             connections = list(self._by_id.values())
@@ -283,8 +291,29 @@ class ConnectionManager:
 
         connection.writer = asyncio.create_task(self._drain(connection))
 
+        if connection.token_expires_at is not None:
+            # Closed when the token expires, to the second. The re-validation
+            # sweep would get there too, but up to a minute late -- a minute
+            # in which the socket outlived a credential REST already refuses.
+            # The sweep's own expiry check stays, for a clock that jumps.
+            delay = max(0.0, connection.token_expires_at - time.time())
+            connection.expiry = asyncio.get_running_loop().call_later(
+                delay, self._expire, connection
+            )
+
+    def _expire(self, connection: Connection) -> None:
+        if connection.closing:
+            return
+        self.stats["expired"] += 1
+        closer = asyncio.ensure_future(self._close(connection, CLOSE_UNAUTHORIZED, "token expired"))
+        self._closers.add(closer)
+        closer.add_done_callback(self._closers.discard)
+
     async def unregister(self, connection: Connection) -> None:
         """Remove a socket and stop its writer. Safe to call twice."""
+        if connection.expiry is not None:
+            connection.expiry.cancel()
+            connection.expiry = None
         async with self._lock:
             room = self._rooms.get(connection.workspace_id)
             if room is not None:
@@ -452,6 +481,19 @@ class ConnectionManager:
     async def close(self, connection: Connection, code: int, reason: str) -> None:
         """Take one connection out of service with the given close code."""
         await self._close(connection, code, reason)
+
+    async def close_token(self, token_id: str) -> int:
+        """Close every connection opened with this token. Returns how many."""
+        async with self._lock:
+            targets = [c for c in self._by_id.values() if c.token_id == token_id]
+        closed = 0
+        for connection in targets:
+            if connection.closing:
+                continue
+            self.stats["revoked"] += 1
+            await self._close(connection, CLOSE_UNAUTHORIZED, "token revoked")
+            closed += 1
+        return closed
 
     def get(self, connection_id: str) -> Connection | None:
         return self._by_id.get(connection_id)

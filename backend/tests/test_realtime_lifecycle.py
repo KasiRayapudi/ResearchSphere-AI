@@ -93,6 +93,54 @@ class TestTokenLifetime:
             assert stats["unauthorized"] == 1
             assert ws.close_code(socket) == CLOSE_UNAUTHORIZED
 
+    def test_a_revoked_token_cannot_open_a_socket(self, client, owner, shared_redis):
+        from jose import jwt
+
+        from app.core.token_store import revoke_token
+
+        claims = jwt.get_unverified_claims(owner["token"])
+        assert revoke_token(claims["jti"], claims["exp"]) is True
+        assert ws.rejected(client, owner["token"], owner["workspace_id"]) == CLOSE_UNAUTHORIZED
+
+    def test_the_socket_is_timed_to_close_when_its_token_expires(self, client, owner):
+        """Not left to the sweep, which could let it outlive the token by a minute."""
+        from jose import jwt
+
+        claims = jwt.get_unverified_claims(owner["token"])
+        with ws.open_socket(client, owner["token"], owner["workspace_id"]) as socket:
+            connection = ws.connection_of(client, ws.ready(socket))
+
+            async def seconds_until_close() -> float:
+                assert connection.expiry is not None, "no expiry timer was set"
+                return connection.expiry.when() - asyncio.get_running_loop().time()
+
+            left = ws.on_loop(client, seconds_until_close)
+            assert abs(left - (claims["exp"] - time.time())) < 5
+        assert ws.torn_down(client, connection)
+        assert connection.expiry is None, "the timer outlived its connection"
+
+    def test_logging_out_closes_the_socket_at_once(self, client, owner, joiner):
+        """Regression: a socket outlived its token's logout until the next sweep.
+
+        REST refused the token from the moment of logout; the socket went on
+        receiving the workspace for up to a minute. It now closes while the
+        logout is handled -- and only it: another member is unaffected.
+        """
+        with (
+            ws.open_socket(client, owner["token"], owner["workspace_id"]) as mine,
+            ws.open_socket(client, joiner["token"], owner["workspace_id"]) as colleague,
+        ):
+            ws.ready(mine)
+            ws.ready(colleague)
+            response = client.post(
+                "/api/v1/auth/logout", headers={"Authorization": f"Bearer {owner['token']}"}
+            )
+            assert response.status_code == 200, response.text
+            assert ws.close_code(mine) == CLOSE_UNAUTHORIZED
+
+            ws.emit(client, EventType.DOCUMENT_CREATED, owner["workspace_id"], {"id": "still-here"})
+            assert ws.next_event(colleague)["data"]["id"] == "still-here"
+
 
 # ------------------------------------------------------- lost-event coverage --
 class TestChangesBehindTheSocketsBack:

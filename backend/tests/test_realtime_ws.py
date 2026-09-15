@@ -28,6 +28,7 @@ strictly ordered, so a pong arriving next means nothing was queued ahead.
 
 import asyncio
 import json
+import math
 import queue
 import uuid
 from datetime import timedelta
@@ -673,6 +674,36 @@ class TestReconnectAndReplay:
         assert report["complete"] is False
         assert [f["data"]["n"] for f in frames] == [3, 4, 5]
 
+    def test_a_hole_in_the_log_is_reported_incomplete(self, client, owner):
+        """Regression: completeness was judged by the log's first entry alone.
+
+        Entries are appended in the order publishers finish, not the order
+        their numbers were issued. Two publishers racing across the log's trim
+        boundary, or an append that failed after its number was taken, leave
+        a log that starts below a number it no longer holds -- and a client
+        resuming from there was told it had everything.
+        """
+        workspace = owner["workspace_id"]
+
+        async def publish_with_one_append_lost() -> None:
+            broker = get_broker()
+            numbered = []
+            for n in range(3):
+                seq, epoch = await broker._next_sequence(workspace)
+                event = make_event(EventType.CHAT_MESSAGE, workspace, {"n": n})
+                numbered.append(event.with_sequence(seq, epoch))
+            await broker._record(numbered[0])
+            await broker._record(numbered[2])  # the middle one never reached the log
+
+        with open_socket(client, owner["token"], workspace) as socket:
+            ready(socket)
+            start, epoch = position(client, workspace)
+            on_loop(client, publish_with_one_append_lost)
+            frames, report = replay_after(socket, start, epoch)
+
+        assert [f["data"]["n"] for f in frames] == [0, 2]
+        assert report["complete"] is False, "a client missing an event was told it had them all"
+
     def test_a_malformed_resume_is_harmless(self, client, owner):
         with open_socket(client, owner["token"], owner["workspace_id"]) as socket:
             ready(socket)
@@ -949,3 +980,89 @@ class TestAcrossInstances:
 
             assert next_event(colleague)["data"]["id"] == "p"
             assert next_event(mine)["data"]["title"] == "private"
+
+    def test_a_browser_recovers_what_its_instance_missed(
+        self, client, owner, shared_redis, monkeypatch
+    ):
+        """Another instance published while this one's subscription was down.
+
+        The subscription is lost (fakeredis emulating Redis going away) and
+        held down while the other instance publishes, so the event is certain
+        to be missed live. When the subscription returns, the server sends
+        connection.ready again, and a browser answers that with the same
+        resume it sends after any reconnect.
+        """
+        from app.realtime import broker as broker_module
+
+        monkeypatch.setattr(
+            "redis.asyncio.from_url",
+            lambda *args, **kwargs: fakeredis.aioredis.FakeRedis(
+                server=shared_redis, decode_responses=True
+            ),
+        )
+        monkeypatch.setattr(broker_module, "RECONNECT_MIN_SECONDS", 0.01)
+        monkeypatch.setattr(broker_module, "RECONNECT_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(broker_module, "SUBSCRIBER_POLL_SECONDS", 0.01)
+        broker = get_broker()
+
+        async def lose_redis() -> None:
+            broker._unavailable_until = math.inf
+            shared_redis.connected = False
+
+            async def dropped() -> None:
+                while broker.subscribed.is_set():
+                    broker.changed.clear()
+                    await broker.changed.wait()
+
+            await asyncio.wait_for(dropped(), FAIL_AFTER)
+            shared_redis.connected = True
+
+        async def let_it_back() -> None:
+            broker._unavailable_until = 0.0
+
+        with open_socket(client, owner["token"], owner["workspace_id"]) as socket:
+            first = ready(socket)["data"]
+            on_loop(client, lose_redis)
+            event = make_event(EventType.DOCUMENT_CREATED, owner["workspace_id"], {"id": "missed"})
+            missed = on_loop(client, publish_elsewhere, shared_redis, event)
+            on_loop(client, let_it_back)
+
+            again = receive(socket)
+            assert again["type"] == EventType.CONNECTED, f"expected ready again, got {again}"
+            assert (again["data"]["seq"], again["data"]["epoch"]) == (missed.seq, first["epoch"])
+
+            frames, report = replay_after(socket, first["seq"], first["epoch"])
+            assert [f["data"]["id"] for f in frames if f["type"] not in PRESENCE] == ["missed"]
+            assert report["complete"] is True
+
+    def test_a_second_lifespan_leaves_the_subscription_alone(self, client, owner, shared_redis):
+        """A nested lifespan -- another app in the process, a test -- must not
+        stop, restart or replace the subscriber the running one owns."""
+        import main as app_main
+
+        broker = get_broker()
+
+        async def subscriber_state() -> tuple:
+            task = broker._subscriber
+            return (
+                broker.subscribed.is_set(),
+                task is not None and not task.done(),
+                broker.stats["subscriptions"],
+                id(task),
+            )
+
+        before = on_loop(client, subscriber_state)
+        assert before[:2] == (True, True)
+
+        async def second_lifespan() -> None:
+            async with app_main.lifespan(app_main.app):
+                pass
+
+        asyncio.run(second_lifespan())
+        assert on_loop(client, subscriber_state) == before
+
+        with open_socket(client, owner["token"], owner["workspace_id"]) as socket:
+            ready(socket)
+            event = make_event(EventType.DOCUMENT_CREATED, owner["workspace_id"], {"id": "still"})
+            on_loop(client, publish_elsewhere, shared_redis, event)
+            assert next_event(socket)["data"]["id"] == "still"

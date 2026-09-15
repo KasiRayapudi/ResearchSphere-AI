@@ -25,6 +25,7 @@ from app.core.token_store import revoke_token
 from app.core.workspace_access import create_owner_membership
 from app.models.user import User
 from app.models.workspace import Workspace
+from app.realtime import notify
 
 router = APIRouter()
 logger = get_logger("auth")
@@ -477,6 +478,9 @@ async def logout(
     payload = decode_token(credentials.credentials, expected_type=TOKEN_TYPE_ACCESS)
     blacklisted = revoke_token(payload.get("jti"), payload.get("exp"))
     revoked = revoke_all_for_user(db, current_user.id, reason="logout")
+    # Sockets opened with this token close now, on every instance, rather
+    # than at the next re-validation sweep.
+    await notify.token_revoked(payload.get("jti"))
 
     metrics.safe(metrics.auth_attempts_total.labels(action="logout", outcome="success").inc)
     audit(
