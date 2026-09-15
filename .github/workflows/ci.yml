@@ -87,6 +87,19 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    # A real Redis, the image docker-compose.yml runs, for the one step below
+    # that needs it. The main suite uses fakeredis and never touches it.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -106,8 +119,8 @@ jobs:
           pip install -r requirements-dev.txt
 
       # The suite provisions its own SQLite database and fakeredis, and asserts
-      # that Qdrant- and Gemini-dependent paths degrade rather than crash, so
-      # no service containers are needed.
+      # that Qdrant- and Gemini-dependent paths degrade rather than crash. The
+      # real-Redis tests in it are skipped here; the next step runs them.
       - name: Run tests with coverage
         working-directory: backend
         run: |
@@ -117,6 +130,27 @@ jobs:
             --cov-report=term-missing \
             --cov-report=html \
             --junitxml=junit.xml
+
+      # fakeredis cannot show what breaks a pub/sub subscriber in production --
+      # read timeouts on a quiet channel, killed connections, a server that
+      # stops answering. This runs the realtime layer against the real thing,
+      # and fails rather than passing if the tests were skipped.
+      - name: Realtime against a real Redis
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        env:
+          REALTIME_REDIS_URL: redis://localhost:6379/15
+        run: |
+          set -o pipefail
+          pytest tests/test_realtime_redis.py -m redis -rfEs 2>&1 | tee realtime-redis.log
+          summary="$(tail -n 1 realtime-redis.log)"
+          echo "::notice title=Realtime on real Redis (py${{ matrix.python-version }})::${summary}"
+          case "$summary" in
+            *skipped*|*"no tests ran"*)
+              echo "::error::Real-Redis tests did not run: ${summary}"
+              exit 1
+              ;;
+          esac
 
       - name: Upload coverage and test reports
         if: always() && matrix.python-version == '3.11'

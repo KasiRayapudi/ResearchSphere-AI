@@ -103,6 +103,7 @@ addopts = [
 markers = [
     "integration: exercises the app through the API (no external services required)",
     "unit: pure unit test with no I/O",
+    "redis: needs a real Redis server at REALTIME_REDIS_URL; skipped when it is not set",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
