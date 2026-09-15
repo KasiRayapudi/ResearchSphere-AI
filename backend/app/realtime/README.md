@@ -126,6 +126,9 @@ The subscription is kept alive deliberately:
   within 5 s ends the connection;
 - reconnects back off from 1 s, doubling to 30 s and reset once subscribed,
   and the lost subscription is closed before the wait;
+- a Redis client the instance gives up on -- after a failed call or a lost
+  subscription -- is closed with its connection pool, not left for garbage
+  collection, and stopping waits for those closes;
 - a subscription that replaces a lost one re-sends `connection.ready` to the
   instance's sockets, so their clients resume what they missed (see
   Connecting).
@@ -286,7 +289,9 @@ which a client too slow to keep up is closed with 4408.
   runs the broker, presence and the endpoint against a real server when
   `REALTIME_REDIS_URL` is set -- in CI against `redis:7-alpine`, locally
   against a throwaway instance such as `docker compose up -d redis` -- and is
-  skipped without it. Elsewhere the suite uses fakeredis in process, which
+  skipped without it. The CI step fails unless every test ran and passed with
+  none skipped (counted from JUnit XML), and if any connection was left for
+  the garbage collector to close. Elsewhere the suite uses fakeredis in process, which
   applies no read timeouts, cannot stop answering, and keeps a subscription
   registered after its connection closes.
 - **Untested topologies.** Nothing exercises a Redis restart with

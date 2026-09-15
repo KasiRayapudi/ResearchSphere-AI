@@ -88,7 +88,9 @@ class PresenceTracker:
             # Through the broker, so a Redis that has stopped answering is
             # left alone for a while rather than timing out every call of
             # the handshake in turn.
-            self._broker._lost_redis(exc, f"Recording presence for {user_id}", "using this process")
+            self._broker._lost_redis(
+                exc, f"Recording presence for {user_id}", "using this process", client
+            )
             return len(self._broker.manager.connections_for(user_id, workspace_id)) <= 1
 
     async def refresh(self, workspace_id: str, user_id: str) -> None:
@@ -99,7 +101,7 @@ class PresenceTracker:
         try:
             await client.expire(presence_key(workspace_id, user_id), PRESENCE_TTL_SECONDS)
         except Exception as exc:
-            self._broker._lost_redis(exc, f"Refreshing presence for {user_id}", "skipped")
+            self._broker._lost_redis(exc, f"Refreshing presence for {user_id}", "skipped", client)
 
     async def depart(self, workspace_id: str, user_id: str, connection_id: str) -> bool:
         """Drop a connection. True when the user has no others left."""
@@ -124,7 +126,9 @@ class PresenceTracker:
                 return True
             return False
         except Exception as exc:
-            self._broker._lost_redis(exc, f"Clearing presence for {user_id}", "using this process")
+            self._broker._lost_redis(
+                exc, f"Clearing presence for {user_id}", "using this process", client
+            )
             return not self._broker.manager.connections_for(user_id, workspace_id)
 
     async def online(self, workspace_id: str) -> list[str]:
@@ -143,7 +147,7 @@ class PresenceTracker:
                     found.add(str(key)[len(prefix) :])
         except Exception as exc:
             self._broker._lost_redis(
-                exc, f"Reading presence for {workspace_id}", "using this process"
+                exc, f"Reading presence for {workspace_id}", "using this process", client
             )
             return sorted(self._broker.manager.users_in(workspace_id))
         return sorted(found)
@@ -156,7 +160,7 @@ class PresenceTracker:
         try:
             return await client.get(last_seen_key(workspace_id, user_id))
         except Exception as exc:
-            self._broker._lost_redis(exc, "Reading last seen", "reported as unknown")
+            self._broker._lost_redis(exc, "Reading last seen", "reported as unknown", client)
             return None
 
 

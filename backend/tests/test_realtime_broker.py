@@ -795,6 +795,67 @@ class TestSubscription:
             await shut(instance)
 
 
+def open_connections(client) -> list:
+    """The client's pooled connections that still hold a socket."""
+    pool = client.connection_pool
+    connections = list(pool._available_connections) + list(pool._in_use_connections)
+    return [c for c in connections if c.is_connected]
+
+
+@pytest.mark.asyncio
+class TestClientsGivenUpOn:
+    """A client the broker stops using is closed, not left to the garbage collector.
+
+    Regression, found by the real-Redis CI job: dropped clients kept their
+    sockets open, and one collected after its event loop had closed raised
+    "Event loop is closed" on the way out.
+    """
+
+    async def test_a_client_a_call_failed_on_is_closed(self, redis_server, redis_url):
+        instance = make_broker(redis_server, "api-1")
+        client = instance._redis
+        await client.ping()
+        assert open_connections(client), "the test needs a connection to be open"
+
+        instance._lost_redis(ConnectionError("gone"), "Probe", "dropped", client)
+        await asyncio.wait_for(instance.stop(), FAIL_AFTER)
+
+        assert open_connections(client) == [], "the dropped client kept its socket"
+        assert instance._closers == set()
+        await instance.manager.stop()
+
+    async def test_a_failure_on_a_replaced_client_leaves_the_new_one_alone(
+        self, redis_server, redis_url
+    ):
+        """A call that failed on an old client must not throw away a working one."""
+        instance = make_broker(redis_server, "api-1")
+        old = client_for(redis_server)
+        await old.ping()
+        current = instance._redis
+        try:
+            instance._lost_redis(ConnectionError("gone"), "Probe", "dropped", old)
+            assert instance._redis is current
+            assert await current.ping() is True
+        finally:
+            await shut(instance)
+        assert open_connections(old) == []
+
+    async def test_the_client_a_lost_subscription_used_is_closed(self, reconnecting):
+        server = reconnecting
+        listener = make_broker(server, "api-2")
+        first = listener._redis
+        try:
+            await listening(listener)
+            server.connected = False
+            await until(listener, lambda: not listener.subscribed.is_set())
+            server.connected = True
+            await until(listener, listener.subscribed.is_set)
+            assert listener._redis is not first
+        finally:
+            await shut(listener)
+        assert open_connections(first) == [], "the client given up on kept its socket"
+
+
 @pytest.mark.asyncio
 class TestRevocation:
     async def test_a_revoked_token_closes_its_sockets_on_every_instance(

@@ -133,8 +133,10 @@ jobs:
 
       # fakeredis cannot show what breaks a pub/sub subscriber in production --
       # read timeouts on a quiet channel, killed connections, a server that
-      # stops answering. This runs the realtime layer against the real thing,
-      # and fails rather than passing if the tests were skipped.
+      # stops answering. This runs the realtime layer against the real thing.
+      # It passes only if tests ran and none failed, errored or was skipped
+      # (counted from JUnit XML, not read off the log), and nothing was left
+      # for the garbage collector to close.
       - name: Realtime against a real Redis
         if: ${{ !cancelled() }}
         working-directory: backend
@@ -142,15 +144,30 @@ jobs:
           REALTIME_REDIS_URL: redis://localhost:6379/15
         run: |
           set -o pipefail
-          pytest tests/test_realtime_redis.py -m redis -rfEs 2>&1 | tee realtime-redis.log
-          summary="$(tail -n 1 realtime-redis.log)"
-          echo "::notice title=Realtime on real Redis (py${{ matrix.python-version }})::${summary}"
-          case "$summary" in
-            *skipped*|*"no tests ran"*)
-              echo "::error::Real-Redis tests did not run: ${summary}"
-              exit 1
-              ;;
-          esac
+          pytest tests/test_realtime_redis.py -m redis -rfEs \
+            -W error::pytest.PytestUnraisableExceptionWarning \
+            --junitxml=realtime-redis.xml 2>&1 | tee realtime-redis.log
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("realtime-redis.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          n = {key: int(suite.get(key, 0)) for key in ("tests", "failures", "errors", "skipped")}
+          passed = n["tests"] - n["failures"] - n["errors"] - n["skipped"]
+          summary = (
+              f"{n['tests']} tests: {passed} passed, {n['failures']} failed, "
+              f"{n['errors']} errors, {n['skipped']} skipped"
+          )
+          print(f"::notice title=Realtime on real Redis (py${{ matrix.python-version }})::{summary}")
+          if n["tests"] == 0 or n["skipped"] or n["failures"] or n["errors"]:
+              print(f"::error::Real-Redis tests did not all run and pass: {summary}")
+              sys.exit(1)
+          PY
+          if grep -nE "Exception ignored in|Event loop is closed|unclosed Connection|Unclosed client" realtime-redis.log; then
+            echo "::error::A Redis connection was left for the garbage collector to close (see lines above)"
+            exit 1
+          fi
 
       - name: Upload coverage and test reports
         if: always() && matrix.python-version == '3.11'

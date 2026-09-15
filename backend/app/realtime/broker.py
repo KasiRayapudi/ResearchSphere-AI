@@ -137,6 +137,8 @@ class EventBroker:
         #: health check or a test, clears it and waits for the next change
         #: instead of polling for one.
         self.changed = asyncio.Event()
+        #: Clients being closed in the background; see ``_discard``.
+        self._closers: set[asyncio.Task] = set()
         #: The loop this broker was started on. Captured so a thread that is
         #: not the loop -- inline ingestion runs in one -- can hand work back
         #: to it. None in a process with no loop at all, such as a real
@@ -179,20 +181,48 @@ class EventBroker:
         self.stats[stat] += by
         self.changed.set()
 
-    def _lost_redis(self, exc: Exception, attempt: str, fallback: str) -> None:
+    def _lost_redis(self, exc: Exception, attempt: str, fallback: str, client=None) -> None:
         """A Redis call failed: fall back, and leave Redis alone for a while.
 
-        The client is dropped so the next attempt starts on a fresh
-        connection, and the same window a failed connect opens is opened
-        here. Without it a Redis that has stopped answering costs every call
-        its full command timeout, and a handshake makes several: each new
-        socket would stall for many seconds instead of one call paying once
-        per window.
+        ``client`` is the one the call failed on. It is closed, and dropped
+        if it is still the broker's current client -- not if another call has
+        already replaced it with a working one -- so the next attempt starts
+        on a fresh connection. The same window a failed connect opens is
+        opened here. Without it a Redis that has stopped answering costs
+        every call its full command timeout, and a handshake makes several:
+        each new socket would stall for many seconds instead of one call
+        paying once per window.
         """
+        failed = client if client is not None else self._redis
+        if self._redis is failed:
+            self._redis = None
+        self._discard(failed)
         self._tally("redis_errors")
-        self._redis = None
         self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
         logger.warning(f"{attempt} failed ({exc}); {fallback}.")
+
+    def _discard(self, client) -> None:
+        """Close a client this broker has stopped using.
+
+        Dropping the reference was not enough: its pooled connections stayed
+        open until garbage collection, and one collected after its event loop
+        had closed raised "Event loop is closed" on the way out. The close
+        runs in the background so the failing call is not held up by it, and
+        ``stop`` waits for any still running.
+        """
+        if client is None:
+            return
+
+        async def close() -> None:
+            with contextlib.suppress(Exception):
+                # The pool explicitly: aclose() alone closes it only for a
+                # client flagged as owning it, and this broker owns every
+                # client it discards.
+                await client.aclose(close_connection_pool=True)
+
+        closer = asyncio.ensure_future(close())
+        self._closers.add(closer)
+        closer.add_done_callback(self._closers.discard)
 
     # ------------------------------------------------------------ lifecycle --
     async def start(self) -> None:
@@ -239,8 +269,12 @@ class EventBroker:
             self._subscriber = None
         if self._redis is not None:
             with contextlib.suppress(Exception):
-                await self._redis.aclose()
+                await self._redis.aclose(close_connection_pool=True)
             self._redis = None
+        if self._closers:
+            # Clients given up on earlier and still closing: nothing this
+            # broker opened may outlive it.
+            await asyncio.wait(list(self._closers), timeout=CONNECT_TIMEOUT_SECONDS + 1)
 
     @staticmethod
     def _redis_configured() -> bool:
@@ -267,18 +301,27 @@ class EventBroker:
                 socket_timeout=COMMAND_TIMEOUT_SECONDS,
                 decode_responses=True,
             )
-            await client.ping()
-            self._redis = client
-            return client
         except Exception as exc:
-            self._tally("redis_errors")
-            self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
-            logger.warning(
-                f"Realtime Redis unavailable ({exc}); staying process-local for "
-                f"{UNAVAILABLE_BACKOFF_SECONDS:.0f}s."
-            )
-            self._redis = None
+            self._unreachable(exc)
             return None
+        try:
+            await client.ping()
+        except Exception as exc:
+            # A client whose first command failed may still hold a socket.
+            self._discard(client)
+            self._unreachable(exc)
+            return None
+        self._redis = client
+        return client
+
+    def _unreachable(self, exc: Exception) -> None:
+        self._tally("redis_errors")
+        self._unavailable_until = time.monotonic() + UNAVAILABLE_BACKOFF_SECONDS
+        logger.warning(
+            f"Realtime Redis unavailable ({exc}); staying process-local for "
+            f"{UNAVAILABLE_BACKOFF_SECONDS:.0f}s."
+        )
+        self._redis = None
 
     # ------------------------------------------------------------- publish --
     async def publish(self, event: Event) -> Event:
@@ -318,7 +361,7 @@ class EventBroker:
                 seq, _, epoch = await pipe.execute()
                 return int(seq), str(epoch)
             except Exception as exc:
-                self._lost_redis(exc, "Sequence allocation", "using the local counter")
+                self._lost_redis(exc, "Sequence allocation", "using the local counter", client)
 
         # Process-local: the epoch is this process, so a restart -- including
         # every dev-server reload -- is visible to clients as an epoch change.
@@ -342,7 +385,7 @@ class EventBroker:
                 seq, _, epoch = await pipe.execute()
                 return int(seq or 0), str(epoch)
             except Exception as exc:
-                self._lost_redis(exc, "Position lookup", "using the local counter")
+                self._lost_redis(exc, "Position lookup", "using the local counter", client)
 
         async with self._local_lock:
             return self._local_seq.get(workspace_id, 0), self.instance_id
@@ -357,7 +400,7 @@ class EventBroker:
                     return 0
                 return Event.from_wire(json.loads(raw)).seq
             except Exception as exc:
-                self._lost_redis(exc, "Replay log read", "using the local buffer")
+                self._lost_redis(exc, "Replay log read", "using the local buffer", client)
 
         async with self._local_lock:
             log = self._local_log.get(workspace_id)
@@ -376,7 +419,7 @@ class EventBroker:
                 await pipe.execute()
                 return
             except Exception as exc:
-                self._lost_redis(exc, "Replay log append", "using the local buffer")
+                self._lost_redis(exc, "Replay log append", "using the local buffer", client)
 
         async with self._local_lock:
             self._local_log[event.workspace_id].append(event)
@@ -391,7 +434,7 @@ class EventBroker:
             payload["origin"] = self.instance_id
             await client.publish(CHANNEL, json.dumps(payload))
         except Exception as exc:
-            self._lost_redis(exc, "Realtime fan-out", "the event stayed process-local")
+            self._lost_redis(exc, "Realtime fan-out", "the event stayed process-local", client)
 
     async def revoke_token(self, token_id: str) -> int:
         """Close every socket, on every instance, that opened with this token.
@@ -421,7 +464,7 @@ class EventBroker:
                 )
             except Exception as exc:
                 self._lost_redis(
-                    exc, "Revocation fan-out", "other instances close at their next sweep"
+                    exc, "Revocation fan-out", "other instances close at their next sweep", client
                 )
         return closed
 
@@ -466,7 +509,8 @@ class EventBroker:
                 continue  # _listen returned: the broker is stopping
             deaf = True
             self.subscribed.clear()
-            self._redis = None
+            dropped, self._redis = self._redis, None
+            self._discard(dropped)
             self._tally("redis_errors")
             logger.warning(f"Realtime subscriber dropped ({failure}); retrying in {delay}s.")
             # Backing off matters: a Redis that is down stays down for a
@@ -629,7 +673,7 @@ class EventBroker:
                     with contextlib.suppress(TypeError, ValueError):
                         events.append(Event.from_wire(json.loads(raw)))
             except Exception as exc:
-                self._lost_redis(exc, "Replay read", "falling back to the local buffer")
+                self._lost_redis(exc, "Replay read", "falling back to the local buffer", client)
                 events = []
 
         if not events:
