@@ -195,7 +195,10 @@ jobs:
           cache-from: type=gha,scope=frontend
 
       - name: Trivy - backend
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned by commit, not tag: trivy-action's tags were rewritten in the
+        # March 2026 supply-chain attack and re-issued with a `v` prefix, which
+        # is why `0.28.0` stopped resolving. ed142fd = v0.36.0.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: researchsphere/backend:scan
           format: sarif
@@ -204,7 +207,10 @@ jobs:
           ignore-unfixed: true
 
       - name: Trivy - frontend
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned by commit, not tag: trivy-action's tags were rewritten in the
+        # March 2026 supply-chain attack and re-issued with a `v` prefix, which
+        # is why `0.28.0` stopped resolving. ed142fd = v0.36.0.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: researchsphere/frontend:scan
           format: sarif
