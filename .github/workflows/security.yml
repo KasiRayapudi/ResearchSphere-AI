@@ -218,12 +218,23 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-      - name: Upload results to code scanning
+      # One upload per image, each with its own category. Code scanning rejects
+      # several SARIF runs under one category, which uploading the directory
+      # under `trivy` did. Each runs only if its scan wrote a report, so a scan
+      # that failed is reported as itself rather than as a missing file.
+      - name: Upload backend results to code scanning
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always() && hashFiles('trivy-backend.sarif') != ''
         with:
-          sarif_file: .
-          category: trivy
+          sarif_file: trivy-backend.sarif
+          category: trivy-backend
+
+      - name: Upload frontend results to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('trivy-frontend.sarif') != ''
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: trivy-frontend
 
       - uses: actions/upload-artifact@v4
         if: always()
