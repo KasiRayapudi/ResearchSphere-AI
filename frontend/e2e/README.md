@@ -29,19 +29,52 @@ python -m celery -A app.worker.celery_app:celery_app worker --loglevel info --co
 npm run test:e2e
 ```
 
-`global-setup.ts` waits for `/api/ready`. In CI it also requires the database,
-Redis and Qdrant to be reachable and fails immediately if they are not.
-Locally it reports what is missing and carries on, so a partial stack can be
-used deliberately -- the tests that need those services will fail on their own
-terms rather than being skipped.
+`global-setup.ts` waits for `/api/ready`. In CI it requires the database, Redis
+and Qdrant to report `ok` and fails the run immediately if any of them does
+not. It asserts those three by name rather than the endpoint's status code,
+because `/api/ready` also covers `GEMINI_API_KEY`, which none of these journeys
+use and which CI holds no key for: a completely healthy end-to-end stack still
+answers 503 there. Locally the setup reports what is missing and carries on, so
+a partial stack can be used deliberately -- the tests that need those services
+fail on their own terms rather than being skipped.
+
+In CI the whole stack is provided by the `End-to-end (browser)` job in
+`.github/workflows/ci.yml`, which runs Postgres, Redis and Qdrant as services
+and starts the API and a Celery worker before the browser does anything.
+
+## What a local partial stack shows
+
+Without Qdrant, an upload is still validated, stored and picked up for
+ingestion, and the document reaches `queued` and `processing` -- then indexing
+fails at the vector upsert and the document ends as `failed`. So a local run
+proves the browser-to-API-to-storage half of the journey; `indexed`, the vector
+write and Celery-backed processing are only exercised where the full stack
+runs, which is the CI job above.
 
 ## Accounts and data
 
 Each test registers its own account through the API, and signup creates that
 account's workspace. Passwords are generated per account at run time, so no
-credentials are committed and no test depends on data that already exists.
+credentials are committed and no test depends on data that already exists. The
+generator alternates a letter with a non-letter so that it cannot accidentally
+produce something the password policy rejects -- a character repeated three
+times, or a run like `abcd` -- which a purely random string does about 7% of
+the time.
 Documents uploaded by a test carry unique content, which keeps them clear of
 the duplicate detection the upload pipeline performs.
+
+## Rate limiting
+
+The API limits every `/auth/` path to 20 requests a minute per client IP, and
+the SPA calls `/auth/me` on each mount. One run of this suite costs roughly ten
+of those requests, so it fits comfortably -- but two runs started inside the
+same minute do not, and the second one fails with the app refusing logins.
+That is the rate limiter doing its job, not a flaky test.
+
+Signup and login therefore happen once per worker, and specs that are not about
+the sign-in form start from a page seeded with those tokens through the same
+`localStorage` contract the app uses. When running the suite repeatedly by
+hand, leave a minute between runs.
 
 ## Determinism
 

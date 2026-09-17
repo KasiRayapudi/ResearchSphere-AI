@@ -200,6 +200,7 @@ export const DocumentManagerPage: React.FC = () => {
         <Button
           variant="primary"
           size="sm"
+          data-testid="open-upload"
           onClick={() => setUploadModalOpen(true)}
           icon={<Upload className="h-4 w-4" />}
         >
@@ -290,7 +291,11 @@ export const DocumentManagerPage: React.FC = () => {
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-slate-200">
               {pagedDocs.map((doc) => (
-                <tr key={doc.id} className="hover:bg-slate-900/60 transition-colors">
+                <tr
+                  key={doc.id}
+                  data-testid="document-row"
+                  className="hover:bg-slate-900/60 transition-colors"
+                >
                   <td className="p-4 font-semibold text-slate-100 flex items-center gap-3">
                     <div className="p-2 rounded-lg bg-slate-800 text-brand-400 border border-slate-700">
                       <FileText className="h-4 w-4" />
@@ -305,7 +310,7 @@ export const DocumentManagerPage: React.FC = () => {
                   <td className="p-4 font-mono uppercase text-slate-400">{doc.fileType}</td>
                   <td className="p-4 font-mono text-slate-400">{(doc.fileSizeKb / 1024).toFixed(1)} MB</td>
                   <td className="p-4 font-mono text-brand-300 font-bold">{doc.chunkCount}</td>
-                  <td className="p-4">
+                  <td className="p-4" data-testid="document-status">
                     <Badge variant={doc.status === 'indexed' ? 'success' : 'warning'} size="sm">
                       {doc.status}
                     </Badge>

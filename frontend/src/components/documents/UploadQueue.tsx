@@ -403,7 +403,12 @@ export const UploadQueue: React.FC<UploadQueueProps> = ({
           </div>
           <ul className="max-h-64 space-y-1 overflow-y-auto p-2">
             {items.map((item) => (
-              <li key={item.id} className="rounded-lg bg-slate-900/60 p-2.5">
+              <li
+                key={item.id}
+                data-testid="upload-item"
+                data-upload-status={item.status}
+                className="rounded-lg bg-slate-900/60 p-2.5"
+              >
                 <div className="flex items-center gap-2.5">
                   <span className="shrink-0">
                     {item.status === 'uploading' && (

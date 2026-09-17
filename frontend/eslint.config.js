@@ -45,6 +45,11 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } },
     // Playwright names a fixture's callback parameter `use`, which the React
     // Hooks rule reads as the `use` hook. There is no React in these files.
-    rules: { 'react-hooks/rules-of-hooks': 'off' },
+    rules: {
+      'react-hooks/rules-of-hooks': 'off',
+      // Playwright requires a fixture callback's first parameter to be an
+      // object pattern, even when the fixture depends on nothing.
+      'no-empty-pattern': 'off',
+    },
   },
 );

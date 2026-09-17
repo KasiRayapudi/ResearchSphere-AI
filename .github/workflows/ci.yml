@@ -370,12 +370,227 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ---------------------------------------------------------------- e2e --
+  # The unit suites prove the pieces; this proves the product. A real browser
+  # drives the frontend against a real API, Postgres, Redis, Qdrant and a Celery
+  # worker, so an upload travels the same path it does in production. Nothing
+  # here is mocked or stubbed, and nothing is allowed to skip: if a service is
+  # missing, the Playwright global setup fails the job before the first test
+  # runs. The frontend is served by the Vite dev server, whose proxy makes /api
+  # and the WebSocket upgrade same-origin exactly as the production reverse
+  # proxy does; the production bundle is covered by the Docker job above.
+  e2e:
+    name: End-to-end (browser)
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: researchsphere_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d researchsphere_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      # The image carries no shell utilities to probe itself with, so this one
+      # is waited for from the runner instead of by a container health check.
+      qdrant:
+        image: qdrant/qdrant:v1.8.0
+        ports:
+          - 6333:6333
+
+    env:
+      # The defaults in config.py already point at localhost on these ports,
+      # but an end-to-end job should state what it is testing against.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/researchsphere_db
+      QDRANT_HOST: localhost
+      QDRANT_PORT: "6333"
+      # A non-empty REDIS_URL is what routes ingestion through Celery and the
+      # realtime broker through Redis pub/sub rather than the inline fallbacks.
+      REDIS_URL: redis://localhost:6379/0
+      ENVIRONMENT: development
+      CORS_ORIGINS: http://localhost:3000
+      VIRUS_SCANNER: noop
+      UPLOAD_DIR: ${{ github.workspace }}/e2e-uploads
+      QUARANTINE_DIR: ${{ github.workspace }}/e2e-uploads/.quarantine
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_DEFAULT }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Set up Node ${{ env.NODE_DEFAULT }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_DEFAULT }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Chromium for Playwright
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      # Waited for here rather than by a service health check (see above). The
+      # loop asks the server itself, so it neither starts early nor sleeps for
+      # a fixed guess.
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:6333/collections >/dev/null 2>&1; then
+              echo "Qdrant is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Qdrant did not become ready"
+          exit 1
+
+      # A secret only this job ever sees, so no fixed key is committed and none
+      # has to be provisioned for CI to run.
+      - name: Generate a run-scoped SECRET_KEY
+        run: |
+          echo "SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(48))')" >> "$GITHUB_ENV"
+
+      - name: Apply database migrations
+        working-directory: backend
+        run: python -m alembic upgrade head
+
+      # The worker downloads the embedding model on its first task. Pulling it
+      # here keeps a cold cache out of the test timeouts; it is the same model
+      # the pipeline uses, fetched early, not a substitute for it.
+      - name: Warm the embedding model cache
+        working-directory: backend
+        run: python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+      - name: Start the API
+        working-directory: backend
+        run: |
+          mkdir -p "$UPLOAD_DIR" "$QUARANTINE_DIR"
+          python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level info             > "$GITHUB_WORKSPACE/api.log" 2>&1 &
+          echo $! > "$GITHUB_WORKSPACE/api.pid"
+
+      - name: Start the Celery worker
+        working-directory: backend
+        run: |
+          python -m celery -A app.worker.celery_app:celery_app worker             --loglevel info --concurrency 2 --hostname "ingest@%h" --queues celery             > "$GITHUB_WORKSPACE/worker.log" 2>&1 &
+          echo $! > "$GITHUB_WORKSPACE/worker.pid"
+
+      # Waiting for the API directly, before the browser is involved, so that a
+      # backend that failed to start is reported as exactly that rather than as
+      # an unreachable proxy. /api/live is exempt from rate limiting.
+      - name: Wait for the API
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/api/live >/dev/null 2>&1; then
+              echo "API is live"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The API did not come up"
+          tail -n 100 "$GITHUB_WORKSPACE/api.log"
+          exit 1
+
+      # A worker that never started would leave every document sitting in
+      # `queued`, which some assertions accept -- the job would look green while
+      # nothing was processed. Asking the worker to answer rules that out.
+      - name: Wait for the Celery worker
+        working-directory: backend
+        run: |
+          for _ in $(seq 1 45); do
+            if python -m celery -A app.worker.celery_app:celery_app inspect ping --timeout 5 2>/dev/null | grep -q pong; then
+              echo "Celery worker answered"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The Celery worker did not answer a ping"
+          tail -n 100 "$GITHUB_WORKSPACE/worker.log"
+          exit 1
+
+      # Playwright starts the frontend itself (webServer in playwright.config.ts)
+      # and its global setup blocks until the API reports database, redis and
+      # qdrant reachable, failing the job if any of them is not.
+      - name: Run end-to-end tests
+        working-directory: frontend
+        env:
+          CI: "true"
+        run: npm run test:e2e
+
+      - name: Show service logs
+        if: always()
+        run: |
+          for name in api worker; do
+            echo "::group::$name log"
+            if [ -f "$GITHUB_WORKSPACE/$name.log" ]; then
+              tail -n 200 "$GITHUB_WORKSPACE/$name.log"
+            else
+              echo "no $name.log was written"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Stop background services
+        if: always()
+        run: |
+          for name in api worker; do
+            pidfile="$GITHUB_WORKSPACE/$name.pid"
+            [ -f "$pidfile" ] || continue
+            if kill "$(cat "$pidfile")" 2>/dev/null; then
+              echo "stopped $name"
+            else
+              echo "$name was no longer running"
+            fi
+          done
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 14
+
   # ------------------------------------------------------------------- gate --
   ci-passed:
     name: CI passed
     runs-on: ubuntu-latest
     if: always()
-    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build]
+    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build, e2e]
     steps:
       # A single required status check for branch protection. Without this,
       # protection rules have to enumerate every matrix leg by name.
