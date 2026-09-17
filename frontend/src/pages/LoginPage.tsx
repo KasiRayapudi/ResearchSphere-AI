@@ -1,23 +1,46 @@
 import React, { useState } from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { Sparkles, ArrowRight, Lock, Mail, Github } from 'lucide-react';
 import { Button } from '../components/common/Button';
 import { Input } from '../components/common/Input';
 import { useAuth } from '../contexts/AuthContext';
+import { useToast } from '../contexts/ToastContext';
+import { ApiError } from '../services/apiClient';
+import { AlertCircle } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
-  const [email, setEmail] = useState('alex.vance@enterprise-ai.io');
-  const [password, setPassword] = useState('••••••••••••');
+  // Demo credentials removed: they leaked a real seeded account and the
+  // bullet-character "password" was never a valid credential.
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const { login } = useAuth();
+  const toast = useToast();
   const navigate = useNavigate();
+  const location = useLocation() as { state?: { from?: string } };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading) return;
+    setFormError(null);
     setIsLoading(true);
-    await login(email, password);
-    setIsLoading(false);
-    navigate('/dashboard');
+    try {
+      await login(email, password);
+      // Return the user to whatever they were trying to reach.
+      navigate(location.state?.from ?? '/dashboard', { replace: true });
+    } catch (err) {
+      const message =
+        err instanceof ApiError && err.status === 401
+          ? 'Incorrect email or password.'
+          : err instanceof Error
+            ? err.message
+            : 'Sign in failed.';
+      setFormError(message);
+      toast.fromError(err, 'Sign in failed');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -33,10 +56,21 @@ export const LoginPage: React.FC = () => {
           <p className="text-xs text-slate-400">Sign in to your ResearchSphere AI workspace</p>
         </div>
 
+        {formError && (
+          <div
+            role="alert"
+            className="mb-4 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200"
+          >
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{formError}</span>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
           <Input
             label="Work Email"
             type="email"
+            data-testid="login-email"
             placeholder="alex@company.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
@@ -51,6 +85,7 @@ export const LoginPage: React.FC = () => {
             </div>
             <Input
               type="password"
+              data-testid="login-password"
               placeholder="••••••••"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -59,7 +94,7 @@ export const LoginPage: React.FC = () => {
             />
           </div>
 
-          <Button type="submit" variant="primary" className="w-full" isLoading={isLoading} icon={<ArrowRight className="h-4 w-4" />}>
+          <Button type="submit" variant="primary" data-testid="login-submit" className="w-full" isLoading={isLoading} icon={<ArrowRight className="h-4 w-4" />}>
             Sign In to Workspace
           </Button>
         </form>

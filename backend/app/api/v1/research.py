@@ -1,91 +1,126 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.core.database import get_db
-from app.core.security import get_current_user
-from app.models.user import User
-from app.models.workspace import Workspace
-from app.models.report import Report as ReportModel
-from app.models.document import Document
-from app.models.chat import ChatSession
+
 from app.agents.graph import LangGraphResearchEngine
-from typing import Optional, List
-import uuid
-from datetime import datetime
+from app.core import metrics
+from app.core.database import get_db
+from app.core.pagination import Page, PageParams, page_params, paginate
+from app.core.security import get_current_user, resolve_workspace
+from app.core.workspace_access import require_workspace_role
+from app.models.report import Report as ReportModel
+from app.models.user import User
 
 router = APIRouter()
 engine = LangGraphResearchEngine()
 
+
 class StartResearchRequest(BaseModel):
     title: str
     objective: str
-    workspace_id: Optional[str] = None
+    workspace_id: str | None = None
+
+
+RESEARCH_SORTS = {
+    "createdAt": ReportModel.created_at,
+    "updatedAt": ReportModel.updated_at,
+    "title": ReportModel.title,
+    "status": ReportModel.status,
+}
+
 
 @router.get("")
 async def get_sessions(
-    workspace_id: Optional[str] = None,
+    request: Request,
+    workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    # For MVP, we can return generated research sessions mapped to Reports or ChatSessions
-    # Or query from DB. Let's fetch from Report table since report represents a compiled agent research session!
-    reports = db.query(ReportModel).filter(
-        ReportModel.workspace_id == workspace_id,
-        ReportModel.user_id == current_user.id
-    ).order_by(ReportModel.created_at.desc()).all()
+    query = db.query(ReportModel).filter(
+        ReportModel.workspace_id == ws.id, ReportModel.user_id == current_user.id
+    )
+    page = paginate(
+        query,
+        params,
+        sortable=RESEARCH_SORTS,
+        default_sort="createdAt",
+        tiebreaker=ReportModel.id,
+        searchable=[ReportModel.title, ReportModel.query],
+    )
+    return page.envelope(
+        [
+            {
+                "id": r.id,
+                "title": r.title,
+                "objective": r.query,
+                "workspaceId": r.workspace_id,
+                "status": r.status,
+                "progressPercentage": 100 if r.status == "ready" else 0,
+                "sourcesCount": len(r.source_document_ids or []),
+                "createdAt": r.created_at.isoformat(),
+                "updatedAt": r.updated_at.isoformat(),
+                # The trace recorded by the run that produced this report.
+                # Empty for reports generated before it was persisted, which
+                # is accurate: theirs was never recorded.
+                "agentSteps": [
+                    {
+                        "id": f"as-{idx}",
+                        "agentName": step.get("agent"),
+                        "status": step.get("status"),
+                        "task": step.get("task"),
+                        "executionTimeMs": step.get("time_ms"),
+                        "timestamp": r.created_at.isoformat(),
+                    }
+                    for idx, step in enumerate(r.agent_trace or [])
+                ],
+            }
+            for r in page.items
+        ]
+    )
 
-    return [
-        {
-            "id": r.id,
-            "title": r.title,
-            "objective": r.query,
-            "workspaceId": r.workspace_id,
-            "status": r.status,
-            "progressPercentage": 100 if r.status == "ready" else 40,
-            "sourcesCount": len(r.source_document_ids or []),
-            "createdAt": r.created_at.isoformat(),
-            "updatedAt": r.updated_at.isoformat(),
-            "agentSteps": [
-                {"id": "s-1", "agentName": "Planner", "status": "completed", "task": "Decomposed objective into 4 subtasks", "executionTimeMs": 75, "timestamp": "1 min ago"},
-                {"id": "s-2", "agentName": "Retriever", "status": "completed", "task": f"Fetched references from knowledge base", "executionTimeMs": 120, "timestamp": "1 min ago"},
-                {"id": "s-3", "agentName": "Researcher", "status": "completed", "task": "Synthesized summary review", "executionTimeMs": 450, "timestamp": "Just now"},
-                {"id": "s-4", "agentName": "Critic", "status": "completed", "task": "Factual verification check passed", "executionTimeMs": 110, "timestamp": "Just now"},
-            ]
-        }
-        for r in reports
-    ]
 
 @router.post("/start")
 async def start_session(
+    request: Request,
     payload: StartResearchRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    if not payload.workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Workspace required")
-        workspace_id = ws.id
-    else:
-        workspace_id = payload.workspace_id
+    ws = resolve_workspace(payload.workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Workspace required")
+    # Same as reports: this writes a record and runs the agent graph.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
+    workspace_id = ws.id
 
-    # 1. Run multi-agent LangGraph workflow
+    # 1. Run multi-agent LangGraph workflow.
+    #
+    # run_graph is synchronous and does network I/O; see reports.generate_report
+    # for why it must not be called inline from an async handler.
     try:
-        graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LangGraph execution failed: {str(e)}"
+        graph_output = await run_in_threadpool(
+            engine.run_graph, payload.objective, workspace_id=workspace_id
         )
+    except Exception as e:
+        metrics.safe(metrics.research_sessions_total.labels(outcome="failed").inc)
+        raise HTTPException(status_code=500, detail=f"LangGraph execution failed: {str(e)}") from e
 
     final_report_data = graph_output.get("final_report") or {}
-    
+
     # 2. Save final synthesized report in database
     report = ReportModel(
         workspace_id=workspace_id,
@@ -94,16 +129,30 @@ async def start_session(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact checked by Critic Agent. Confidence score: " + str(graph_output.get("confidence_score", 0.95)),
+        # Report what the critic concluded rather than asserting verification
+        # and defaulting the score to 0.95.
+        technical_analysis=(
+            (
+                "Critic agent verified the synthesis against retrieved sources. "
+                if graph_output.get("critic_verified")
+                else "Critic agent could not verify the synthesis against retrieved sources. "
+            )
+            + f"Confidence score: {graph_output.get('confidence_score', 0.0)}."
+        ),
+        agent_trace=graph_output.get("agent_trace", []),
+        confidence_score=graph_output.get("confidence_score", 0.0),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
-        source_document_ids=[c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")],
+        source_document_ids=[
+            c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")
+        ],
         format="markdown",
-        status="ready"
+        status="ready",
     )
     db.add(report)
     db.commit()
     db.refresh(report)
+    metrics.safe(metrics.research_sessions_total.labels(outcome="success").inc)
 
     # 3. Return payload mapping visual agent graph steps
     return {
@@ -123,8 +172,8 @@ async def start_session(
                 "status": trace.get("status"),
                 "task": trace.get("task"),
                 "executionTimeMs": trace.get("time_ms"),
-                "timestamp": "Just now"
+                "timestamp": report.created_at.isoformat(),
             }
             for idx, trace in enumerate(graph_output.get("agent_trace", []))
-        ]
+        ],
     }

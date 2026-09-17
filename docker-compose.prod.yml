@@ -1,0 +1,312 @@
+###############################################################################
+# ResearchSphere AI - production stack.
+#
+#   cp .env.prod.example .env.prod   # then fill in real secrets
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Differences from docker-compose.yml (which stays as the development stack):
+#   - multi-stage production images, all running as non-root
+#   - nginx edge proxy is the only published port; nothing else is exposed
+#   - datastore ports are NOT published to the host
+#   - healthchecks gate startup ordering via depends_on/service_healthy
+#   - restart policies, resource limits and log rotation on every service
+#   - required secrets have no defaults, so the stack refuses to start without
+#     them rather than silently using a well-known value
+###############################################################################
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------ edge --
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: rs-nginx
+    <<: *default-restart
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      # Uncomment together with the TLS block in nginx/conf.d/.
+      # - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - certbot_www:/var/www/certbot
+      - nginx_logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    networks: [frontend_net, backend_net]
+
+  # -------------------------------------------------------------- frontend --
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        # Same-origin: the edge proxy routes /api to the backend.
+        VITE_API_URL: /api
+    image: researchsphere/frontend:${IMAGE_TAG:-latest}
+    container_name: rs-frontend
+    <<: *default-restart
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    networks: [frontend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+
+  # --------------------------------------------------------------- backend --
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    container_name: rs-backend
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment: &backend_env
+      ENVIRONMENT: production
+      DEBUG: "false"
+      # `?err` makes compose refuse to start when the value is missing, rather
+      # than falling back to a committed default as the dev stack once did.
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+      DATABASE_URL: postgresql://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-researchsphere_docs}
+      FRONTEND_URL: ${FRONTEND_URL:?FRONTEND_URL is required}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:?TRUSTED_HOSTS is required}
+      UPLOAD_DIR: /app/uploads
+      QUARANTINE_DIR: /app/uploads/.quarantine
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-30}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      GRACEFUL_TIMEOUT: ${GRACEFUL_TIMEOUT:-30}
+    expose:
+      - "8000"
+    volumes:
+      # Uploaded source files must survive redeploys; without this they are
+      # lost while their database rows and vectors remain.
+      - uploads_data:/app/uploads
+      # Persist the embedding model so a restarted container does not
+      # re-download it on the first request.
+      - model_cache:/home/appuser/.cache
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/api/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    # Allow in-flight SSE streams and uploads to finish before SIGKILL.
+    stop_grace_period: 45s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+
+  # --------------------------------------------------------------- worker --
+  # Document ingestion: extraction, chunking, embedding and the vector
+  # upsert. Runs the same image as the API with a different entrypoint
+  # command, so there is one artefact to build, scan and promote.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    container_name: rs-worker
+    command: ["worker"]
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *backend_env
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
+    volumes:
+      # The worker reads the files the API stored, so it needs the same
+      # volume. Without this every ingest fails with a missing file.
+      - uploads_data:/app/uploads
+      # Shared with the API so the embedding model is downloaded once.
+      - model_cache:/home/appuser/.cache
+    healthcheck:
+      test: ["CMD", "python", "-m", "celery", "-A", "app.worker.celery_app:celery_app", "inspect", "ping", "-d", "ingest@$$HOSTNAME"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    # Long enough for an in-flight document to finish rather than being
+    # redelivered; acks_late means an interrupted task is retried anyway.
+    stop_grace_period: 120s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 4G }
+
+  # Scheduler for the periodic reclaim of documents whose worker died.
+  # Exactly one of these may run: a second would duplicate every tick.
+  beat:
+    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    container_name: rs-beat
+    command: ["beat"]
+    <<: *default-restart
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    environment:
+      <<: *backend_env
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 4G }
+        reservations: { memory: 1G }
+
+  # -------------------------------------------------------------- postgres --
+  postgres:
+    image: postgres:16-alpine
+    container_name: rs-postgres
+    <<: *default-restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      # Checksums catch silent corruption; cheap to enable, impossible later.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    # Deliberately not published: the database is reachable only from the
+    # backend_net network. The development stack exposed 5432 to the host.
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1G }
+
+  # ---------------------------------------------------------------- qdrant --
+  qdrant:
+    image: qdrant/qdrant:v1.8.0
+    container_name: rs-qdrant
+    <<: *default-restart
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__LOG_LEVEL: INFO
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 2G }
+
+  # ----------------------------------------------------------------- redis --
+  redis:
+    image: redis:7-alpine
+    container_name: rs-redis
+    <<: *default-restart
+    # Password-protected and persistent: Redis holds the token blacklist, so
+    # losing it silently un-revokes logged-out sessions until they expire.
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      --appendonly yes
+      --maxmemory ${REDIS_MAXMEMORY:-256mb}
+      --maxmemory-policy noeviction
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 384M }
+
+networks:
+  # Split so the datastores are unreachable from the edge network.
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+  uploads_data:
+  model_cache:
+  nginx_logs:
+  certbot_www:

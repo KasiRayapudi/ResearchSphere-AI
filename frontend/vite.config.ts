@@ -4,6 +4,20 @@ import path from 'path';
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        // Split long-lived vendor code out of the app shell so an application
+        // change does not invalidate the whole bundle in users' caches.
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-motion': ['framer-motion'],
+          'vendor-markdown': ['react-markdown', 'remark-gfm'],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 700,
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -17,6 +31,9 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
+        // Upgrade requests for /api/v1/ws too; without this the dev server
+        // answers the WebSocket handshake itself and it never reaches the API.
+        ws: true,
       },
     },
   },

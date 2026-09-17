@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { Sparkles, Github, Twitter, Linkedin, Mail } from 'lucide-react';
+import { Sparkles, Github, Twitter, Linkedin } from 'lucide-react';
 
 export const Footer: React.FC = () => {
   return (

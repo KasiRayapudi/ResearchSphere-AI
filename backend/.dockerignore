@@ -1,0 +1,41 @@
+# Virtual environments - the local venv is multiple GB and must never enter
+# the build context, let alone the image.
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state that must never be baked into an image
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite3
+uploads/
+logs/
+*.log
+
+# VCS / editors / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Docs and tests are not needed at runtime
+README.md
+docs/
+tests/

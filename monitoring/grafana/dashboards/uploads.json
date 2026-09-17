@@ -1,0 +1,405 @@
+{
+  "uid": "rs-uploads",
+  "title": "ResearchSphere - Uploads",
+  "description": "Ingestion throughput and the security pipeline's rejection reasons.",
+  "tags": [
+    "researchsphere",
+    "uploads"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Upload outcomes",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_uploads_total{job=\"researchsphere-backend\"}[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejections by reason",
+      "description": "executable_content and content_mismatch indicate deliberately disguised files.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_upload_rejections_total{job=\"researchsphere-backend\"}[5m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Upload duration percentiles",
+      "description": "Ingestion is synchronous: extraction, chunking and embedding all happen inside the request.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(researchsphere_upload_duration_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(researchsphere_upload_duration_seconds_bucket{job=\"researchsphere-backend\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Documents and chunks indexed",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_documents_indexed_total{job=\"researchsphere-backend\"}[15m]))",
+          "legendFormat": "documents",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "sum(rate(researchsphere_document_chunks_total{job=\"researchsphere-backend\"}[15m]))",
+          "legendFormat": "chunks",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Quarantined (24h)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "increase(researchsphere_uploads_total{job=\"researchsphere-backend\",outcome=\"quarantined\"}[24h])",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Failed (24h)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "increase(researchsphere_uploads_total{job=\"researchsphere-backend\",outcome=\"failed\"}[24h])",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Duplicates ignored (24h)",
+      "description": "Deduplication working as intended - not an error.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "researchsphere-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "researchsphere-prometheus"
+          },
+          "expr": "increase(researchsphere_uploads_total{job=\"researchsphere-backend\",outcome=\"duplicate\"}[24h])",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    }
+  ]
+}

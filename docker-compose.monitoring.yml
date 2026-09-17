@@ -1,0 +1,101 @@
+###############################################################################
+# Monitoring stack: Prometheus + Grafana.
+#
+# Layered on top of the production stack rather than merged into it, so the
+# application can be deployed without monitoring and monitoring can be
+# restarted without touching the application:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.monitoring.yml \
+#     --env-file .env.prod up -d
+#
+# Grafana is published on 3001 and Prometheus on 9090 by default. Neither
+# should be reachable from the internet: bind them to localhost and reach them
+# over an SSH tunnel, or put them behind the edge proxy with authentication.
+###############################################################################
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: rs-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://localhost:9090}
+    ports:
+      # Bound to loopback by default; override PROMETHEUS_BIND to expose it.
+      - "${PROMETHEUS_BIND:-127.0.0.1}:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 1G }
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: rs-grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      # No default password: compose refuses to start rather than shipping
+      # admin/admin, which is how Grafana instances end up compromised.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:3001:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 512M }
+
+networks:
+  # Declared as external to the compose *project*, not the host: this must be
+  # the same network the production stack creates, so Prometheus can reach the
+  # backend by service name.
+  backend_net:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:

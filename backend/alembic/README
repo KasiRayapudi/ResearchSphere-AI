@@ -1,0 +1,2 @@
+Alembic migrations. See backend/migrations/README.md for when to run
+`alembic upgrade head` versus `alembic stamp head`.

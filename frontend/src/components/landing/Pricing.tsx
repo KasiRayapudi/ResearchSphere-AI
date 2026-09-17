@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, Sparkles, Zap, Shield } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { Button } from '../common/Button';
 import { Card } from '../common/Card';
 

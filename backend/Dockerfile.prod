@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# ResearchSphere AI - production backend image
+#
+# Multi-stage so the compiler toolchain needed to build psycopg2 and friends
+# never ships in the runtime image. The dev Dockerfile is left untouched.
+###############################################################################
+
+# ---------------------------------------------------------------- builder ---
+FROM python:3.11-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Build-only dependencies. None of this reaches the final stage.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Dependencies are installed into a self-contained virtualenv that the runtime
+# stage copies wholesale. Copying requirements.txt first keeps this layer
+# cached across source-only changes.
+COPY requirements.txt .
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ---------------------------------------------------------------- runtime ---
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # Cache the sentence-transformers model inside the image-owned directory
+    # so a cold container does not download it on the first request.
+    HF_HOME=/home/appuser/.cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/home/appuser/.cache/sentence-transformers
+
+# Runtime-only OS packages:
+#   libpq5     - psycopg2 runtime (not libpq-dev)
+#   tini       - correct PID 1: forwards SIGTERM so uvicorn shuts down
+#                gracefully instead of being killed after the grace period
+#   curl       - container HEALTHCHECK
+#   tesseract  - retained from the original image for future OCR support
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        tini \
+        curl \
+        tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run as an unprivileged user. The original image ran everything as root.
+RUN groupadd --gid 10001 appuser \
+    && useradd --uid 10001 --gid appuser --create-home --shell /usr/sbin/nologin appuser
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+
+# Source last: it changes most often, so everything above stays cached.
+COPY --chown=appuser:appuser . .
+
+# Writable state lives in directories owned by the runtime user. Both are
+# mounted as volumes in production; creating them here keeps the image usable
+# standalone.
+RUN mkdir -p /app/uploads /app/uploads/.quarantine /home/appuser/.cache \
+    && chown -R appuser:appuser /app/uploads /home/appuser/.cache \
+    && chmod +x /app/docker-entrypoint.sh
+
+USER appuser
+
+EXPOSE 8000
+
+# Uses the readiness probe, so an instance whose database or vector store is
+# unreachable is reported unhealthy rather than merely "running".
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:8000/api/live || exit 1
+
+# tini reaps zombies and forwards signals; the entrypoint waits for
+# dependencies and then execs the server so it becomes PID 1's direct child.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
+CMD ["serve"]

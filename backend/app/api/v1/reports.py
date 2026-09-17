@@ -1,81 +1,137 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.core.database import get_db
-from app.core.security import get_current_user
-from app.models.user import User
-from app.models.workspace import Workspace
-from app.models.report import Report as ReportModel
+
 from app.agents.graph import LangGraphResearchEngine
-from typing import Optional, List
+from app.core import metrics
+from app.core.audit import AuditAction, AuditOutcome, audit
+from app.core.database import get_db
+from app.core.pagination import Page, PageParams, page_params, paginate
+from app.core.security import get_current_user, resolve_workspace
+from app.core.workspace_access import require_workspace_role
+from app.models.report import Report as ReportModel
+from app.models.user import User
 
 router = APIRouter()
 engine = LangGraphResearchEngine()
 
+
 class ReportGenerateRequest(BaseModel):
     title: str
     objective: str
-    workspace_id: Optional[str] = None
-    document_ids: List[str] = []
+    workspace_id: str | None = None
+    document_ids: list[str] = []
+
+
+REPORT_SORTS = {
+    "createdAt": ReportModel.created_at,
+    "title": ReportModel.title,
+    "status": ReportModel.status,
+}
+
 
 @router.get("")
 async def get_reports(
-    workspace_id: Optional[str] = None,
+    request: Request,
+    workspace_id: str | None = None,
+    params: PageParams = Depends(page_params),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    if not workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            return []
-        workspace_id = ws.id
+    ws = resolve_workspace(workspace_id, request, db, current_user)
+    if not ws:
+        return Page(
+            items=[],
+            page=params.page,
+            page_size=params.page_size,
+            total=0,
+            pages=1,
+            has_next=False,
+            has_previous=False,
+        ).envelope()
 
-    reports = db.query(ReportModel).filter(
-        ReportModel.workspace_id == workspace_id,
-        ReportModel.user_id == current_user.id
-    ).order_by(ReportModel.created_at.desc()).all()
+    query = db.query(ReportModel).filter(
+        ReportModel.workspace_id == ws.id, ReportModel.user_id == current_user.id
+    )
+    page = paginate(
+        query,
+        params,
+        sortable=REPORT_SORTS,
+        default_sort="createdAt",
+        tiebreaker=ReportModel.id,
+        searchable=[ReportModel.title, ReportModel.query],
+    )
+    return page.envelope(
+        [
+            {
+                "id": r.id,
+                "title": r.title,
+                "format": r.format,
+                "summary": r.executive_summary or "Executive Research synthesis",
+                "objective": r.query,
+                "generatedAt": r.created_at.isoformat(),
+                "author": current_user.full_name,
+                "sourceDocumentIds": r.source_document_ids or [],
+                "sections": [
+                    {"title": "Executive Summary", "content": r.executive_summary or ""},
+                    {"title": "Research Findings & Analysis", "content": r.findings or ""},
+                    {
+                        "title": "Technical Assessment & Limitation",
+                        "content": r.technical_analysis or "",
+                    },
+                ],
+            }
+            for r in page.items
+        ]
+    )
 
-    return [
-        {
-            "id": r.id,
-            "title": r.title,
-            "format": r.format,
-            "summary": r.executive_summary or "Executive Research synthesis",
-            "objective": r.query,
-            "generatedAt": r.created_at.isoformat(),
-            "author": current_user.full_name,
-            "sourceDocumentIds": r.source_document_ids or [],
-            "sections": [
-                {"title": "Executive Summary", "content": r.executive_summary or ""},
-                {"title": "Research Findings & Analysis", "content": r.findings or ""},
-                {"title": "Technical Assessment & Limitation", "content": r.technical_analysis or ""},
-            ]
-        }
-        for r in reports
-    ]
 
 @router.post("/generate")
 async def generate_report(
     payload: ReportGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    if not payload.workspace_id:
-        ws = db.query(Workspace).filter(Workspace.owner_id == current_user.id).first()
-        if not ws:
-            raise HTTPException(status_code=400, detail="Workspace required")
-        workspace_id = ws.id
-    else:
-        workspace_id = payload.workspace_id
+    ws = resolve_workspace(payload.workspace_id, request, db, current_user)
+    if not ws:
+        raise HTTPException(status_code=400, detail="Workspace required")
+    # Generating a report persists one, and costs an agent run.
+    require_workspace_role(request, ws, "content.write", current_user, db=db)
+    workspace_id = ws.id
 
-    # 1. Run RAG and LangGraph agent workflow to synthesize the report contents
+    # 1. Run RAG and LangGraph agent workflow to synthesize the report contents.
+    #
+    # run_graph is synchronous and does network I/O (vector search, Gemini).
+    # Calling it directly from this async handler blocked the event loop for
+    # the whole run and, because the retriever needs its own loop, made
+    # retrieval raise on every request. Offloading to a worker thread fixes
+    # both: other requests keep being served and the retriever works.
     try:
-        graph_output = engine.run_graph(payload.objective, workspace_id=workspace_id)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LangGraph failed to generate report: {str(e)}"
+        graph_output = await run_in_threadpool(
+            engine.run_graph,
+            payload.objective,
+            workspace_id=workspace_id,
+            document_ids=payload.document_ids or None,
         )
+    except Exception as e:
+        audit(
+            action=AuditAction.REPORT_GENERATE,
+            actor=current_user,
+            outcome=AuditOutcome.FAILURE,
+            resource="report:new",
+            request=request,
+            metadata={
+                "title": payload.title,
+                "workspace_id": workspace_id,
+                "reason": str(e)[:200],
+            },
+        )
+        metrics.safe(metrics.reports_generated_total.labels(outcome="failed").inc)
+        raise HTTPException(
+            status_code=500, detail=f"LangGraph failed to generate report: {str(e)}"
+        ) from e
 
     final_report_data = graph_output.get("final_report") or {}
 
@@ -87,16 +143,46 @@ async def generate_report(
         query=payload.objective,
         executive_summary=graph_output.get("synthesized_summary"),
         findings=final_report_data.get("markdown"),
-        technical_analysis="Fact verified by Critic Agent. Confidence level: " + str(graph_output.get("confidence_score", 0.95)),
+        # Report what the critic actually concluded. The previous text asserted
+        # "Fact verified" unconditionally and defaulted the score to 0.95, so a
+        # run with no evidence still claimed high confidence.
+        technical_analysis=(
+            (
+                "Critic agent verified the synthesis against retrieved sources. "
+                if graph_output.get("critic_verified")
+                else "Critic agent could not verify the synthesis against retrieved sources. "
+            )
+            + f"Confidence level: {graph_output.get('confidence_score', 0.0)}. "
+            + f"Supporting chunks retrieved: {len(graph_output.get('retrieved_chunks') or [])}."
+        ),
         references=graph_output.get("citations", []),
         content_markdown=final_report_data.get("markdown"),
-        source_document_ids=payload.document_ids or [c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")],
+        source_document_ids=payload.document_ids
+        or [
+            c.get("document_id") for c in graph_output.get("citations", []) if c.get("document_id")
+        ],
+        agent_trace=graph_output.get("agent_trace", []),
+        confidence_score=graph_output.get("confidence_score", 0.0),
         format="pdf",
-        status="ready"
+        status="ready",
     )
     db.add(report)
     db.commit()
     db.refresh(report)
+
+    metrics.safe(metrics.reports_generated_total.labels(outcome="success").inc)
+    audit(
+        action=AuditAction.REPORT_GENERATE,
+        actor=current_user,
+        outcome=AuditOutcome.SUCCESS,
+        resource=f"report:{report.id}",
+        request=request,
+        metadata={
+            "title": report.title,
+            "workspace_id": workspace_id,
+            "source_document_count": len(report.source_document_ids or []),
+        },
+    )
 
     return {
         "id": report.id,
@@ -111,5 +197,5 @@ async def generate_report(
             {"title": "Executive Summary", "content": report.executive_summary},
             {"title": "Research Findings & Analysis", "content": report.findings},
             {"title": "Technical Assessment & Limitation", "content": report.technical_analysis},
-        ]
+        ],
     }
