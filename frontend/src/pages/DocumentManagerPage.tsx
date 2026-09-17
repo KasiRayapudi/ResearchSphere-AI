@@ -309,7 +309,9 @@ export const DocumentManagerPage: React.FC = () => {
                   </td>
                   <td className="p-4 font-mono uppercase text-slate-400">{doc.fileType}</td>
                   <td className="p-4 font-mono text-slate-400">{(doc.fileSizeKb / 1024).toFixed(1)} MB</td>
-                  <td className="p-4 font-mono text-brand-300 font-bold">{doc.chunkCount}</td>
+                  <td className="p-4 font-mono text-brand-300 font-bold" data-testid="document-chunks">
+                    {doc.chunkCount}
+                  </td>
                   <td className="p-4" data-testid="document-status">
                     <Badge variant={doc.status === 'indexed' ? 'success' : 'warning'} size="sm">
                       {doc.status}

@@ -51,6 +51,11 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
   const checks = payload.checks ?? {};
   const missing = REQUIRED_SERVICES.filter((name) => checks[name] !== REACHABLE);
 
+  // Published for specs that cannot run without a given service. Worker
+  // processes inherit this, and it is only ever consulted outside CI: in CI the
+  // check below fails the run instead, so nothing can quietly not run.
+  process.env.E2E_MISSING_SERVICES = missing.join(',');
+
   const summary = missing.length > 0 ? `missing: ${missing.join(', ')}` : 'all required services reachable';
   const report = `[e2e] API answered /api/ready with ${status}; ${summary}. Checks: ${JSON.stringify(checks)}`;
 

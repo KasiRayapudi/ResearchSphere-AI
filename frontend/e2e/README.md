@@ -51,6 +51,16 @@ proves the browser-to-API-to-storage half of the journey; `indexed`, the vector
 write and Celery-backed processing are only exercised where the full stack
 runs, which is the CI job above.
 
+`indexing.spec.ts` therefore declares itself not runnable when those services
+are absent, rather than being left to fail every local run. That declaration is
+switched off in CI: `CI` is set on the job, and global setup has already failed
+the run if a service is unreachable, so the indexed journey cannot quietly not
+run. Its assertion is not relaxed anywhere -- `queued` and `processing` are
+never accepted, and `failed` fails the test rather than waiting out the clock.
+What that job proves beyond the green test is checked separately by its
+`Prove the indexing pipeline ran` step, which looks for this document's id in
+the worker's log and in Qdrant itself.
+
 ## Accounts and data
 
 Each test registers its own account through the API, and signup creates that

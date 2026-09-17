@@ -549,6 +549,115 @@ jobs:
           CI: "true"
         run: npm run test:e2e
 
+      # A green test says the UI showed `indexed`. This says *why* it could:
+      # that the task left the API for the broker, that the worker process (not
+      # the API's inline fallback) ran it, that the embedding stage executed,
+      # and that Qdrant holds points for this exact document. A healthy worker
+      # and a healthy Qdrant would prove none of that, so nothing here looks at
+      # service health -- it looks for this document id.
+      - name: Prove the indexing pipeline ran
+        working-directory: backend
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import urllib.request
+
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence_path = workspace / "frontend" / "test-results" / "indexed-document.json"
+          if not evidence_path.exists():
+              sys.exit(f"::error::The indexed test left no evidence at {evidence_path}")
+
+          evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+          document_id = evidence["documentId"]
+          api_log = (workspace / "api.log").read_text(encoding="utf-8", errors="replace")
+          worker_log = (workspace / "worker.log").read_text(encoding="utf-8", errors="replace")
+
+          failures = []
+
+          def require(condition, message):
+              if not condition:
+                  failures.append(message)
+
+          # 1. The API handed the task to the broker instead of doing it itself.
+          require(
+              f"Queued document {document_id} for indexing" in api_log,
+              f"the API never queued {document_id} to the broker",
+          )
+          for inline in ("is being indexed inline", "indexing inline instead"):
+              require(
+                  inline not in api_log,
+                  f"the API fell back to inline ingestion ({inline!r}) -- Celery did not do this work",
+              )
+
+          # 2. The worker process ran it, and got as far as the vector write.
+          require(
+              document_id in worker_log,
+              f"the worker log has no record of {document_id}",
+          )
+          require(
+              f"vectors for document {document_id}" in worker_log,
+              f"the worker never upserted vectors for {document_id}",
+          )
+          require(
+              "Embedding model loaded successfully" in worker_log,
+              "the worker never loaded the embedding model",
+          )
+
+          # 3. Qdrant itself holds points carrying this document id.
+          # Asked of the application's own settings, so this cannot drift from
+          # the collection the worker actually wrote to.
+          from app.core.config import settings
+
+          collection = settings.QDRANT_COLLECTION
+          request = urllib.request.Request(
+              f"http://localhost:6333/collections/{collection}/points/scroll",
+              data=json.dumps(
+                  {
+                      "filter": {"must": [{"key": "document_id", "match": {"value": document_id}}]},
+                      "limit": 100,
+                      "with_payload": True,
+                  }
+              ).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              scrolled = json.loads(response.read())
+          points = scrolled.get("result", {}).get("points", [])
+          require(points, f"Qdrant holds no points for document {document_id}")
+          require(
+              all(p.get("payload", {}).get("document_id") == document_id for p in points),
+              "Qdrant returned points belonging to another document",
+          )
+          # At least one point per chunk. A retried ingest writes fresh point
+          # ids and leaves the previous attempt's points behind, so more than
+          # the chunk count means a retry happened, not that indexing is wrong.
+          require(
+              len(points) >= evidence["chunkCountApi"],
+              f"Qdrant holds {len(points)} points but the API reports "
+              f"{evidence['chunkCountApi']} chunks",
+          )
+          if len(points) > evidence["chunkCountApi"]:
+              print(
+                  f"::warning::Qdrant holds {len(points)} points for "
+                  f"{evidence['chunkCountApi']} chunks; an earlier attempt was retried"
+              )
+
+          summary = (
+              f"document {document_id}: {evidence['chunkCountApi']} chunks, "
+              f"{len(points)} Qdrant points, upload to indexed in "
+              f"{evidence['uploadToIndexedMs']}ms "
+              f"(worker {evidence['processingStartedAt']} -> {evidence['processingCompletedAt']})"
+          )
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"The indexed journey could not be corroborated. {summary}")
+          print(f"::notice title=Indexed journey::{summary}")
+          PY
+
       - name: Show service logs
         if: always()
         run: |
