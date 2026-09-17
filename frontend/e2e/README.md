@@ -61,6 +61,21 @@ What that job proves beyond the green test is checked separately by its
 `Prove the indexing pipeline ran` step, which looks for this document's id in
 the worker's log and in Qdrant itself.
 
+## Proving realtime rather than polling
+
+`realtime.spec.ts` reads the frames of the application's own WebSocket through
+Playwright -- it does not inject events, intercept routes or touch React state.
+It requires that a `document.status` frame for the exact document it uploaded
+arrived *before* the row changed, that the browser also saw the document in a
+non-terminal state first, and that the one endpoint the UI could have polled
+with, `GET /documents/{id}/status`, was called at most once while waiting.
+
+That allowance is not slack: `UploadQueue` makes one REST read per indexing
+document, and only after a resync the server reported incomplete. Repeated
+reads are polling and fail the test. Note that a dev-server run also opens
+Vite's own HMR socket, so the spec selects the socket whose URL contains
+`/api/v1/ws`.
+
 ## Accounts and data
 
 Each test registers its own account through the API, and signup creates that

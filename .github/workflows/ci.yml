@@ -658,6 +658,73 @@ jobs:
           print(f"::notice title=Indexed journey::{summary}")
           PY
 
+      # The indexed journey above says the pipeline finished. This says the
+      # browser was told: that a document.status frame for this exact document
+      # arrived on the application's own socket before the row changed, and
+      # that the one REST endpoint which could have produced the same result
+      # was not being polled. A missing file means the realtime test did not
+      # run, which fails the job rather than passing quietly.
+      - name: Prove the realtime path delivered the update
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = (
+              pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+              / "frontend"
+              / "test-results"
+              / "realtime-document.json"
+          )
+          if not path.exists():
+              sys.exit(f"::error::The realtime test left no evidence at {path}")
+
+          e = json.loads(path.read_text(encoding="utf-8"))
+          failures = []
+
+          def require(condition, message):
+              if not condition:
+                  failures.append(message)
+
+          require(
+              e["indexedFrameStatus"] == "indexed",
+              f"the observed frame carried {e['indexedFrameStatus']!r}, not 'indexed'",
+          )
+          require(
+              e["nonTerminalFrames"] >= 1,
+              "the browser never saw a non-terminal status frame, so no transition was observed",
+          )
+          require(
+              e["frameToDomMs"] >= 0,
+              "the DOM showed indexed before the frame arrived, so the event did not cause it",
+          )
+          require(
+              e["statusEndpointRequestsWhileWaiting"] <= 1,
+              f"the UI called the status endpoint "
+              f"{e['statusEndpointRequestsWhileWaiting']} times while waiting: that is polling",
+          )
+          require(
+              e["restCorroboratedStatus"] == "indexed",
+              f"REST disagreed with the UI: {e['restCorroboratedStatus']!r}",
+          )
+          require("/api/v1/ws" in (e.get("socketUrl") or ""), "no application WebSocket was recorded")
+
+          summary = (
+              f"document {e['documentId']}: {e['statusFramesForDocument']} status frames "
+              f"({e['nonTerminalFrames']} non-terminal), upload to indexed frame "
+              f"{e['uploadToIndexedFrameMs']}ms, frame to DOM {e['frameToDomMs']}ms, "
+              f"status-endpoint requests while waiting: "
+              f"{e['statusEndpointRequestsWhileWaiting']}"
+          )
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"The realtime path could not be corroborated. {summary}")
+          print(f"::notice title=Realtime update::{summary}")
+          PY
+
       - name: Show service logs
         if: always()
         run: |
