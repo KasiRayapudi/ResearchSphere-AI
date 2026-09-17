@@ -70,6 +70,7 @@ export const LoginPage: React.FC = () => {
           <Input
             label="Work Email"
             type="email"
+            data-testid="login-email"
             placeholder="alex@company.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
@@ -84,6 +85,7 @@ export const LoginPage: React.FC = () => {
             </div>
             <Input
               type="password"
+              data-testid="login-password"
               placeholder="••••••••"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -92,7 +94,7 @@ export const LoginPage: React.FC = () => {
             />
           </div>
 
-          <Button type="submit" variant="primary" className="w-full" isLoading={isLoading} icon={<ArrowRight className="h-4 w-4" />}>
+          <Button type="submit" variant="primary" data-testid="login-submit" className="w-full" isLoading={isLoading} icon={<ArrowRight className="h-4 w-4" />}>
             Sign In to Workspace
           </Button>
         </form>
