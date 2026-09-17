@@ -38,5 +38,13 @@ export default tseslint.config(
       // Kept visible as a warning so the debt stays on the report.
       'react-hooks/set-state-in-effect': 'warn',
     },
-  }
+  },
+  // Playwright specs and config run in Node, not the browser.
+  {
+    files: ['e2e/**/*.ts', 'playwright.config.ts'],
+    languageOptions: { globals: { ...globals.node } },
+    // Playwright names a fixture's callback parameter `use`, which the React
+    // Hooks rule reads as the `use` hook. There is no React in these files.
+    rules: { 'react-hooks/rules-of-hooks': 'off' },
+  },
 );

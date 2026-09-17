@@ -6,6 +6,9 @@ export default defineConfig({
   plugins: [react()],
   resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   test: {
+    // Unit tests only. Without this, Vitest's default glob would also pick up
+    // the Playwright specs in e2e/, which need a browser and a running stack.
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
