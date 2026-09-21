@@ -191,6 +191,7 @@ test.describe('realtime document updates', () => {
     expect(reported.ok(), `status lookup failed (${reported.status()})`).toBeTruthy();
     const state = (await reported.json()) as { status: string; chunkCount: number };
     expect(state.status).toBe('indexed');
+    expect(state.chunkCount, 'indexed with no chunks: nothing reached the vector store').toBeGreaterThan(0);
 
     const evidence = {
       documentId,

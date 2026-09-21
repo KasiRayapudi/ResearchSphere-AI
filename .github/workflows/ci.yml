@@ -762,8 +762,9 @@ jobs:
               f"{e['statusEndpointRequestsWhileWaiting']} times while waiting: that is polling",
           )
           require(
-              e["restCorroboratedStatus"] == "indexed",
-              f"REST disagreed with the UI: {e['restCorroboratedStatus']!r}",
+              e["restCorroboratedStatus"] == "indexed" and e["restChunkCount"] > 0,
+              f"REST disagreed with the UI: {e['restCorroboratedStatus']!r}, "
+              f"{e['restChunkCount']} chunks",
           )
           require("/api/v1/ws" in (e.get("socketUrl") or ""), "no application WebSocket was recorded")
 
@@ -772,7 +773,8 @@ jobs:
               f"({e['nonTerminalFrames']} non-terminal), upload to indexed frame "
               f"{e['uploadToIndexedFrameMs']}ms, frame to DOM {e['frameToDomMs']}ms, "
               f"status-endpoint requests while waiting: "
-              f"{e['statusEndpointRequestsWhileWaiting']}"
+              f"{e['statusEndpointRequestsWhileWaiting']}, REST {e['restCorroboratedStatus']} "
+              f"with {e['restChunkCount']} chunks"
           )
           if failures:
               for failure in failures:
