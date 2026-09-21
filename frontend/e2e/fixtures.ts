@@ -18,6 +18,14 @@ export interface TestAccount {
 /** Where the SPA keeps its tokens (see services/apiClient.ts). */
 const ACCESS_TOKEN_KEY = 'rs_auth_token';
 const REFRESH_TOKEN_KEY = 'rs_refresh_token';
+/** Where the SPA remembers the last workspace chosen (see WorkspaceContext.tsx). */
+export const ACTIVE_WORKSPACE_KEY = 'rs_active_workspace';
+
+/** The tokens a signed-in browser holds. */
+export interface Tokens {
+  access: string;
+  refresh: string;
+}
 
 const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:3000';
 
@@ -57,6 +65,20 @@ function generatePassword(): string {
 
 /** Register a fresh account through the real API and return its credentials. */
 export async function createAccount(request: APIRequestContext, label: string): Promise<TestAccount> {
+  return (await signUp(request, label)).account;
+}
+
+/**
+ * Register an account and keep the tokens signup already returns.
+ *
+ * Signup answers with an access and a refresh token, so a test that needs a
+ * second signed-in user can use them directly instead of logging in again --
+ * every /auth/ request spends the shared 20-a-minute budget.
+ */
+export async function signUp(
+  request: APIRequestContext,
+  label: string
+): Promise<{ account: TestAccount; tokens: Tokens }> {
   const password = generatePassword();
   // example.com, not example.test: the API validates addresses with
   // email-validator, which refuses reserved names such as .test.
@@ -65,7 +87,11 @@ export async function createAccount(request: APIRequestContext, label: string): 
 
   const signup = await request.post('/api/v1/auth/signup', { data: { name, email, password } });
   expect(signup.ok(), `signup failed (${signup.status()}): ${await signup.text()}`).toBeTruthy();
-  const created = (await signup.json()) as { access_token: string; user: { id: string } };
+  const created = (await signup.json()) as {
+    access_token: string;
+    refresh_token: string;
+    user: { id: string };
+  };
 
   const workspaces = await request.get('/api/v1/workspaces', {
     headers: { Authorization: `Bearer ${created.access_token}` },
@@ -74,7 +100,28 @@ export async function createAccount(request: APIRequestContext, label: string): 
   const [workspace] = (await workspaces.json()) as Array<{ id: string }>;
   expect(workspace, 'signup did not create a default workspace').toBeTruthy();
 
-  return { email, password, name, userId: created.user.id, workspaceId: workspace.id };
+  return {
+    account: { email, password, name, userId: created.user.id, workspaceId: workspace.id },
+    tokens: { access: created.access_token, refresh: created.refresh_token },
+  };
+}
+
+/**
+ * Browser storage for a context that starts signed in, in the shape
+ * `browser.newContext({ storageState })` takes. `extra` adds other keys the
+ * SPA reads at start-up, such as a remembered workspace.
+ */
+export function signedInStorage(tokens: Tokens, extra: Record<string, string> = {}) {
+  const entries = { [ACCESS_TOKEN_KEY]: tokens.access, [REFRESH_TOKEN_KEY]: tokens.refresh, ...extra };
+  return {
+    cookies: [],
+    origins: [
+      {
+        origin: new URL(baseURL).origin,
+        localStorage: Object.entries(entries).map(([name, value]) => ({ name, value })),
+      },
+    ],
+  };
 }
 
 /** Log in through the API and return the tokens the SPA would have stored. */

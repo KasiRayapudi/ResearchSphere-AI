@@ -444,7 +444,7 @@ jobs:
       QUARANTINE_DIR: ${{ github.workspace }}/e2e-uploads/.quarantine
       # Every spec in frontend/e2e belongs to exactly one of these.
       E2E_CORE_SPECS: auth.spec.ts upload.spec.ts indexing.spec.ts
-      E2E_REALTIME_SPECS: realtime.spec.ts reconnect.spec.ts
+      E2E_REALTIME_SPECS: realtime.spec.ts reconnect.spec.ts workspace-isolation.spec.ts
 
     steps:
       - uses: actions/checkout@v4
@@ -852,6 +852,91 @@ jobs:
                   print(f"::error::{failure}")
               sys.exit(f"The reconnect could not be corroborated. {summary}")
           print(f"::notice title=Reconnect recovery::{summary}")
+          PY
+
+      # Two accounts, two workspaces: B must be refused -- with 404, so it
+      # cannot even learn the ids exist -- on every route that could expose A's
+      # document, must not get a byte of A's data back, must land in its own
+      # workspace in the browser despite remembering A's, and must leave A's
+      # document intact for A. The test writes this only after all of that
+      # held; a missing file means it did not run.
+      - name: Prove workspace isolation held
+        if: contains(format(' {0} ', env.E2E_SPECS), ' workspace-isolation.spec.ts ')
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          path = (
+              pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+              / "frontend"
+              / "test-results"
+              / "workspace-isolation.json"
+          )
+          if not path.exists():
+              sys.exit(f"::error::The isolation test left no evidence at {path}")
+
+          raw = path.read_text(encoding="utf-8")
+          e = json.loads(raw)
+          failures = []
+
+          def require(condition, message):
+              if not condition:
+                  failures.append(message)
+
+          # Nothing that could sign anyone in may be in an uploaded artifact.
+          require(not re.search(r"eyJ[\w-]+\.[\w-]+\.", raw), "the evidence contains a token")
+          require(not re.search(r"password|@example\.com", raw, re.I), "the evidence contains credentials")
+
+          require(e["workspaceA"] and e["workspaceB"] and e["workspaceA"] != e["workspaceB"],
+                  "the two accounts did not have separate workspaces")
+          require(bool(e["documentId"]), "no document id was recorded")
+
+          refused = {
+              "list Workspace A", "document status", "document download", "document delete",
+              "workspace detail", "analytics for Workspace A", "chat against Workspace A",
+          }
+          scoped = {"list own workspace", "search own workspace for the file", "list workspaces"}
+          probes = {p["name"]: p for p in e["probes"]}
+          require(set(probes) == refused | scoped,
+                  f"expected probes {sorted(refused | scoped)}, got {sorted(probes)}")
+          for name, p in probes.items():
+              require(p["held"], f"{name}: {p['method']} {p['path']} answered {p['status']}")
+              require(not p["leaked"], f"{name}: the response carried Workspace A's data")
+              if name in refused:
+                  require(p["status"] == 404, f"{name}: expected 404, got {p['status']}")
+              else:
+                  require(p["status"] == 200, f"{name}: expected 200, got {p['status']}")
+
+          require(e["documentIntactAfterDelete"], "A's document did not survive B's delete attempt")
+
+          ui = e["ui"]
+          require(ui["documentsRequestedFor"] == "B", "B's page asked for another workspace's documents")
+          require(ui["switcherShowsB"] and not ui["switcherShowsA"], "B's page selected the wrong workspace")
+          require(ui["documentRequests"] > 0, "B's page never loaded its documents, so absence proves nothing")
+          require(ui["requestsNamingWorkspaceA"] == 0, "B's page sent a request naming Workspace A")
+          require(not ui["documentRendered"], "A's document rendered in B's browser")
+
+          own = e["ownerAccess"]
+          require(own["rowVisible"], "A could not see its own document")
+          require(own["status"] == 200 and own["download"] == 200 and own["downloadMatches"],
+                  f"A lost access to its own document: status {own['status']}, download {own['download']}")
+
+          summary = (
+              f"document {e['documentId']} in workspace {e['workspaceA']}: "
+              + ", ".join(f"{n}={probes[n]['status']}" for n in sorted(probes))
+              + f"; B's page: {ui['documentRequests']} document requests, "
+              f"{ui['requestsNamingWorkspaceA']} naming A; A: status {own['status']}, "
+              f"download {own['download']}"
+          )
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"Workspace isolation could not be corroborated. {summary}")
+          print(f"::notice title=Workspace isolation::{summary}")
           PY
 
       - name: Show service logs

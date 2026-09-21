@@ -104,6 +104,25 @@ One status read during the outage is expected and asserted: `UploadQueue` asks
 once for an upload that returned while the socket was down. After the
 reconnect there must be none.
 
+## Proving workspace isolation
+
+`workspace-isolation.spec.ts` uses two accounts, each owning the workspace
+signup gave it: A is the worker's account, B is signed up by the test and uses
+the tokens signup returns rather than logging in again. A uploads one document
+through the API; B is then refused with 404 on every route that could expose
+it -- listing A's workspace, status, download, delete, the workspace itself,
+analytics and chat -- and finds nothing when listing or searching its own. 404
+is also the answer for an id that does not exist, so B cannot even learn that
+A's workspace or document is there, and no response may contain A's file name,
+workspace name or the document's contents. In the browser, B starts with A's
+workspace id remembered in `rs_active_workspace`, as a shared machine can leave
+it, and must land in its own workspace without the page ever naming A's. A
+must still see, read and download its document afterwards.
+
+Isolation needs neither the worker nor Redis nor Qdrant, so this spec runs on a
+partial local stack too and has nothing to skip. It costs six requests from the
+shared `/auth/` + `/upload` budget and runs in the realtime leg.
+
 ## Why CI runs the suite in two legs
 
 The API allows 20 requests a minute per client IP across `/auth/*` and
@@ -112,7 +131,8 @@ checks `/auth/me` on mount, and React StrictMode runs that effect twice on the
 dev server -- and an upload costs one more. All E2E traffic comes from one IP,
 so the whole suite in one job would exceed the limit. CI therefore runs it as
 two legs, each with its own complete stack and so its own limit window; the
-limit itself is unchanged. `E2E_CORE_SPECS` and `E2E_REALTIME_SPECS` in the
+limit itself is unchanged. The core leg uses about 16 of the 20, the realtime
+leg about 14. `E2E_CORE_SPECS` and `E2E_REALTIME_SPECS` in the
 workflow say which spec runs where, and the job fails if a spec file is in
 neither list or in both.
 
