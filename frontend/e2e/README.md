@@ -76,6 +76,46 @@ reads are polling and fail the test. Note that a dev-server run also opens
 Vite's own HMR socket, so the spec selects the socket whose URL contains
 `/api/v1/ws`.
 
+## Proving recovery after a dropped socket
+
+`reconnect.spec.ts` interrupts the application socket mid-session and keeps it
+down while a document is uploaded and fully indexed, so the page cannot have
+heard about that transition. Then it lets the client's own retry through and
+requires that the client *resumed* in the same sequence space, that the server
+replayed what it missed and called the replay complete, and that the row
+reached `indexed` from a replayed frame on the new socket -- with no reload, no
+document-list refetch and no status read after the reconnect.
+
+The interruption uses Playwright's `routeWebSocket`, scoped to `/api/v1/ws`, in
+pass-through mode. Worth knowing before changing it:
+
+- It replaces the page's `WebSocket` class with a shim, and the real
+  connection is opened inside it with the page's own token and Origin. Every
+  frame is still the server's, forwarded unmodified; the route only decides
+  when the connection ends and when a retry may reach the server.
+- Closing a route closes one side only. The spec closes the page side with
+  1006 (what a browser reports for a dropped connection) and then the server
+  side with 1000, because `WebSocket.close()` rejects 1006. The other order
+  would hand the page a clean close forwarded from the server first.
+- `context.setOffline()` is not an alternative on the dev server: it also
+  drops Vite's HMR socket, and Vite reloads the page when that reconnects.
+
+One status read during the outage is expected and asserted: `UploadQueue` asks
+once for an upload that returned while the socket was down. After the
+reconnect there must be none.
+
+## Why CI runs the suite in two legs
+
+The API allows 20 requests a minute per client IP across `/auth/*` and
+`/upload` together. Each browser test costs at least two of them -- the SPA
+checks `/auth/me` on mount, and React StrictMode runs that effect twice on the
+dev server -- and an upload costs one more. All E2E traffic comes from one IP,
+so the whole suite in one job would exceed the limit. CI therefore runs it as
+two legs, each with its own complete stack and so its own limit window; the
+limit itself is unchanged. `E2E_CORE_SPECS` and `E2E_REALTIME_SPECS` in the
+workflow say which spec runs where, and the job fails if a spec file is in
+neither list or in both.
+
 ## Accounts and data
 
 Each test registers its own account through the API, and signup creates that

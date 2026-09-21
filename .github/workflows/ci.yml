@@ -379,10 +379,22 @@ jobs:
   # runs. The frontend is served by the Vite dev server, whose proxy makes /api
   # and the WebSocket upgrade same-origin exactly as the production reverse
   # proxy does; the production bundle is covered by the Docker job above.
+  #
+  # The suite runs as two legs, each against its own complete stack. That is
+  # not for speed: the API allows 20 requests a minute per client IP across
+  # /auth/* and /upload, every leg's traffic comes from one IP, and one leg
+  # running every spec would exceed it. Separate stacks mean separate rate
+  # limit windows, with the limit itself untouched. Which spec runs where is
+  # set once, in E2E_CORE_SPECS and E2E_REALTIME_SPECS below, and the first
+  # step fails the job if any spec file is in neither list or in both.
   e2e:
-    name: End-to-end (browser)
+    name: End-to-end (${{ matrix.suite }})
     runs-on: ubuntu-latest
     needs: [backend-tests, frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core, realtime]
 
     services:
       postgres:
@@ -430,9 +442,49 @@ jobs:
       VIRUS_SCANNER: noop
       UPLOAD_DIR: ${{ github.workspace }}/e2e-uploads
       QUARANTINE_DIR: ${{ github.workspace }}/e2e-uploads/.quarantine
+      # Every spec in frontend/e2e belongs to exactly one of these.
+      E2E_CORE_SPECS: auth.spec.ts upload.spec.ts indexing.spec.ts
+      E2E_REALTIME_SPECS: realtime.spec.ts reconnect.spec.ts
 
     steps:
       - uses: actions/checkout@v4
+
+      # A spec in neither list would never run anywhere, and nothing else would
+      # notice; one in both would double this leg's share of the rate limit.
+      - name: Every spec belongs to exactly one suite
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          present = sorted(p.name for p in pathlib.Path("frontend/e2e").glob("*.spec.ts"))
+          core = os.environ["E2E_CORE_SPECS"].split()
+          realtime = os.environ["E2E_REALTIME_SPECS"].split()
+          assigned = core + realtime
+          problems = []
+          for name in present:
+              if assigned.count(name) != 1:
+                  problems.append(f"{name} is assigned {assigned.count(name)} times")
+          for name in assigned:
+              if name not in present:
+                  problems.append(f"{name} is assigned but does not exist")
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+          print(f"{len(present)} specs, each in exactly one suite")
+          PY
+
+      - name: Select this suite's specs
+        run: |
+          case "${{ matrix.suite }}" in
+            core) specs="$E2E_CORE_SPECS" ;;
+            realtime) specs="$E2E_REALTIME_SPECS" ;;
+            *) echo "::error::unknown suite ${{ matrix.suite }}"; exit 1 ;;
+          esac
+          echo "E2E_SPECS=$specs" >> "$GITHUB_ENV"
+          echo "suite ${{ matrix.suite }}: $specs"
 
       - name: Set up Python ${{ env.PYTHON_DEFAULT }}
         uses: actions/setup-python@v5
@@ -547,7 +599,9 @@ jobs:
         working-directory: frontend
         env:
           CI: "true"
-        run: npm run test:e2e
+        # Word-split on purpose: one filter argument per spec file. A filter
+        # that matches nothing makes Playwright fail with "No tests found".
+        run: npm run test:e2e -- $E2E_SPECS
 
       # A green test says the UI showed `indexed`. This says *why* it could:
       # that the task left the API for the broker, that the worker process (not
@@ -556,6 +610,7 @@ jobs:
       # and a healthy Qdrant would prove none of that, so nothing here looks at
       # service health -- it looks for this document id.
       - name: Prove the indexing pipeline ran
+        if: contains(format(' {0} ', env.E2E_SPECS), ' indexing.spec.ts ')
         working-directory: backend
         run: |
           python - <<'PY'
@@ -665,6 +720,7 @@ jobs:
       # was not being polled. A missing file means the realtime test did not
       # run, which fails the job rather than passing quietly.
       - name: Prove the realtime path delivered the update
+        if: contains(format(' {0} ', env.E2E_SPECS), ' realtime.spec.ts ')
         run: |
           python - <<'PY'
           import json
@@ -725,6 +781,77 @@ jobs:
           print(f"::notice title=Realtime update::{summary}")
           PY
 
+      # The realtime step above proves events arrive on a healthy socket. This
+      # proves a broken one recovers: that the initial socket really ended, the
+      # client retried on its own, resumed in the same sequence space, and the
+      # server replayed -- completely -- the indexing it missed, so the row
+      # caught up from a replayed frame with no reload, no refetch and no REST
+      # read after the reconnect. A missing file means the test did not run.
+      - name: Prove the reconnect recovered what it missed
+        if: contains(format(' {0} ', env.E2E_SPECS), ' reconnect.spec.ts ')
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = (
+              pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+              / "frontend"
+              / "test-results"
+              / "reconnect-document.json"
+          )
+          if not path.exists():
+              sys.exit(f"::error::The reconnect test left no evidence at {path}")
+
+          e = json.loads(path.read_text(encoding="utf-8"))
+          failures = []
+
+          def require(condition, message):
+              if not condition:
+                  failures.append(message)
+
+          require(e["initialSocketClosed"], "the initial application socket never closed")
+          require(e["applicationSockets"] == 2, f"expected 2 application sockets, saw {e['applicationSockets']}")
+          require(e["otherSocketCloses"] == 0, "a socket other than /api/v1/ws was interrupted")
+          require(e["reconnectAttemptAfterCloseMs"] >= 0, "the retry did not follow the close")
+          require(e["resumeSent"] and e["resumeEpochMatches"], "the client did not resume in the same epoch")
+          require(e["resumedComplete"], "the server reported the resume incomplete")
+          require(e["resumedReplayed"] > 0, "the server replayed nothing")
+          require(e["indexedFrameOnNewSocket"], "no indexed frame for the document arrived on the new socket")
+          require(e["backendStatusWhileDown"] == "indexed", "the backend was not indexed during the outage")
+          require(
+              e["rowStatusWhileDown"] in ("queued", "processing"),
+              f"the row showed {e['rowStatusWhileDown']!r} while the socket was down",
+          )
+          require(e["frameToDomMs"] >= 0, "the DOM changed before the replayed frame arrived")
+          require(
+              e["statusReadsWhileDown"] == 1,
+              f"expected the one documented status read during the outage, saw {e['statusReadsWhileDown']}",
+          )
+          require(e["statusReadsAfterReconnect"] == 0, "the UI read the status endpoint after reconnecting")
+          require(e["listRequestsAfterReconnect"] == 0, "the UI refetched the document list after reconnecting")
+          require(e["documentLoadsDuringTest"] == 0, "the page reloaded during recovery")
+          require(
+              e["restStatus"] == "indexed" and e["restChunkCount"] > 0,
+              f"REST disagreed: {e['restStatus']!r}, {e['restChunkCount']} chunks",
+          )
+
+          summary = (
+              f"document {e['documentId']}: socket dropped, retry {e['reconnectAttemptAfterCloseMs']}ms "
+              f"after close; resumed after seq {e['resumeAfter']} with {e['resumedReplayed']} replayed "
+              f"(complete={e['resumedComplete']}); restore to indexed frame "
+              f"{e['restoreToIndexedFrameMs']}ms, frame to DOM {e['frameToDomMs']}ms; status reads "
+              f"{e['statusReadsWhileDown']} during outage / {e['statusReadsAfterReconnect']} after"
+          )
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"The reconnect could not be corroborated. {summary}")
+          print(f"::notice title=Reconnect recovery::{summary}")
+          PY
+
       - name: Show service logs
         if: always()
         run: |
@@ -755,7 +882,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.suite }}
           path: |
             frontend/playwright-report/
             frontend/test-results/
