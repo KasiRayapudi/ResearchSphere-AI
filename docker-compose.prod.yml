@@ -126,8 +126,15 @@ services:
       # Persist the embedding model so a restarted container does not
       # re-download it on the first request.
       - model_cache:/home/appuser/.cache
+    # /api/ready, not /api/live: nginx gates on this service being healthy, so
+    # "healthy" has to mean "can actually serve". /api/live deliberately does
+    # no dependency I/O (main.py) and would report an instance healthy with
+    # its database or vector store unreachable, letting the edge start routing
+    # to it. /api/ready answers 503 until every required dependency responds.
+    # Resource pressure does not fail it -- see _READY_STATUSES -- so a full
+    # disk warns rather than pulling the instance out.
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/api/live"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/api/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
