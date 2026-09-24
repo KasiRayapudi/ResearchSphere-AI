@@ -12,7 +12,8 @@ on:
 permissions:
   contents: write      # create the release and push notes
   packages: write      # publish images to GHCR
-  id-token: write      # provenance attestation
+  id-token: write      # sign the attestation
+  attestations: write  # store it; attest-build-provenance needs both
 
 env:
   REGISTRY: ghcr.io
