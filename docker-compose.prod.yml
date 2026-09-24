@@ -2,7 +2,19 @@
 # ResearchSphere AI - production stack.
 #
 #   cp .env.prod.example .env.prod   # then fill in real secrets
-#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# This file runs PUBLISHED images from GHCR and carries no build: stanza, so
+# a host needs no application source to deploy:
+#
+#   make prod-pull                   # pull IMAGE_TAG and start
+#
+# To build the images from this working tree instead, add the build overlay,
+# which is what `make prod` does:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.build.yml #       --env-file .env.prod up -d --build
+#
+# Either way the nginx/ directory must be present next to this file: the edge
+# proxy bind-mounts its configuration from it.
 #
 # Differences from docker-compose.yml (which stays as the development stack):
 #   - multi-stage production images, all running as non-root
@@ -55,13 +67,7 @@ services:
 
   # -------------------------------------------------------------- frontend --
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile.prod
-      args:
-        # Same-origin: the edge proxy routes /api to the backend.
-        VITE_API_URL: /api
-    image: researchsphere/frontend:${IMAGE_TAG:-latest}
+    image: ghcr.io/kasirayapudi/researchsphere-ai/frontend:${IMAGE_TAG:?IMAGE_TAG is required - a published tag such as 1.2.0, or "local" when building from source}
     container_name: rs-frontend
     <<: *default-restart
     expose:
@@ -82,10 +88,7 @@ services:
 
   # --------------------------------------------------------------- backend --
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.prod
-    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    image: &backend_image ghcr.io/kasirayapudi/researchsphere-ai/backend:${IMAGE_TAG:?IMAGE_TAG is required - a published tag such as 1.2.0, or "local" when building from source}
     container_name: rs-backend
     <<: *default-restart
     depends_on:
@@ -151,10 +154,7 @@ services:
   # upsert. Runs the same image as the API with a different entrypoint
   # command, so there is one artefact to build, scan and promote.
   worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.prod
-    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    image: *backend_image
     container_name: rs-worker
     command: ["worker"]
     <<: *default-restart
@@ -194,7 +194,7 @@ services:
   # Scheduler for the periodic reclaim of documents whose worker died.
   # Exactly one of these may run: a second would duplicate every tick.
   beat:
-    image: researchsphere/backend:${IMAGE_TAG:-latest}
+    image: *backend_image
     container_name: rs-beat
     command: ["beat"]
     <<: *default-restart
