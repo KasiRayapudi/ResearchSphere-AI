@@ -17,6 +17,14 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # OCI repository names must be lowercase, and github.repository is not
+  # ("KasiRayapudi/ResearchSphere-AI"). docker/metadata-action lowercases what
+  # it is given, but nothing else does, so the name is written out once here
+  # and used everywhere the registry path is needed. It is a literal because
+  # GitHub Actions expressions have no lowercase function, and because
+  # docker-compose.prod.yml has to carry the same name verbatim -- keep the
+  # two in step.
+  IMAGE_NAMESPACE: kasirayapudi/researchsphere-ai
 
 jobs:
   # Nothing is published unless the full test suite passes on the tagged
@@ -78,13 +86,20 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}
+          # G9 -- the tag contract, stated once:
+          #   git tag v1.2.0  ->  1.2.0, 1.2, 1, sha-<40 hex>
+          # There is deliberately no `latest`. This workflow runs only on tags
+          # and workflow_dispatch, so the usual
+          # `type=raw,value=latest,enable={{is_default_branch}}` line could
+          # never fire; it was removed rather than left to imply a tag that is
+          # never published. Production selects a release explicitly with
+          # IMAGE_TAG -- see .env.prod.example.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
         id: build
@@ -105,7 +120,10 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          # Lowercase, like the images above: this is pushed to the registry
+          # (push-to-registry below), and a registry rejects a repository name
+          # that is not lowercase.
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -172,8 +190,8 @@ jobs:
             echo "## Container images"
             echo ""
             echo '```'
-            echo "docker pull ghcr.io/${{ github.repository }}/backend:${{ steps.version.outputs.version }}"
-            echo "docker pull ghcr.io/${{ github.repository }}/frontend:${{ steps.version.outputs.version }}"
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ steps.version.outputs.version }}"
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:${{ steps.version.outputs.version }}"
             echo '```'
             echo ""
             echo "See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment instructions."
