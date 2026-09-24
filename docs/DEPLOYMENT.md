@@ -466,8 +466,7 @@ the deployment path is not mistaken for something more finished than it is.
 | 1 | The release workflow has never been exercised | No tag exists locally or on the remote, so no image has ever been published and **pulling from GHCR has never actually been performed**. The CI job builds the images under their Compose names and starts the stack with `--no-build`, which verifies the published-image *path* but not a real registry pull |
 | 2 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
 | 3 | The release artefact is not self-sufficient | `release.yml` attaches `docker-compose.prod.yml` and `.env.prod.example`, but nginx bind-mounts three paths from `./nginx`, which is not attached. A host still needs those files from the repository |
-| 4 | The SSE/chat location drops the shared proxy headers | `location /api/v1/chat/stream` sets `proxy_set_header Connection ''`, and nginx inherits `proxy_set_header` only when a level declares none — so that block loses `Host` and the `X-Forwarded-*` set. With `Host` missing the backend's TrustedHost middleware would reject the request. Found while fixing the WebSocket path; **not fixed here**, because it is outside the scope of this change |
-| 5 | Kubernetes support is absent | No manifests, chart or overlays exist |
+| 4 | Kubernetes support is absent | No manifests, chart or overlays exist |
 
 ### Closed since the previous revision
 
@@ -476,6 +475,7 @@ the deployment path is not mistaken for something more finished than it is.
 | GHCR images were not consumed by the production stack | `docker-compose.prod.yml` now names the GHCR images and carries no `build:` stanza; the build instructions moved to `docker-compose.prod.build.yml` and `make prod-pull` was added |
 | `beat` and `qdrant` had no healthcheck | Both now have one — see [§8](#8-health-and-validation) — and every consumer gates on `service_healthy` |
 | The edge did not forward WebSocket upgrades | `map $http_upgrade $connection_upgrade` plus `location ^~ /api/v1/ws` — see [§9](#9-nginx-and-tls) |
+| The SSE/chat location dropped the shared proxy headers | `location /api/v1/chat/stream` now repeats `Host` and the `X-Forwarded-*` set alongside `Connection ''`, for the same nginx inheritance reason as the WebSocket location — fixed in `5b3a857` |
 | `.env.prod.example` was not tracked | `.gitignore` now re-includes it and the template is committed, with every secret-bearing value empty |
 | The Compose stack was never started by CI | The `prod-stack` job starts all eight services, waits for every healthcheck, drives the edge and opens a real WebSocket through it |
 | `beat` declared `deploy:` twice | The duplicate — a copy of the worker's limits — was removed; beat keeps 0.25 CPU / 256M |
