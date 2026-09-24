@@ -43,11 +43,14 @@ Persistent data lives in named volumes: `postgres_data`, `qdrant_data`,
 | Disk | Volumes for Postgres, Qdrant, Redis, uploads and the embedding model cache |
 | Ports | `HTTP_PORT` (default `80`) is published by nginx. No other service publishes a port |
 
-> **Note — the `.env.prod` template is not in the repository.** `make prod`
-> prints `copy .env.prod.example and fill it in`, but `.env.prod.example` is
-> **not tracked**: `.gitignore` ignores `.env.*` and only re-includes
-> `.env.example`. A fresh clone will not contain it. Use the variable tables in
-> [§3](#3-production-configuration) to write `.env.prod` by hand.
+`.env.prod.example` is tracked, so a fresh clone contains the template:
+
+```bash
+cp .env.prod.example .env.prod
+```
+
+Every secret-bearing value in it is empty and must be filled in. `.env.prod`
+itself stays ignored by `.gitignore` and must never be committed.
 
 ---
 
@@ -123,18 +126,53 @@ write to any file — copy the output into `.env.prod` yourself.
 
 ## 4. Production Images
 
-Two image paths exist today, and **they are not wired together**.
+The stack runs two application images, under one name each:
 
-| Path | Names | Produced by | Consumed by |
+```
+ghcr.io/kasirayapudi/researchsphere-ai/backend:${IMAGE_TAG}
+ghcr.io/kasirayapudi/researchsphere-ai/frontend:${IMAGE_TAG}
+```
+
+`backend`, `worker` and `beat` all run the backend image with different
+commands, so there is a single artefact to build, scan and promote.
+
+Those names are used in **both** modes, which differ only in where the image
+comes from:
+
+| Mode | Command | Image source | Files needed on the host |
 |---|---|---|---|
-| Local build | `researchsphere/backend:${IMAGE_TAG:-latest}`, `researchsphere/frontend:${IMAGE_TAG:-latest}` | `make prod-build` / `make prod` (Compose `build:` stanzas) | `docker-compose.prod.yml` |
-| Registry | `ghcr.io/<owner>/<repo>/backend`, `ghcr.io/<owner>/<repo>/frontend` | `.github/workflows/release.yml` on a `v*.*.*` tag | **nothing in this repository** |
+| Published images | `make prod-pull` | Pulled from GHCR | `docker-compose.prod.yml`, `nginx/`, `.env.prod` |
+| Local build | `make prod` | Built from this working tree | The above **plus** `backend/` and `frontend/` |
 
-`docker-compose.prod.yml` references the local names only and carries `build:`
-stanzas for `frontend`, `backend` and `worker`, so `make prod` builds images on
-the host. Pulling the GHCR images into the Compose stack is not supported by
-any file in the repository today; see
+`docker-compose.prod.yml` carries no `build:` stanza, so the published-image
+mode needs no application source. The build instructions live in
+`docker-compose.prod.build.yml`, applied as an overlay; `make prod` and
+`make prod-build` use it. A locally built image is tagged with exactly the same
+name as a published one, so nothing downstream has to know which mode produced
+it — set `IMAGE_TAG=local` to keep them apart by eye.
+
+**The published-image mode is not source-free.** The nginx service bind-mounts
+`./nginx/nginx.conf`, `./nginx/conf.d` and `./nginx/certs` from the deployment
+directory, so a host needs the `nginx/` directory alongside
+`docker-compose.prod.yml` and `.env.prod`. What it does not need is the
+application source or any build toolchain. The GitHub release attaches
+`docker-compose.prod.yml` and `.env.prod.example` but **not** `nginx/`, so the
+published release artefact alone is not yet sufficient — see
 [Known deployment gaps](#11-known-deployment-gaps).
+
+### Selecting a version
+
+| Thing | Format | Example |
+|---|---|---|
+| Git tag | `vMAJOR.MINOR.PATCH` | `v1.2.0` |
+| Published image tags | `MAJOR.MINOR.PATCH`, `MAJOR.MINOR`, `MAJOR`, `sha-<40 hex>` | `1.2.0`, `1.2`, `1` |
+| `IMAGE_TAG` for a release | the Git tag **without** its leading `v` | `1.2.0` |
+| `IMAGE_TAG` for a local build | any label; the template ships `local` | `local` |
+
+There is **no `latest` tag**. `release.yml` runs only on tags, and production
+pins a version deliberately rather than following a moving target. `IMAGE_TAG`
+has no default: Compose refuses to start without it, and `make prod-pull`
+refuses to run when it is unset or still `local`.
 
 Both production images are built from dedicated Dockerfiles and run unprivileged:
 
@@ -155,38 +193,63 @@ Services defined by `docker-compose.prod.yml`. All use `restart: unless-stopped`
 | Service | Image | Role | Network | Compose healthcheck |
 |---|---|---|---|---|
 | `nginx` | `nginx:1.27-alpine` | Edge reverse proxy; the only service publishing a host port (`${HTTP_PORT:-80}:80`); routes `/api/` to the backend and everything else to the frontend | `frontend_net`, `backend_net` | `wget --spider http://127.0.0.1/healthz` |
-| `frontend` | `researchsphere/frontend:${IMAGE_TAG:-latest}` | Serves the built SPA on `8080` | `frontend_net` | `curl --fail http://127.0.0.1:8080/healthz` |
-| `backend` | `researchsphere/backend:${IMAGE_TAG:-latest}` | FastAPI API on `8000` (`serve`) | `backend_net` | `curl --fail http://127.0.0.1:8000/api/live` |
+| `frontend` | `…/frontend:${IMAGE_TAG}` | Serves the built SPA on `8080` | `frontend_net` | `curl --fail http://127.0.0.1:8080/healthz` |
+| `backend` | `…/backend:${IMAGE_TAG}` | FastAPI API on `8000` (`serve`) | `backend_net` | `curl --fail http://127.0.0.1:8000/api/ready` |
 | `worker` | same image, command `worker` | Celery worker: document extraction, chunking, embedding and the Qdrant upsert | `backend_net` | `celery -A app.worker.celery_app:celery_app inspect ping` |
-| `beat` | same image, command `beat` | Celery beat scheduler for the periodic reclaim of documents whose worker died. **Exactly one may run per deployment** | `backend_net` | **none** |
+| `beat` | same image, command `beat` | Celery beat scheduler for the periodic reclaim of documents whose worker died. **Exactly one may run per deployment** | `backend_net` | freshness of beat's schedule file (see [§8](#8-health-and-validation)) |
 | `postgres` | `postgres:16-alpine` | Relational store; volume `postgres_data` | `backend_net` | `pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}` |
-| `qdrant` | `qdrant/qdrant:v1.8.0` | Vector store; volume `qdrant_data` | `backend_net` | **none** |
+| `qdrant` | `qdrant/qdrant:v1.8.0` | Vector store; volume `qdrant_data` | `backend_net` | `GET /readyz` over bash's `/dev/tcp` |
 | `redis` | `redis:7-alpine` | Celery broker, realtime pub/sub and rate-limit counters. Started with `--requirepass`, `--appendonly yes`, `--maxmemory ${REDIS_MAXMEMORY:-256mb}` and `--maxmemory-policy noeviction`; volume `redis_data` | `backend_net` | `redis-cli -a "$REDIS_PASSWORD" ping` |
 
 `backend` and `worker` share `uploads_data:/app/uploads` (so the worker can read
 what the API stored) and `model_cache:/home/appuser/.cache` (so the embedding
 model is downloaded once).
 
+Every dependency edge is health-gated with one deliberate exception:
+
+| Edge | Condition |
+|---|---|
+| `nginx` → `backend`, `frontend` | `service_healthy` |
+| `backend` → `postgres`, `qdrant`, `redis` | `service_healthy` |
+| `worker` → `postgres`, `qdrant`, `redis` | `service_healthy` |
+| `beat` → `postgres`, `qdrant`, `redis` | `service_healthy` |
+| `beat` → `worker` | `service_started` — beat only publishes to the broker, and a queued task waits perfectly well |
+
 ---
 
 ## 6. Deployment Procedure
 
-Every target below is defined in the `Makefile` and expands to
-`docker compose -f docker-compose.prod.yml --env-file .env.prod …`.
+Every target below is defined in the `Makefile`. Targets that do not build
+expand to `docker compose -f docker-compose.prod.yml --env-file .env.prod …`;
+`prod` and `prod-build` add `-f docker-compose.prod.build.yml`.
 
 ### 1. Create `.env.prod`
 
-Write the file at the repository root using the tables in
-[§3](#3-production-configuration). `make prod` exits immediately if it is absent.
-
-### 2. Build the images
-
 ```bash
-make prod-build
+cp .env.prod.example .env.prod
 ```
 
-Runs `docker compose … build`. Optional in principle, because `make prod` also
-builds, but running it first surfaces build failures before anything starts.
+Fill in every value marked REQUIRED — see [§3](#3-production-configuration) —
+and set `IMAGE_TAG` per [§4](#4-production-images). `make prod` and
+`make prod-pull` both exit immediately if the file is absent.
+
+### 2. Obtain the images
+
+Either pull a published release:
+
+```bash
+make prod-pull      # pulls IMAGE_TAG and starts the stack with --no-build
+```
+
+or build from this working tree:
+
+```bash
+make prod-build     # build only
+```
+
+`make prod-pull` refuses to run when `IMAGE_TAG` is unset or still `local`, and
+starts with `--no-build` so a deployment cannot silently fall back to building.
+If you used `prod-pull`, skip to step 4 — it has already started the stack.
 
 ### 3. Validate the configuration
 
@@ -214,7 +277,9 @@ because it is a plain `run` (not `--no-deps`).
 make prod
 ```
 
-Checks that `.env.prod` exists, then runs `docker compose … up -d --build`.
+Checks that `.env.prod` exists, then builds from this tree and starts the stack.
+For a published release use `make prod-pull` instead, which starts the same
+topology from GHCR images without building.
 
 ### 6. Check service health
 
@@ -269,9 +334,9 @@ migration**. Use it only when the existing schema is known to match head.
 
 | Endpoint | Meaning |
 |---|---|
-| `/api/live` | Liveness. Used by the backend container healthcheck |
+| `/api/live` | Liveness only — performs no dependency I/O. Not used as a gate |
 | `/api/health` | Dependency detail: database, qdrant, redis, gemini, storage, disk, memory |
-| `/api/ready` | Readiness gate. Returns `503` unless every dependency is in an acceptable state |
+| `/api/ready` | Readiness gate. Returns `503` unless every dependency is in an acceptable state. **Used by the backend container healthcheck**, in both `docker-compose.prod.yml` and `backend/Dockerfile.prod` |
 | `/healthz` (frontend image, port 8080) | Served by the frontend image; used by its healthcheck |
 | `/healthz` (edge nginx) | `return 200 'ok'`, with access logging off |
 
@@ -281,14 +346,29 @@ migration**. Use it only when the existing schema is known to match head.
 
 ### Compose healthchecks
 
-Present for `nginx`, `frontend`, `backend`, `worker`, `postgres` and `redis`
-(see the table in [§5](#5-production-compose-stack)).
+**All eight services declare one** (see the table in
+[§5](#5-production-compose-stack)). Three are worth explaining.
 
-> **Warning — two services have no healthcheck:** `beat` and `qdrant`.
-> `docker compose ps` will not report health for them, and nothing waits on
-> their readiness. For `qdrant`, the official image carries no shell probe
-> tools, which is why the same limitation appears in CI, where the E2E job waits
-> for Qdrant from outside the container instead.
+`backend` probes `/api/ready`, not `/api/live`. nginx gates on the backend being
+healthy, so "healthy" has to mean "can actually serve"; `/api/live` would report
+an instance healthy with its database or vector store unreachable. Resource
+pressure deliberately does not fail readiness, so a disk at 85% warns through
+`/api/health` rather than pulling the instance out.
+
+`qdrant` has no HTTP client in its image — neither `curl` nor `wget` is present
+— but its Debian base does provide `bash`, so the probe issues a real HTTP
+request through bash's `/dev/tcp` against Qdrant's own `/readyz` and requires a
+`200`. `/readyz` is on Qdrant's API-key whitelist, so this keeps working when
+`QDRANT_API_KEY` is set.
+
+`beat` watches the freshness of its own schedule file. A process check would be
+meaningless — beat is the container's `exec`'d main process, so its death takes
+the container with it — and the failure worth catching is a scheduler that runs
+but stops ticking. Celery's `PersistentScheduler` writes that file at startup
+and re-syncs it from the service loop at least every 300s, so a file that has
+not moved in 900s means the loop stopped. The path is set explicitly with
+`--schedule` in `backend/docker-entrypoint.sh`; the entrypoint and the
+healthcheck must agree on it.
 
 ---
 
@@ -298,6 +378,8 @@ Present for `nginx`, `frontend`, `backend`, `worker`, `postgres` and `redis`
 
 - `nginx/nginx.conf` defines the rate-limit zones: `api_limit` at 30 r/s and
   `auth_limit` at 5 r/s, both keyed on `$binary_remote_addr`.
+- `nginx/nginx.conf` also defines `map $http_upgrade $connection_upgrade`, the
+  standard mapping a WebSocket proxy needs.
 - `nginx/conf.d/researchsphere.conf` defines upstreams `backend:8000` and
   `frontend:8080`, sets `proxy_http_version 1.1`, and serves a single
   `server { listen 80; server_name _; }`.
@@ -328,12 +410,30 @@ Present for `nginx`, `frontend`, `backend`, `worker`, `postgres` and `redis`
 > Enabling TLS means supplying certificates and uncommenting those blocks. That
 > work is **not** part of this document and has not been done.
 
-> **Warning — the edge does not forward WebSocket upgrades.** The realtime
-> endpoint `/api/v1/ws` is matched by `location /api/`, but no configuration in
-> `nginx/` sets `proxy_set_header Upgrade` / `Connection "upgrade"`, and there is
-> no `$http_upgrade` map. The end-to-end realtime tests exercise the Vite dev
-> server's proxy, not this file, so the edge's WebSocket behaviour is unverified
-> as configured.
+### Realtime WebSocket
+
+`location ^~ /api/v1/ws` proxies the application's only WebSocket, forwarding
+`Upgrade` and `Connection: $connection_upgrade`, with buffering off and 3600s
+read/send timeouts — far beyond the 25s application heartbeat, so the
+application's own 60s heartbeat timeout decides when a socket is dead rather
+than the proxy.
+
+Two details matter if this block is ever edited:
+
+- `^~` rather than a plain prefix. Prefix matching already beats `/api/` on
+  length, but `^~` also stops any regex location from claiming the upgrade
+  request and proxying it without the `Upgrade` header.
+- The six shared `proxy_set_header` directives are repeated inside the location.
+  nginx inherits `proxy_set_header` from the enclosing level **only when the
+  current level declares none**, so setting `Upgrade` there would otherwise drop
+  `Host` and the `X-Forwarded-*` set — and losing `Host` makes the backend's
+  TrustedHost middleware reject the connection. `Origin` is deliberately not
+  declared: it is an ordinary request header nginx forwards unchanged, which is
+  what the backend checks against `CORS_ORIGINS`.
+
+The CI job `prod-stack` opens a real WebSocket through this proxy on every run
+and requires the upgrade, the echoed `bearer` subprotocol and a first event
+frame.
 
 ---
 
@@ -344,11 +444,11 @@ Present for `nginx`, `frontend`, `backend`, `worker`, `postgres` and `redis`
 | Aspect | Current definition |
 |---|---|
 | Trigger | Push of a tag matching `v*.*.*`, or `workflow_dispatch` with a `tag` input |
-| Permissions | `contents: write`, `packages: write`, `id-token: write` |
+| Permissions | `contents: write`, `packages: write`, `id-token: write`, `attestations: write` |
 | Job 1 — `verify` | Runs the backend tests, then the frontend tests and build, against the tagged commit |
-| Job 2 — `publish` | Needs `verify`. Matrix over `backend` (`backend/Dockerfile.prod`) and `frontend` (`frontend/Dockerfile.prod`); Buildx; logs in to `ghcr.io`; derives tags with `docker/metadata-action` as `{{version}}`, `{{major}}.{{minor}}`, `{{major}}`, long SHA, and `latest` on the default branch; builds with `push: true`, `provenance: true`, `sbom: true`; then `actions/attest-build-provenance` with `push-to-registry: true` |
+| Job 2 — `publish` | Needs `verify`. Matrix over `backend` (`backend/Dockerfile.prod`) and `frontend` (`frontend/Dockerfile.prod`); Buildx; logs in to `ghcr.io`; derives tags with `docker/metadata-action` as `{{version}}`, `{{major}}.{{minor}}`, `{{major}}` and long SHA — **no `latest`**; builds with `push: true`, `provenance: true`, `sbom: true`; then `actions/attest-build-provenance` with `push-to-registry: true` |
 | Job 3 — `release` | Needs `publish`. Creates a GitHub release with `softprops/action-gh-release`, whose notes include `docker pull` lines for both images and a link back to this document |
-| Registry | `ghcr.io/<owner>/<repo>/backend` and `…/frontend` |
+| Registry | `ghcr.io/kasirayapudi/researchsphere-ai/{backend,frontend}`. The name is lowercase because OCI repository names must be; it comes from `IMAGE_NAMESPACE` in the workflow env, which `docker-compose.prod.yml` mirrors verbatim |
 
 > **Status — never exercised.** No tag exists in this repository, locally or on
 > the remote, so `release.yml` has never run and no image has been published to
@@ -363,14 +463,25 @@ the deployment path is not mistaken for something more finished than it is.
 
 | # | Gap | Evidence |
 |---|---|---|
-| 1 | The release workflow has never been exercised | No tag exists locally or on the remote |
-| 2 | GHCR images are not consumed by the production stack | `docker-compose.prod.yml` references `researchsphere/*` with `build:` stanzas and never mentions `ghcr.io` |
-| 3 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
-| 4 | `beat` and `qdrant` have no healthcheck | `docker-compose.prod.yml` |
-| 5 | The edge does not forward WebSocket upgrades | No `Upgrade`/`Connection: upgrade` headers and no `$http_upgrade` map anywhere in `nginx/` |
-| 6 | `.env.prod.example` is not tracked | `.gitignore` ignores `.env.*` and re-includes only `.env.example`, yet `make prod` tells you to copy it |
-| 7 | The Compose stack is never started by CI | CI builds both production images and smoke-tests them individually; the E2E job runs its own services rather than this Compose topology, so `docker-compose.prod.yml` itself is unverified |
-| 8 | Kubernetes support is absent | No manifests, chart or overlays exist |
+| 1 | The release workflow has never been exercised | No tag exists locally or on the remote, so no image has ever been published and **pulling from GHCR has never actually been performed**. The CI job builds the images under their Compose names and starts the stack with `--no-build`, which verifies the published-image *path* but not a real registry pull |
+| 2 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
+| 3 | The release artefact is not self-sufficient | `release.yml` attaches `docker-compose.prod.yml` and `.env.prod.example`, but nginx bind-mounts three paths from `./nginx`, which is not attached. A host still needs those files from the repository |
+| 4 | The SSE/chat location drops the shared proxy headers | `location /api/v1/chat/stream` sets `proxy_set_header Connection ''`, and nginx inherits `proxy_set_header` only when a level declares none — so that block loses `Host` and the `X-Forwarded-*` set. With `Host` missing the backend's TrustedHost middleware would reject the request. Found while fixing the WebSocket path; **not fixed here**, because it is outside the scope of this change |
+| 5 | Kubernetes support is absent | No manifests, chart or overlays exist |
+
+### Closed since the previous revision
+
+| Gap | How |
+|---|---|
+| GHCR images were not consumed by the production stack | `docker-compose.prod.yml` now names the GHCR images and carries no `build:` stanza; the build instructions moved to `docker-compose.prod.build.yml` and `make prod-pull` was added |
+| `beat` and `qdrant` had no healthcheck | Both now have one — see [§8](#8-health-and-validation) — and every consumer gates on `service_healthy` |
+| The edge did not forward WebSocket upgrades | `map $http_upgrade $connection_upgrade` plus `location ^~ /api/v1/ws` — see [§9](#9-nginx-and-tls) |
+| `.env.prod.example` was not tracked | `.gitignore` now re-includes it and the template is committed, with every secret-bearing value empty |
+| The Compose stack was never started by CI | The `prod-stack` job starts all eight services, waits for every healthcheck, drives the edge and opens a real WebSocket through it |
+| `beat` declared `deploy:` twice | The duplicate — a copy of the worker's limits — was removed; beat keeps 0.25 CPU / 256M |
+| The backend healthcheck probed `/api/live` while claiming readiness | Both `docker-compose.prod.yml` and `backend/Dockerfile.prod` now probe `/api/ready` |
+| The release workflow named an uppercase repository | `IMAGE_NAMESPACE` supplies the lowercase name to the attestation subject and the release notes |
+| `latest` was referenced but never published | The dead metadata rule was removed and `IMAGE_TAG` is now explicit — see [§4](#4-production-images) |
 
 ---
 
@@ -391,9 +502,25 @@ here yet.
 
 Every command, service name, environment variable, image name, port and workflow
 behaviour above was read from the files it describes:
-`docker-compose.prod.yml`, `backend/Dockerfile.prod`,
-`frontend/Dockerfile.prod`, `backend/docker-entrypoint.sh`,
-`backend/.env.example`, `Makefile`, `.github/workflows/release.yml`,
-`nginx/nginx.conf`, `nginx/conf.d/researchsphere.conf` and `README.md`.
+`docker-compose.prod.yml`, `docker-compose.prod.build.yml`,
+`backend/Dockerfile.prod`, `frontend/Dockerfile.prod`,
+`backend/docker-entrypoint.sh`, `.env.prod.example`, `backend/.env.example`,
+`.gitignore`, `Makefile`, `.github/workflows/release.yml`,
+`.github/workflows/ci.yml`, `nginx/nginx.conf`,
+`nginx/conf.d/researchsphere.conf` and `README.md`.
 
-No part of this document has been validated by performing a real deployment.
+**What has been verified, and how:**
+
+| Claim | Verified by |
+|---|---|
+| The Compose files parse and the topology starts | The `prod-stack` CI job — `docker compose config` on both file sets, then all eight services healthy |
+| The edge proxies the API, serves the SPA and upgrades WebSockets | The same job, against the running stack |
+| The datastores are not reachable from the host | The same job |
+| The nginx configuration is syntactically valid in every context | Parsed with NGINX's own parser (crossplane) |
+| The qdrant and beat healthcheck commands work | Executed locally against live and dead endpoints, in both the healthy and unhealthy cases |
+| `/api/ready` gates on dependencies | The repository's own test suite |
+| The release workflow's structure is unchanged apart from the naming fix | Parsed and compared against the previous revision |
+
+**What has not been verified:** no real deployment has been performed, no image
+has been pulled from GHCR, and TLS has never been enabled. `release.yml` has
+still never run.
