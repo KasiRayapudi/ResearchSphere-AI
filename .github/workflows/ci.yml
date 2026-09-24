@@ -975,12 +975,308 @@ jobs:
             frontend/test-results/
           retention-days: 14
 
+  # ------------------------------------------------------ production stack --
+  # docker-compose.prod.yml was never started by anything. CI built the two
+  # production images and smoke-tested them one at a time, and the e2e job runs
+  # its own services rather than this topology, so the Compose file was not
+  # merely unverified -- nothing had ever parsed it. This job starts the real
+  # thing: nginx, frontend, backend, worker, beat, Postgres, Qdrant and Redis,
+  # on the split networks, with the production healthchecks gating startup, and
+  # then drives it through the edge proxy -- including the WebSocket upgrade,
+  # which the e2e suite reaches through the Vite dev proxy instead and so has
+  # never exercised in its production form.
+  #
+  # The images are built here rather than pulled, because nothing has been
+  # published to GHCR yet. They are tagged with the exact names Compose
+  # expects and the stack is started with --no-build, so this exercises the
+  # published-image path rather than the build overlay; the overlay is checked
+  # separately by asking Compose to merge it.
+  prod-stack:
+    name: Production stack verification
+    runs-on: ubuntu-latest
+    # After docker-build, so the layer cache for both Dockerfiles is warm.
+    needs: [docker-build]
+    env:
+      EDGE: http://localhost
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the backend image under its Compose name
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: false
+          load: true
+          tags: ghcr.io/kasirayapudi/researchsphere-ai/backend:ci
+          cache-from: type=gha,scope=backend
+
+      - name: Build the frontend image under its Compose name
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: false
+          load: true
+          tags: ghcr.io/kasirayapudi/researchsphere-ai/frontend:ci
+          cache-from: type=gha,scope=frontend
+
+      # Throwaway values for this runner only: generated, never committed, and
+      # the path stays gitignored. That the stack refuses to start without them
+      # is itself part of what this job verifies.
+      - name: Compose a throwaway .env.prod
+        run: |
+          python3 - <<'PY'
+          import base64
+          import pathlib
+          import secrets
+
+          values = {
+              "SECRET_KEY": base64.b64encode(secrets.token_bytes(48)).decode(),
+              "POSTGRES_PASSWORD": secrets.token_hex(24),
+              "REDIS_PASSWORD": secrets.token_hex(24),
+              "GEMINI_API_KEY": "ci-not-a-real-key",
+              "FRONTEND_URL": "http://localhost",
+              "CORS_ORIGINS": "http://localhost",
+              "TRUSTED_HOSTS": "localhost",
+              "IMAGE_TAG": "ci",
+          }
+          out, seen = [], set()
+          for line in pathlib.Path(".env.prod.example").read_text().splitlines():
+              key = line.split("=", 1)[0] if ("=" in line and not line.startswith("#")) else None
+              if key in values:
+                  out.append(key + "=" + values[key])
+                  seen.add(key)
+              else:
+                  out.append(line)
+          for key, value in values.items():
+              if key not in seen:
+                  out.append(key + "=" + value)
+          pathlib.Path(".env.prod").write_text("\n".join(out) + "\n")
+
+          print("keys written (values withheld):")
+          for line in out:
+              if "=" in line and not line.startswith("#"):
+                  print("  " + line.split("=", 1)[0])
+          PY
+
+      # The first time anything has asked Docker to read these files.
+      - name: Compose parses both file sets
+        run: |
+          echo "--- published-image file: what a deployment runs ---"
+          docker compose -f docker-compose.prod.yml --env-file .env.prod config --quiet
+          echo "ok"
+          echo "--- with the build overlay: what make prod uses ---"
+          docker compose -f docker-compose.prod.yml -f docker-compose.prod.build.yml --env-file .env.prod config --quiet
+          echo "ok"
+
+      - name: The images Compose names are present
+        run: |
+          for svc in backend frontend; do
+            image="ghcr.io/kasirayapudi/researchsphere-ai/$svc:ci"
+            docker image inspect "$image" > /dev/null
+            echo "present: $image"
+          done
+
+      # The backend refuses to start against a schema it was not built for, so
+      # migrations run as a separate one-shot step exactly as in production.
+      - name: Start the datastores and migrate
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --no-build postgres redis qdrant
+          pending="not checked"
+          deadline=$((SECONDS + 240))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in postgres redis qdrant; do
+              cid="$(docker compose -f docker-compose.prod.yml --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "datastores healthy"
+              break
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          if [ -n "$pending" ]; then
+            echo "::error::datastores did not become healthy:$pending"
+            exit 1
+          fi
+          docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend migrate
+
+      - name: Start the full stack
+        run: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --no-build
+
+      # Every service, including the two that had no healthcheck before this
+      # batch. beat's first probe only runs after its 60s interval, which is
+      # why the budget is generous.
+      - name: Every service reports healthy
+        run: |
+          services="nginx frontend backend worker beat postgres qdrant redis"
+          pending="not checked"
+          deadline=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in $services; do
+              cid="$(docker compose -f docker-compose.prod.yml --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "all 8 services healthy"
+              docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+              exit 0
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          echo "::error::services did not become healthy:$pending"
+          docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+          exit 1
+
+      - name: The edge serves the SPA and proxies the API
+        run: |
+          echo "--- nginx own health ---"
+          curl --fail --silent --show-error "$EDGE/healthz"
+          echo
+          echo "--- backend diagnostics through the edge ---"
+          curl --fail --silent --show-error "$EDGE/api/health" | head -c 400
+          echo
+          status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' "$EDGE/api/ready")"
+          if [ "$status" != "200" ]; then
+            echo "::error::readiness through the edge returned $status"
+            exit 1
+          fi
+          echo "readiness through the edge: $status"
+          echo "--- SPA through the edge ---"
+          body="$(curl --fail --silent --show-error "$EDGE/")"
+          printf '%s' "$body" | grep -qi "<!doctype html"
+          echo "index.html served through nginx, $(printf '%s' "$body" | wc -c) bytes"
+
+      # The datastores are on backend_net only and publish no ports; if any of
+      # them answers on the host, the network split has been broken.
+      - name: The datastores are not reachable from the host
+        run: |
+          for port in 5432 6379 6333; do
+            if curl --silent --max-time 3 "http://127.0.0.1:$port" > /dev/null 2>&1; then
+              echo "::error::port $port answered on the host; it must not be published"
+              exit 1
+            fi
+            echo "port $port is not reachable from the host, as intended"
+          done
+
+      # The assertion this batch exists for. Before the nginx change an upgrade
+      # request fell through to location /api/ and never became a WebSocket,
+      # and nothing in CI would have noticed.
+      - name: A WebSocket upgrade survives the edge proxy
+        run: |
+          python3 -m pip install --quiet "websockets==12.0"
+          python3 - <<'PY'
+          import asyncio
+          import json
+          import secrets
+          import sys
+          import urllib.error
+          import urllib.request
+
+          import websockets
+
+          EDGE = "http://localhost"
+          UPPER = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+          LOWER = "abcdefghijkmnopqrstuvwxyz"
+          DIGIT = "23456789"
+          SPECIAL = "!@#%^&*"
+
+
+          def password():
+              # Mirrors what the backend policy accepts: alternate a letter and
+              # a non-letter so no run of repeats or sequences can form.
+              out = []
+              for pair in range(8):
+                  out.append(secrets.choice(UPPER if pair % 2 == 0 else LOWER))
+                  out.append(secrets.choice(DIGIT if pair % 2 == 0 else SPECIAL))
+              return "".join(out)
+
+
+          def call(path, payload=None, token=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(EDGE + path, data=data)
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Origin", EDGE)
+              if token:
+                  req.add_header("Authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return json.loads(response.read().decode())
+              except urllib.error.HTTPError as exc:
+                  sys.exit("%s failed: HTTP %s %s" % (path, exc.code, exc.read().decode()[:300]))
+
+          marker = secrets.token_hex(6)
+          created = call("/api/v1/auth/signup", {
+              "name": "Prod Stack Probe",
+              "email": "prod-stack-%s@example.test" % marker,
+              "password": password(),
+          })
+          token = created["access_token"]
+          workspace_id = call("/api/v1/workspaces", token=token)[0]["id"]
+          print("signed up through the edge; workspace %s" % workspace_id)
+
+
+          async def probe():
+              url = "ws://localhost/api/v1/ws?workspace_id=%s" % workspace_id
+              async with websockets.connect(
+                  url,
+                  subprotocols=["bearer", token],
+                  origin=EDGE,
+                  open_timeout=30,
+                  close_timeout=5,
+              ) as socket:
+                  print("handshake completed through nginx")
+                  print("negotiated subprotocol: %r" % socket.subprotocol)
+                  if socket.subprotocol != "bearer":
+                      sys.exit("the server did not echo the bearer subprotocol")
+                  raw = await asyncio.wait_for(socket.recv(), timeout=30)
+                  return json.loads(raw)
+
+          event = asyncio.run(probe())
+          if not isinstance(event, dict) or "type" not in event:
+              sys.exit("unexpected first frame: %r" % (event,))
+          print("first frame through the proxy: %s" % json.dumps(event)[:300])
+          print("::notice::Production WebSocket verified through nginx: upgrade "
+                "accepted, bearer subprotocol echoed, first event type %r" % event["type"])
+          PY
+
+      - name: Stack state and logs
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+          docker compose -f docker-compose.prod.yml --env-file .env.prod logs --tail=150
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.prod.yml --env-file .env.prod down -v --remove-orphans
+
   # ------------------------------------------------------------------- gate --
   ci-passed:
     name: CI passed
     runs-on: ubuntu-latest
     if: always()
-    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build, e2e]
+    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build, e2e, prod-stack]
     steps:
       # A single required status check for branch protection. Without this,
       # protection rules have to enumerate every matrix leg by name.
