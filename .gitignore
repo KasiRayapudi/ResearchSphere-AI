@@ -56,8 +56,11 @@ backend/uploads/
 # Docker dev file (optional)
 Dockerfile.dev
 
-# Production secrets - only the example template is tracked
+# Production secrets - only the example template is tracked. The blanket
+# `.env.*` rule above hides the template too, so it needs its own negation;
+# without it a fresh clone has no file for `make prod` to tell you to copy.
 .env.prod
+!.env.prod.example
 nginx/certs/*
 !nginx/certs/.gitkeep
 

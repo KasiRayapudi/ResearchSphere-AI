@@ -92,7 +92,7 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_healthy
     environment: &backend_env
@@ -155,7 +155,7 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_healthy
     environment:
@@ -192,12 +192,41 @@ services:
     command: ["beat"]
     <<: *default-restart
     depends_on:
+      # The beat branch of docker-entrypoint.sh calls wait_for_dependencies(),
+      # which blocks on the database and Qdrant, so declaring them here means
+      # the scheduler waits on health instead of burning its startup budget in
+      # a TCP retry loop. Deliberately not gated on the worker's health: beat
+      # only publishes to the broker, and a queued task waits perfectly well.
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
       redis:
         condition: service_healthy
       worker:
         condition: service_started
     environment:
       <<: *backend_env
+    # A scheduler that is running but no longer ticking is the failure worth
+    # catching, and a process check cannot see it: beat is the container's
+    # exec'd main process, so if it had died the container would already be
+    # gone. PersistentScheduler writes its shelve file at startup and re-syncs
+    # from the service loop once more than Scheduler.sync_every (180s) has
+    # passed (celery/beat.py:379-383, 646-649), while the loop itself wakes at
+    # least every DEFAULT_MAX_INTERVAL (300s). A file that has not moved in
+    # 900s therefore means the loop stopped. The glob covers shelve picking
+    # dbm.gnu (one file) or dbm.dumb (.dat/.dir/.bak).
+    # The path is fixed by --schedule in docker-entrypoint.sh; keep them in step.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import glob, os, sys, time; f = glob.glob('/tmp/celerybeat-schedule*'); sys.exit(0 if f and time.time() - max(os.path.getmtime(x) for x in f) < 900 else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     logging: *default-logging
     networks: [backend_net]
     security_opt:
@@ -205,10 +234,6 @@ services:
     deploy:
       resources:
         limits: { cpus: "0.25", memory: 256M }
-    deploy:
-      resources:
-        limits: { cpus: "2.00", memory: 4G }
-        reservations: { memory: 1G }
 
   # -------------------------------------------------------------- postgres --
   postgres:
@@ -254,6 +279,22 @@ services:
       - "6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    # The image ships no HTTP client -- verified against its published layers:
+    # neither curl nor wget is present -- but its Debian base does provide
+    # bash, so the request is made with bash's /dev/tcp. /readyz is Qdrant's
+    # own readiness endpoint and sits on its API-key whitelist
+    # (src/actix/mod.rs:94-97 at v1.8.0), so this keeps working when
+    # QDRANT_API_KEY is set.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && head -n 1 <&3 | grep -q "200 OK"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     logging: *default-logging
     networks: [backend_net]
     security_opt:

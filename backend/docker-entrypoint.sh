@@ -161,7 +161,12 @@ case "${1:-serve}" in
         validate_config
 
         log INFO "starting celery beat"
-        exec python -m celery -A app.worker.celery_app:celery_app beat             --loglevel "${CELERY_LOG_LEVEL:-info}"
+        # --schedule is given explicitly rather than left to Celery's relative
+        # default ("celerybeat-schedule" in the working directory): the beat
+        # service's healthcheck watches this file's mtime to tell a ticking
+        # scheduler from a hung one, and it has to know where to look. Keep
+        # the path in step with docker-compose.prod.yml.
+        exec python -m celery -A app.worker.celery_app:celery_app beat             --loglevel "${CELERY_LOG_LEVEL:-info}"             --schedule "${CELERYBEAT_SCHEDULE:-/tmp/celerybeat-schedule}"
         ;;
 
     *)
