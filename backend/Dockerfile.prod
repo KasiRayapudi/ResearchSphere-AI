@@ -77,11 +77,15 @@ USER appuser
 EXPOSE 8000
 
 # Uses the readiness probe, so an instance whose database or vector store is
-# unreachable is reported unhealthy rather than merely "running". The
-# comment said exactly that while the command probed /api/live, which does
-# no dependency I/O at all; the command is what changed.
+# unreachable is reported unhealthy rather than merely "running".
+#
+# The Host header is explicit because TrustedHostMiddleware fronts every
+# route: a probe of 127.0.0.1 sends "Host: 127.0.0.1:8000", which no real
+# TRUSTED_HOSTS contains, and was answered 400 before reaching the endpoint.
+# The first TRUSTED_HOSTS entry is valid by construction; localhost is the
+# fallback for running this image without that variable set.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl --fail --silent --show-error http://127.0.0.1:8000/api/ready || exit 1
+    CMD probe_host="${TRUSTED_HOSTS%%,*}"; curl --fail --silent --show-error --header "Host: ${probe_host:-localhost}" http://127.0.0.1:8000/api/ready || exit 1
 
 # tini reaps zombies and forwards signals; the entrypoint waits for
 # dependencies and then execs the server so it becomes PID 1's direct child.

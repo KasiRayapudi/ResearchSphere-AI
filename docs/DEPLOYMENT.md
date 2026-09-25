@@ -91,7 +91,6 @@ missing or empty**.
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `10080` |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `30` |
 | `QDRANT_COLLECTION` | `researchsphere_docs` |
-| `QDRANT_API_KEY` | empty |
 | `REDIS_MAXMEMORY` | `256mb` |
 
 ### Values Compose derives for you
@@ -355,11 +354,26 @@ an instance healthy with its database or vector store unreachable. Resource
 pressure deliberately does not fail readiness, so a disk at 85% warns through
 `/api/health` rather than pulling the instance out.
 
+The probe also sets its `Host` header to the first entry of `TRUSTED_HOSTS`, and
+that is not cosmetic. `TrustedHostMiddleware` fronts every route and answers
+`400` for a `Host` outside `TRUSTED_HOSTS`, health endpoints included. Probing
+`http://127.0.0.1:8000/...` sends `Host: 127.0.0.1:8000`, which no real
+`TRUSTED_HOSTS` contains, so the probe was rejected and the container could
+never become healthy. Deriving the header from the configured value keeps the
+probe valid for any deployment without widening the allowlist. The same applies
+to the image's own `HEALTHCHECK` in `backend/Dockerfile.prod`, which falls back
+to `localhost` when the variable is unset.
+
 `qdrant` has no HTTP client in its image — neither `curl` nor `wget` is present
 — but its Debian base does provide `bash`, so the probe issues a real HTTP
 request through bash's `/dev/tcp` against Qdrant's own `/readyz` and requires a
-`200`. `/readyz` is on Qdrant's API-key whitelist, so this keeps working when
-`QDRANT_API_KEY` is set.
+`200`. `/readyz` sits on Qdrant's API-key whitelist, which means it answers even
+when Qdrant is configured to require a key — so a healthy `qdrant` container is
+**not** evidence that the backend can query it. Qdrant runs unauthenticated
+here: no API key is configured, because Qdrant enforces one as soon as the
+setting is present at all (an empty value included) and the backend has no key
+to send. Its protection is the network — it publishes no port and is reachable
+only from `backend_net`.
 
 `beat` watches the freshness of its own schedule file. A process check would be
 meaningless — beat is the container's `exec`'d main process, so its death takes

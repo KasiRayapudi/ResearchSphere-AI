@@ -136,8 +136,19 @@ services:
     # to it. /api/ready answers 503 until every required dependency responds.
     # Resource pressure does not fail it -- see _READY_STATUSES -- so a full
     # disk warns rather than pulling the instance out.
+    #
+    # The Host header is set explicitly, and this is not cosmetic. The
+    # application puts TrustedHostMiddleware in front of every route, so a
+    # request whose Host is not in TRUSTED_HOSTS is answered 400 before
+    # routing -- including the health endpoints. Probing 127.0.0.1 sends
+    # "Host: 127.0.0.1:8000", which no real TRUSTED_HOSTS contains, so the
+    # probe was rejected and the container could never become healthy. Taking
+    # the first TRUSTED_HOSTS entry keeps the probe valid for whatever this
+    # deployment is configured with, without widening the allowlist.
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/api/ready"]
+      test:
+        - CMD-SHELL
+        - 'probe_host="$${TRUSTED_HOSTS%%,*}"; curl --fail --silent --header "Host: $${probe_host:-localhost}" http://127.0.0.1:8000/api/ready'
       interval: 30s
       timeout: 10s
       retries: 3
@@ -278,8 +289,16 @@ services:
     image: qdrant/qdrant:v1.8.0
     container_name: rs-qdrant
     <<: *default-restart
+    # No API key is configured, deliberately. Qdrant enables authentication
+    # whenever service.api_key is present at all -- an empty value included,
+    # because that deserializes to Some("") rather than None (Qdrant
+    # src/common/auth.rs AuthKeys::try_create) -- and then answers every
+    # unauthenticated request 403 "Invalid api-key". Nothing on the client
+    # side could satisfy it: the backend has no QDRANT_API_KEY setting and no
+    # QdrantClient here passes api_key. Qdrant's protection is the network:
+    # it publishes no port and is reachable only from backend_net, which is
+    # the same contract the development stack uses.
     environment:
-      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
       QDRANT__LOG_LEVEL: INFO
     expose:
       - "6333"
@@ -290,8 +309,9 @@ services:
     # neither curl nor wget is present -- but its Debian base does provide
     # bash, so the request is made with bash's /dev/tcp. /readyz is Qdrant's
     # own readiness endpoint and sits on its API-key whitelist
-    # (src/actix/mod.rs:94-97 at v1.8.0), so this keeps working when
-    # QDRANT_API_KEY is set.
+    # (src/actix/mod.rs:94-97 at v1.8.0), so it answers even when Qdrant is
+    # configured to require a key -- which is exactly why a healthy container
+    # here does not prove the backend can query it.
     healthcheck:
       test:
         - CMD
