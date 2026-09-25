@@ -185,8 +185,31 @@ services:
       - uploads_data:/app/uploads
       # Shared with the API so the embedding model is downloaded once.
       - model_cache:/home/appuser/.cache
+    # `inspect ping` against this worker's own node name. That is the check
+    # worth having: it proves the process is consuming from the broker, not
+    # merely that it is running.
+    #
+    # The node name has to be resolved at probe time rather than written down.
+    # The worker registers as ingest@<hostname> -- docker-entrypoint.sh passes
+    # --hostname "ingest@%h", and Celery expands %h with socket.gethostname()
+    # -- while Docker assigns the container hostname at run time. The previous
+    # form passed "ingest@$$HOSTNAME" through an exec-form CMD, which runs with
+    # no shell, so Celery received that literal string, matched no node and
+    # answered EX_UNAVAILABLE; the probe could never succeed and the worker
+    # was permanently unhealthy.
+    #
+    # It is resolved with socket.gethostname(), the identical function Celery
+    # itself uses, so the two cannot disagree. Deliberately not a shell
+    # expansion: that would add a dependency on HOSTNAME being exported or on
+    # a hostname binary, whereas python and this import are already required
+    # by the probe. timeout=1.0 is the celery CLI's own default, so the reply
+    # window is unchanged.
     healthcheck:
-      test: ["CMD", "python", "-m", "celery", "-A", "app.worker.celery_app:celery_app", "inspect", "ping", "-d", "ingest@$$HOSTNAME"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket, sys; from app.worker.celery_app import celery_app; node = 'ingest@' + socket.gethostname(); sys.exit(0 if celery_app.control.inspect(timeout=1.0, destination=[node]).ping() else 1)"
       interval: 60s
       timeout: 15s
       retries: 3

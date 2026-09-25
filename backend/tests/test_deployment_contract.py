@@ -129,6 +129,87 @@ class TestBackendHealthcheck:
         assert "Host: " in healthcheck
 
 
+# ------------------------------------------------------- the worker's own node --
+class TestWorkerHealthcheck:
+    """The probe must address the node name the worker actually registers.
+
+    Docker's exec form (``test: ["CMD", ...]``) runs without a shell, so a
+    ``$VAR`` in it is passed through literally. The probe used to ask for
+    ``ingest@$HOSTNAME``, which matched no node, so Celery answered
+    EX_UNAVAILABLE and the worker was permanently unhealthy -- while the
+    container itself was running perfectly well.
+    """
+
+    @staticmethod
+    def _worker_probe() -> str:
+        test = _compose(PROD_COMPOSE)["services"]["worker"]["healthcheck"]["test"]
+        assert test[:3] == ["CMD", "python", "-c"], f"unexpected probe shape: {test[:3]}"
+        return test[3]
+
+    @staticmethod
+    def _entrypoint_hostname() -> str:
+        """The --hostname the worker is launched with, read from the entrypoint."""
+        entrypoint = (REPO_ROOT / "backend" / "docker-entrypoint.sh").read_text(encoding="utf-8")
+        found = re.findall(r'--hostname\s+"([^"]+)"', entrypoint)
+        assert len(found) == 1, f"expected one --hostname in the entrypoint, found {found}"
+        return found[0]
+
+    def test_the_probe_resolves_the_registered_node_name(self):
+        """Execute the probe's own destination expression and compare it.
+
+        This is the assertion that matters: it runs the code the container
+        runs, rather than restating the expected string, so the two cannot
+        drift apart.
+        """
+        from celery.utils.nodenames import default_nodename, host_format
+
+        # Everything before the ping is the import plus the node computation.
+        prelude = self._worker_probe().split("sys.exit(")[0]
+        namespace: dict = {}
+        exec(prelude, namespace)  # noqa: S102 - the probe's own code, from the repo
+        assert "node" in namespace, (
+            "the probe must bind its destination to `node` before the ping, so "
+            "that this test can compare it against the worker's registered name"
+        )
+        resolved = namespace["node"]
+
+        # What Celery will register the worker as, from the same launch
+        # argument the entrypoint passes.
+        expected = host_format(default_nodename(self._entrypoint_hostname()))
+
+        assert resolved == expected, (
+            f"the probe would ping {resolved!r} but the worker registers as "
+            f"{expected!r}; no node would reply"
+        )
+
+    def test_the_probe_targets_one_node_rather_than_broadcasting(self):
+        probe = self._worker_probe()
+        assert "destination=[node]" in probe, (
+            "the probe must address this worker's node; a broadcast ping would "
+            "pass while this container is dead as long as any worker replies"
+        )
+        assert ".ping()" in probe, "the Celery ping semantics must be preserved"
+
+    def test_no_exec_form_healthcheck_relies_on_shell_expansion(self):
+        """The general form of the defect, across every service.
+
+        Exec form does not expand variables, so a `$` in one is either a
+        literal that will not match anything or a silent no-op.
+        """
+        services = _compose(PROD_COMPOSE)["services"]
+        offenders = {
+            name: spec["healthcheck"]["test"]
+            for name, spec in services.items()
+            if "healthcheck" in spec
+            and spec["healthcheck"]["test"][0] == "CMD"
+            and any("$" in str(arg) for arg in spec["healthcheck"]["test"][1:])
+        }
+        assert not offenders, (
+            "exec-form healthchecks cannot expand shell variables: "
+            f"{offenders}. Use CMD-SHELL, or resolve the value in-process."
+        )
+
+
 # --------------------------------------------------------- the Qdrant contract --
 class TestQdrantAuthentication:
     """Server-side and client-side Qdrant auth must agree, or nothing works."""
