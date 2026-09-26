@@ -77,12 +77,19 @@ missing or empty**.
 | `CORS_ORIGINS` | Allowed browser origins; also the allow-list for WebSocket `Origin` checks |
 | `FRONTEND_URL` | Absolute URL of the deployed frontend |
 | `TRUSTED_HOSTS` | `TrustedHostMiddleware` allow-list |
+| `IMAGE_TAG` | Which build of the application images to run. **There is no default and no `latest` image tag** — see [§4](#4-production-images) |
+
+> **`IMAGE_TAG` must be set explicitly.** Deploying release `v1.0.0` means
+> `IMAGE_TAG=1.0.0`, which is the tag that release actually publishes, alongside
+> the other version tags in [§4](#4-production-images). Nothing publishes
+> `latest`, so there is no moving tag to fall back to and no way to deploy
+> "whatever is newest" by accident. `IMAGE_TAG=local` is the separate
+> local-build mode, used with the build overlay via `make prod`.
 
 ### Optional values (defaults applied by Compose)
 
 | Variable | Default |
 |---|---|
-| `IMAGE_TAG` | `latest` |
 | `HTTP_PORT` | `80` |
 | `WEB_CONCURRENCY` | `4` |
 | `GRACEFUL_TIMEOUT` | `30` |
