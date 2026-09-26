@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, CheckCircle2, Sparkles, Database, ShieldCheck, FileText } from 'lucide-react';
+import { CheckCircle2 } from 'lucide-react';
 import { Card } from '../common/Card';
 
 export const WorkflowDiagram: React.FC = () => {

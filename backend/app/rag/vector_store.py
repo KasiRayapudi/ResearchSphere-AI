@@ -1,9 +1,12 @@
 """
 Qdrant Vector Store Service - Real vector storage and similarity search.
 """
-import uuid
+
 import logging
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import Any
+
+from app.core import metrics
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -16,21 +19,20 @@ def get_qdrant_client():
     global _client
     if _client is None:
         from qdrant_client import QdrantClient
-        from qdrant_client.models import Distance, VectorParams
-        
+
         _client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
         logger.info(f"Connected to Qdrant at {settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
-        
+
         # Ensure collection exists
         _ensure_collection(_client)
-    
+
     return _client
 
 
 def _ensure_collection(client):
     """Create Qdrant collection if it doesn't exist."""
     from qdrant_client.models import Distance, VectorParams
-    
+
     collections = [c.name for c in client.get_collections().collections]
     if settings.QDRANT_COLLECTION not in collections:
         client.create_collection(
@@ -44,25 +46,27 @@ def _ensure_collection(client):
 
 
 def upsert_chunks(
-    chunks: List[Dict[str, Any]],
-    embeddings: List[List[float]],
+    chunks: list[dict[str, Any]],
+    embeddings: list[list[float]],
     document_id: str,
     workspace_id: str,
-) -> List[str]:
+) -> list[str]:
     """
     Store chunks and their embeddings in Qdrant.
     Returns list of Qdrant point IDs.
     """
     from qdrant_client.models import PointStruct
-    
+
     client = get_qdrant_client()
     points = []
     point_ids = []
-    
-    for chunk, embedding in zip(chunks, embeddings):
+
+    # strict=True: a chunk/embedding length mismatch is a bug, and zip's
+    # default would silently drop the tail rather than surface it.
+    for chunk, embedding in zip(chunks, embeddings, strict=True):
         point_id = str(uuid.uuid4())
         point_ids.append(point_id)
-        
+
         points.append(
             PointStruct(
                 id=point_id,
@@ -76,48 +80,49 @@ def upsert_chunks(
                 },
             )
         )
-    
+
     if points:
         client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points)
         logger.info(f"Stored {len(points)} vectors for document {document_id}")
-    
+
     return point_ids
 
 
 def search_similar(
-    query_embedding: List[float],
+    query_embedding: list[float],
     workspace_id: str,
     top_k: int = 5,
-    document_ids: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
+    document_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Search Qdrant for similar chunks within a workspace.
     Optionally filter by specific document IDs.
     """
-    from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
-    
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
     client = get_qdrant_client()
-    
+
     # Build filter: must match workspace
-    must_conditions = [
-        FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
-    ]
-    
+    must_conditions = [FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))]
+
     if document_ids:
-        must_conditions.append(
-            FieldCondition(key="document_id", match=MatchAny(any=document_ids))
-        )
-    
+        must_conditions.append(FieldCondition(key="document_id", match=MatchAny(any=document_ids)))
+
     search_filter = Filter(must=must_conditions)
-    
-    results = client.search(
-        collection_name=settings.QDRANT_COLLECTION,
-        query_vector=query_embedding,
-        query_filter=search_filter,
-        limit=top_k,
-        with_payload=True,
-    )
-    
+
+    with metrics.track_duration(metrics.retrieval_duration_seconds):
+        results = client.search(
+            collection_name=settings.QDRANT_COLLECTION,
+            query_vector=query_embedding,
+            query_filter=search_filter,
+            limit=top_k,
+            with_payload=True,
+        )
+
+    # A spike at zero here means retrieval is finding nothing and answers are
+    # ungrounded - the single most useful RAG health signal.
+    metrics.safe(metrics.retrieval_results.observe, len(results))
+
     return [
         {
             "chunk_id": str(r.id),
@@ -133,8 +138,8 @@ def search_similar(
 
 def delete_document_vectors(document_id: str) -> None:
     """Remove all vectors belonging to a document."""
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
-    
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
     client = get_qdrant_client()
     client.delete(
         collection_name=settings.QDRANT_COLLECTION,

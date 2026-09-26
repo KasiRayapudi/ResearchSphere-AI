@@ -1,0 +1,42 @@
+###############################################################################
+# ResearchSphere AI - build overlay for the production stack.
+#
+# docker-compose.prod.yml runs published images and deliberately carries no
+# build: stanza, so a deployment host needs no application source. This file
+# adds the build instructions back for the case where the images are produced
+# from this working tree instead of pulled:
+#
+#   make prod-build      # build only
+#   make prod            # build and start
+#
+# It is an overlay, never used on its own:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.build.yml \
+#       --env-file .env.prod build
+#
+# The image names and tags come from the base file, so a locally built image
+# is tagged exactly like a published one. Set IMAGE_TAG=local (the value in
+# .env.prod.example) to keep the two apart at a glance.
+#
+# worker and beat run the backend image and so are not listed here: they are
+# tagged by the backend build above, exactly as before this file existed.
+###############################################################################
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        # Same-origin: the edge proxy routes /api to the backend.
+        VITE_API_URL: /api
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod

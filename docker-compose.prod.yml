@@ -1,0 +1,403 @@
+###############################################################################
+# ResearchSphere AI - production stack.
+#
+#   cp .env.prod.example .env.prod   # then fill in real secrets
+#
+# This file runs PUBLISHED images from GHCR and carries no build: stanza, so
+# a host needs no application source to deploy:
+#
+#   make prod-pull                   # pull IMAGE_TAG and start
+#
+# To build the images from this working tree instead, add the build overlay,
+# which is what `make prod` does:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.build.yml #       --env-file .env.prod up -d --build
+#
+# Either way the nginx/ directory must be present next to this file: the edge
+# proxy bind-mounts its configuration from it.
+#
+# Differences from docker-compose.yml (which stays as the development stack):
+#   - multi-stage production images, all running as non-root
+#   - nginx edge proxy is the only published port; nothing else is exposed
+#   - datastore ports are NOT published to the host
+#   - healthchecks gate startup ordering via depends_on/service_healthy
+#   - restart policies, resource limits and log rotation on every service
+#   - required secrets have no defaults, so the stack refuses to start without
+#     them rather than silently using a well-known value
+###############################################################################
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------ edge --
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: rs-nginx
+    <<: *default-restart
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      # Uncomment together with the TLS block in nginx/conf.d/.
+      # - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - certbot_www:/var/www/certbot
+      - nginx_logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    networks: [frontend_net, backend_net]
+
+  # -------------------------------------------------------------- frontend --
+  frontend:
+    image: ghcr.io/kasirayapudi/researchsphere-ai/frontend:${IMAGE_TAG:?IMAGE_TAG is required - a published tag such as 1.2.0, or "local" when building from source}
+    container_name: rs-frontend
+    <<: *default-restart
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    networks: [frontend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+
+  # --------------------------------------------------------------- backend --
+  backend:
+    image: &backend_image ghcr.io/kasirayapudi/researchsphere-ai/backend:${IMAGE_TAG:?IMAGE_TAG is required - a published tag such as 1.2.0, or "local" when building from source}
+    container_name: rs-backend
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: &backend_env
+      ENVIRONMENT: production
+      DEBUG: "false"
+      # `?err` makes compose refuse to start when the value is missing, rather
+      # than falling back to a committed default as the dev stack once did.
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+      DATABASE_URL: postgresql://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-researchsphere_docs}
+      FRONTEND_URL: ${FRONTEND_URL:?FRONTEND_URL is required}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:?TRUSTED_HOSTS is required}
+      UPLOAD_DIR: /app/uploads
+      QUARANTINE_DIR: /app/uploads/.quarantine
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-30}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      GRACEFUL_TIMEOUT: ${GRACEFUL_TIMEOUT:-30}
+    expose:
+      - "8000"
+    volumes:
+      # Uploaded source files must survive redeploys; without this they are
+      # lost while their database rows and vectors remain.
+      - uploads_data:/app/uploads
+      # Persist the embedding model so a restarted container does not
+      # re-download it on the first request.
+      - model_cache:/home/appuser/.cache
+    # /api/ready, not /api/live: nginx gates on this service being healthy, so
+    # "healthy" has to mean "can actually serve". /api/live deliberately does
+    # no dependency I/O (main.py) and would report an instance healthy with
+    # its database or vector store unreachable, letting the edge start routing
+    # to it. /api/ready answers 503 until every required dependency responds.
+    # Resource pressure does not fail it -- see _READY_STATUSES -- so a full
+    # disk warns rather than pulling the instance out.
+    #
+    # The Host header is set explicitly, and this is not cosmetic. The
+    # application puts TrustedHostMiddleware in front of every route, so a
+    # request whose Host is not in TRUSTED_HOSTS is answered 400 before
+    # routing -- including the health endpoints. Probing 127.0.0.1 sends
+    # "Host: 127.0.0.1:8000", which no real TRUSTED_HOSTS contains, so the
+    # probe was rejected and the container could never become healthy. Taking
+    # the first TRUSTED_HOSTS entry keeps the probe valid for whatever this
+    # deployment is configured with, without widening the allowlist.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'probe_host="$${TRUSTED_HOSTS%%,*}"; curl --fail --silent --header "Host: $${probe_host:-localhost}" http://127.0.0.1:8000/api/ready'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    # Allow in-flight SSE streams and uploads to finish before SIGKILL.
+    stop_grace_period: 45s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+
+  # --------------------------------------------------------------- worker --
+  # Document ingestion: extraction, chunking, embedding and the vector
+  # upsert. Runs the same image as the API with a different entrypoint
+  # command, so there is one artefact to build, scan and promote.
+  worker:
+    image: *backend_image
+    container_name: rs-worker
+    command: ["worker"]
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *backend_env
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
+    volumes:
+      # The worker reads the files the API stored, so it needs the same
+      # volume. Without this every ingest fails with a missing file.
+      - uploads_data:/app/uploads
+      # Shared with the API so the embedding model is downloaded once.
+      - model_cache:/home/appuser/.cache
+    # `inspect ping` against this worker's own node name. That is the check
+    # worth having: it proves the process is consuming from the broker, not
+    # merely that it is running.
+    #
+    # The node name has to be resolved at probe time rather than written down.
+    # The worker registers as ingest@<hostname> -- docker-entrypoint.sh passes
+    # --hostname "ingest@%h", and Celery expands %h with socket.gethostname()
+    # -- while Docker assigns the container hostname at run time. The previous
+    # form passed "ingest@$$HOSTNAME" through an exec-form CMD, which runs with
+    # no shell, so Celery received that literal string, matched no node and
+    # answered EX_UNAVAILABLE; the probe could never succeed and the worker
+    # was permanently unhealthy.
+    #
+    # It is resolved with socket.gethostname(), the identical function Celery
+    # itself uses, so the two cannot disagree. Deliberately not a shell
+    # expansion: that would add a dependency on HOSTNAME being exported or on
+    # a hostname binary, whereas python and this import are already required
+    # by the probe. timeout=1.0 is the celery CLI's own default, so the reply
+    # window is unchanged.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket, sys; from app.worker.celery_app import celery_app; node = 'ingest@' + socket.gethostname(); sys.exit(0 if celery_app.control.inspect(timeout=1.0, destination=[node]).ping() else 1)"
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    # Long enough for an in-flight document to finish rather than being
+    # redelivered; acks_late means an interrupted task is retried anyway.
+    stop_grace_period: 120s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 4G }
+
+  # Scheduler for the periodic reclaim of documents whose worker died.
+  # Exactly one of these may run: a second would duplicate every tick.
+  beat:
+    image: *backend_image
+    container_name: rs-beat
+    command: ["beat"]
+    <<: *default-restart
+    depends_on:
+      # The beat branch of docker-entrypoint.sh calls wait_for_dependencies(),
+      # which blocks on the database and Qdrant, so declaring them here means
+      # the scheduler waits on health instead of burning its startup budget in
+      # a TCP retry loop. Deliberately not gated on the worker's health: beat
+      # only publishes to the broker, and a queued task waits perfectly well.
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    environment:
+      <<: *backend_env
+    # A scheduler that is running but no longer ticking is the failure worth
+    # catching, and a process check cannot see it: beat is the container's
+    # exec'd main process, so if it had died the container would already be
+    # gone. PersistentScheduler writes its shelve file at startup and re-syncs
+    # from the service loop once more than Scheduler.sync_every (180s) has
+    # passed (celery/beat.py:379-383, 646-649), while the loop itself wakes at
+    # least every DEFAULT_MAX_INTERVAL (300s). A file that has not moved in
+    # 900s therefore means the loop stopped. The glob covers shelve picking
+    # dbm.gnu (one file) or dbm.dumb (.dat/.dir/.bak).
+    # The path is fixed by --schedule in docker-entrypoint.sh; keep them in step.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import glob, os, sys, time; f = glob.glob('/tmp/celerybeat-schedule*'); sys.exit(0 if f and time.time() - max(os.path.getmtime(x) for x in f) < 900 else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
+
+  # -------------------------------------------------------------- postgres --
+  postgres:
+    image: postgres:16-alpine
+    container_name: rs-postgres
+    <<: *default-restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      # Checksums catch silent corruption; cheap to enable, impossible later.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    # Deliberately not published: the database is reachable only from the
+    # backend_net network. The development stack exposed 5432 to the host.
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1G }
+
+  # ---------------------------------------------------------------- qdrant --
+  qdrant:
+    image: qdrant/qdrant:v1.8.0
+    container_name: rs-qdrant
+    <<: *default-restart
+    # No API key is configured, deliberately. Qdrant enables authentication
+    # whenever service.api_key is present at all -- an empty value included,
+    # because that deserializes to Some("") rather than None (Qdrant
+    # src/common/auth.rs AuthKeys::try_create) -- and then answers every
+    # unauthenticated request 403 "Invalid api-key". Nothing on the client
+    # side could satisfy it: the backend has no QDRANT_API_KEY setting and no
+    # QdrantClient here passes api_key. Qdrant's protection is the network:
+    # it publishes no port and is reachable only from backend_net, which is
+    # the same contract the development stack uses.
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # The image ships no HTTP client -- verified against its published layers:
+    # neither curl nor wget is present -- but its Debian base does provide
+    # bash, so the request is made with bash's /dev/tcp. /readyz is Qdrant's
+    # own readiness endpoint and sits on its API-key whitelist
+    # (src/actix/mod.rs:94-97 at v1.8.0), so it answers even when Qdrant is
+    # configured to require a key -- which is exactly why a healthy container
+    # here does not prove the backend can query it.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && head -n 1 <&3 | grep -q "200 OK"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 2G }
+
+  # ----------------------------------------------------------------- redis --
+  redis:
+    image: redis:7-alpine
+    container_name: rs-redis
+    <<: *default-restart
+    # Password-protected and persistent: Redis holds the token blacklist, so
+    # losing it silently un-revokes logged-out sessions until they expire.
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      --appendonly yes
+      --maxmemory ${REDIS_MAXMEMORY:-256mb}
+      --maxmemory-policy noeviction
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    logging: *default-logging
+    networks: [backend_net]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 384M }
+
+networks:
+  # Split so the datastores are unreachable from the edge network.
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+  uploads_data:
+  model_cache:
+  nginx_logs:
+  certbot_www:

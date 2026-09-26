@@ -1,0 +1,12 @@
+ResearchSphere end-to-end test document.
+
+This file exists so the upload tests send a real, supported document through
+the real pipeline: extraction, chunking, embedding and the vector upsert. It
+is deliberately small -- the tests verify the journey, not throughput.
+
+Each test appends a unique marker before uploading, because the upload
+pipeline rejects a second copy of identical content as a duplicate.
+
+Retrieval-augmented generation grounds a model's answers in documents the user
+supplied, so the answer can cite where it came from instead of relying on
+whatever the model memorised during training.

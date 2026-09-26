@@ -1,16 +1,24 @@
+from app.models.chat import ChatMessage, ChatSession
+from app.models.document import Document, DocumentChunk
+from app.models.membership import WorkspaceInvitation, WorkspaceMember, WorkspaceRole
+from app.models.password_reset import PasswordResetToken
+from app.models.refresh_token import RefreshToken
+from app.models.report import Connector, Report
 from app.models.user import User
 from app.models.workspace import Workspace
-from app.models.document import Document, DocumentChunk
-from app.models.chat import ChatSession, ChatMessage
-from app.models.report import Report, Connector
 
 __all__ = [
     "User",
     "Workspace",
+    "WorkspaceMember",
+    "WorkspaceInvitation",
+    "WorkspaceRole",
     "Document",
     "DocumentChunk",
     "ChatSession",
     "ChatMessage",
     "Report",
     "Connector",
+    "PasswordResetToken",
+    "RefreshToken",
 ]
