@@ -1229,7 +1229,12 @@ jobs:
           marker = secrets.token_hex(6)
           created = call("/api/v1/auth/signup", {
               "name": "Prod Stack Probe",
-              "email": "prod-stack-%s@example.test" % marker,
+              # example.com, not a .test address: .test is a reserved
+              # special-use TLD (RFC 6761) and email-validator, which backs
+              # pydantic's EmailStr, rejects it outright -- signup answers 422
+              # and this probe never reaches the socket. frontend/e2e/fixtures.ts
+              # uses example.com for the same reason; keep the two in step.
+              "email": "prod-stack-%s@example.com" % marker,
               "password": password(),
           })
           token = created["access_token"]
