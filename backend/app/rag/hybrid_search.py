@@ -1,18 +1,24 @@
-from typing import List, Dict, Any
+from typing import Any
+
 
 class HybridSearchEngine:
+    """Reciprocal Rank Fusion over dense and sparse result lists.
+
+    NOTE: this is not currently wired into the retrieval path. app/rag/pipeline
+    performs dense-only search via vector_store.search_similar, and no BM25
+    sparse index exists yet. The fusion logic below is correct and tested, and
+    is kept for when a sparse index is added - but retrieval today is dense
+    only, whatever the product copy says.
     """
-    Combines Dense Vector Cosine Similarity with Sparse BM25 Keyword Search
-    using Reciprocal Rank Fusion (RRF).
-    """
+
     def __init__(self, rrf_k: int = 60):
         self.rrf_k = rrf_k
 
     def reciprocal_rank_fusion(
-        self, dense_results: List[Dict[str, Any]], sparse_results: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        scores: Dict[str, float] = {}
-        item_map: Dict[str, Dict[str, Any]] = {}
+        self, dense_results: list[dict[str, Any]], sparse_results: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        scores: dict[str, float] = {}
+        item_map: dict[str, dict[str, Any]] = {}
 
         # Process dense rank
         for rank, item in enumerate(dense_results):

@@ -1,0 +1,59 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, backend]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # The ML stack must move together; separate PRs produce incompatible
+      # transitive pins that fail in ways unrelated to the upgrade itself.
+      ml-stack:
+        patterns: ["torch*", "transformers*", "sentence-transformers", "numpy"]
+      langchain:
+        patterns: ["langchain*", "langgraph*", "langsmith"]
+      dev-tooling:
+        patterns: ["black", "isort", "ruff", "mypy", "pytest*", "bandit*", "pip-audit"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, frontend]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react*", "react-router-dom"]
+      tooling:
+        patterns: ["vite*", "vitest", "@vitest/*", "eslint*", "typescript*", "@typescript-eslint/*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: monthly
+    labels: [dependencies, infrastructure]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: monthly
+    labels: [dependencies, infrastructure]
+    commit-message:
+      prefix: "chore(deps)"

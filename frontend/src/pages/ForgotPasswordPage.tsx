@@ -3,14 +3,30 @@ import { NavLink } from 'react-router-dom';
 import { Sparkles, ArrowLeft, Mail, CheckCircle2 } from 'lucide-react';
 import { Button } from '../components/common/Button';
 import { Input } from '../components/common/Input';
+import { ApiService } from '../services/api';
+import { useToast } from '../contexts/ToastContext';
 
 export const ForgotPasswordPage: React.FC = () => {
   const [email, setEmail] = useState('');
   const [submitted, setSubmitted] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const toast = useToast();
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Previously this only flipped a local flag and no request was ever made.
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (email) setSubmitted(true);
+    if (!email || isSending) return;
+    setIsSending(true);
+    try {
+      await ApiService.requestPasswordReset(email);
+      // The backend deliberately returns the same response whether or not the
+      // address exists, so the UI must not reveal anything either.
+      setSubmitted(true);
+    } catch (err) {
+      toast.fromError(err, 'Could not start the password reset');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   return (
@@ -46,7 +62,7 @@ export const ForgotPasswordPage: React.FC = () => {
               leftIcon={<Mail className="h-4 w-4" />}
               required
             />
-            <Button type="submit" variant="primary" className="w-full">
+            <Button type="submit" variant="primary" className="w-full" isLoading={isSending}>
               Send Reset Email
             </Button>
           </form>

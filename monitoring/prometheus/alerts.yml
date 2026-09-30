@@ -1,0 +1,399 @@
+###############################################################################
+# ResearchSphere AI - alerting rules.
+#
+# Every rule carries a `summary` describing what broke and a `description`
+# saying what to do about it. An alert nobody knows how to action is noise, and
+# noisy alerts get muted, which is how real incidents get missed.
+#
+# `for:` durations are deliberately non-zero so a single scrape blip does not
+# page anyone.
+###############################################################################
+groups:
+  # -------------------------------------------------------------- availability
+  - name: researchsphere_availability
+    interval: 30s
+    rules:
+      - alert: BackendDown
+        expr: up{job="researchsphere-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: backend
+        annotations:
+          summary: "Backend instance {{ $labels.instance }} is not responding to scrapes"
+          description: >-
+            Prometheus cannot reach the backend. Check container status and the
+            /api/live probe. If the container is running but unscrapeable,
+            verify METRICS_ENABLED and any proxy restriction on /metrics.
+
+      - alert: DatabaseUnavailable
+        expr: researchsphere_dependency_up{dependency="database"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "PostgreSQL is unreachable"
+          description: >-
+            Every request that touches persistence is failing. Check the
+            postgres container, credentials and network. Note the backend does
+            NOT fall back to SQLite in production - it refuses to start.
+
+      - alert: QdrantUnavailable
+        expr: researchsphere_dependency_up{dependency="qdrant"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: qdrant
+        annotations:
+          summary: "Qdrant is unreachable"
+          description: >-
+            Retrieval and ingestion both fail. Chat will return its degraded
+            error event rather than an ungrounded answer, and uploads will fail
+            after the file has been validated.
+
+      - alert: RedisUnavailable
+        # -1 means "not configured", which is a deployment choice, not an
+        # outage; only 0 (configured but unreachable) is alertable.
+        expr: researchsphere_dependency_up{dependency="redis"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis is configured but unreachable"
+          description: >-
+            The service stays up but degrades: rate limiting falls back to
+            per-process counters (so effective limits multiply by worker count)
+            and access-token revocation stops taking effect. Logout still
+            revokes refresh tokens, which live in the database.
+
+      - alert: GeminiNotConfigured
+        expr: researchsphere_dependency_up{dependency="gemini"} == -1
+        for: 5m
+        labels:
+          severity: warning
+          component: gemini
+        annotations:
+          summary: "Gemini API key is not configured"
+          description: >-
+            Chat, report generation and research workflows cannot produce
+            answers. Set GEMINI_API_KEY.
+
+  # ------------------------------------------------------------------- latency
+  - name: researchsphere_latency
+    interval: 30s
+    rules:
+      - alert: HighApiLatency
+        expr: >-
+          histogram_quantile(0.95,
+            sum(rate(researchsphere_http_request_duration_seconds_bucket{job="researchsphere-backend"}[5m]))
+            by (le, route)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "p95 latency on {{ $labels.route }} is {{ $value | humanizeDuration }}"
+          description: >-
+            Check the Performance dashboard for database and dependency
+            timings. Upload and agent routes are legitimately slow - ingestion
+            and LangGraph runs are synchronous - so confirm the route before
+            treating this as a regression.
+
+      - alert: VeryHighApiLatency
+        expr: >-
+          histogram_quantile(0.95,
+            sum(rate(researchsphere_http_request_duration_seconds_bucket{job="researchsphere-backend",route!~"/api/v1/(documents/upload|reports/generate|research/start|chat/stream)"}[5m]))
+            by (le)
+          ) > 5
+        for: 3m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "p95 latency above 5s on ordinary API routes"
+          description: >-
+            Excludes the routes that are synchronous by design. Sustained
+            latency here usually means database contention or event-loop
+            blocking.
+
+      - alert: SlowRequestSpike
+        expr: sum(rate(researchsphere_http_slow_requests_total{job="researchsphere-backend"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Sustained slow requests ({{ $value | printf \"%.2f\" }}/s)"
+          description: >-
+            Each slow request is logged with its request id; search the
+            application log for slow_request=true to find specific examples.
+
+  # -------------------------------------------------------------------- errors
+  - name: researchsphere_errors
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: >-
+          sum(rate(researchsphere_http_requests_total{job="researchsphere-backend",status_class="5xx"}[5m]))
+          / clamp_min(sum(rate(researchsphere_http_requests_total{job="researchsphere-backend"}[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "5xx rate is {{ $value | humanizePercentage }}"
+          description: >-
+            More than 5% of requests are failing. Check the Errors dashboard
+            for the failing route and exception type.
+
+      - alert: UnhandledExceptions
+        expr: sum(increase(researchsphere_http_exceptions_total{job="researchsphere-backend"}[15m])) > 5
+        for: 1m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} unhandled exceptions in 15 minutes"
+          description: >-
+            These escaped the route handlers. Full tracebacks are in the
+            application log, correlated by request id.
+
+      - alert: DatabaseErrors
+        expr: sum(rate(researchsphere_db_errors_total{job="researchsphere-backend"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Database operations are failing"
+          description: >-
+            Check connection pool saturation, disk space on the database
+            volume, and long-running queries.
+
+  # ---------------------------------------------------------------- saturation
+  - name: researchsphere_saturation
+    interval: 60s
+    rules:
+      - alert: DiskUsageHigh
+        expr: researchsphere_disk_usage_percent{path="uploads"} > 85
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Upload volume is {{ $value | printf \"%.0f\" }}% full"
+          description: >-
+            Uploads fail once the volume fills. Documents deleted through the
+            API remove their files, but a failed extraction on Windows can
+            leave orphans behind - check for those first.
+
+      - alert: DiskUsageCritical
+        expr: researchsphere_disk_usage_percent{path="uploads"} > 95
+        for: 2m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Upload volume is {{ $value | printf \"%.0f\" }}% full"
+          description: "Uploads are about to start failing. Free space now."
+
+      - alert: MemoryPressure
+        expr: researchsphere_system_memory_percent{job="researchsphere-backend"} > 90
+        for: 10m
+        labels:
+          severity: warning
+          component: backend
+        annotations:
+          summary: "Host memory at {{ $value | printf \"%.0f\" }}%"
+          description: >-
+            Each uvicorn worker loads its own copy of the embedding model, so
+            memory scales roughly linearly with WEB_CONCURRENCY. Reduce it, or
+            raise the container limit.
+
+      - alert: WorkerMemoryGrowth
+        expr: >-
+          delta(researchsphere_process_memory_bytes{job="researchsphere-backend"}[1h])
+          > 500 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: warning
+          component: backend
+        annotations:
+          summary: "Worker RSS grew by {{ $value | humanize1024 }}B in an hour"
+          description: >-
+            Sustained growth suggests a leak. Compare against request volume
+            before concluding - a cold worker loading the embedding model shows
+            a large one-off jump.
+
+  # ------------------------------------------------------------------ security
+  - name: researchsphere_security
+    interval: 30s
+    rules:
+      - alert: RefreshTokenReuseDetected
+        expr: increase(researchsphere_token_refresh_reuse_total{job="researchsphere-backend"}[10m]) > 0
+        for: 0m   # a single occurrence is worth knowing about immediately
+        labels:
+          severity: critical
+          component: auth
+        annotations:
+          summary: "Refresh-token reuse detected"
+          description: >-
+            A refresh token was presented after it had already been rotated.
+            That is either a replay or a stolen token; the whole token family
+            was revoked automatically. Check the audit log for
+            auth.token.reuse_detected and the originating client IP.
+
+      - alert: CredentialStuffingSuspected
+        expr: >-
+          sum(rate(researchsphere_auth_failures_total{job="researchsphere-backend",reason="bad_password"}[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: auth
+        annotations:
+          summary: "Elevated password failures ({{ $value | printf \"%.1f\" }}/s)"
+          description: >-
+            Sustained bad-password failures suggest credential stuffing. The
+            auth rate-limit tier (20/min per IP) should be absorbing this;
+            if it is not, the client is likely distributed across addresses.
+
+      - alert: AccountEnumerationSuspected
+        expr: >-
+          sum(rate(researchsphere_auth_failures_total{job="researchsphere-backend",reason="unknown_email"}[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: auth
+        annotations:
+          summary: "Elevated unknown-email login attempts"
+          description: >-
+            Someone is probing for valid accounts. Login deliberately returns
+            an identical response either way, so this is visible only here.
+
+      - alert: AuthorizationDenialSpike
+        expr: >-
+          sum(rate(researchsphere_authz_denials_total{job="researchsphere-backend",reason="workspace_isolation"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: authz
+        annotations:
+          summary: "Repeated cross-tenant access attempts"
+          description: >-
+            Requests are supplying workspace ids belonging to other accounts.
+            Could be a broken client, could be probing. Check the audit log for
+            authz.permission_denied and the actor.
+
+      - alert: RateLimitingDegraded
+        expr: >-
+          sum(rate(researchsphere_rate_limit_rejections_total{job="researchsphere-backend",backend="local"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Rate limiting has fallen back to per-process counters"
+          description: >-
+            Redis is unreachable, so each worker counts separately and the
+            effective limit is multiplied by the worker count. Restore Redis.
+
+  # -------------------------------------------------------------------- uploads
+  - name: researchsphere_uploads
+    interval: 60s
+    rules:
+      - alert: UploadFailureRateHigh
+        expr: >-
+          sum(rate(researchsphere_uploads_total{job="researchsphere-backend",outcome="failed"}[10m]))
+          / clamp_min(sum(rate(researchsphere_uploads_total{job="researchsphere-backend"}[10m])), 0.001)
+          > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: uploads
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of uploads are failing"
+          description: >-
+            "failed" means the file passed security validation but processing
+            broke - usually extraction or the Qdrant write. Distinct from
+            "rejected", which is the security pipeline working as intended.
+
+      - alert: MaliciousUploadDetected
+        expr: >-
+          increase(researchsphere_upload_rejections_total{job="researchsphere-backend",reason=~"executable_content.*|content_mismatch.*"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "Disguised file upload rejected ({{ $labels.reason }})"
+          description: >-
+            Someone uploaded a file whose contents do not match its extension,
+            or an executable. The security pipeline rejected it before storage.
+            Worth checking who, in the audit log.
+
+      - alert: QuarantinedUpload
+        expr: increase(researchsphere_uploads_total{job="researchsphere-backend",outcome="quarantined"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: security
+        annotations:
+          summary: "An upload failed the antivirus scan"
+          description: >-
+            Only fires when a real scanner is configured; the default no-op
+            scanner never reports an infection.
+
+  # ------------------------------------------------------------------- AI / RAG
+  - name: researchsphere_ai
+    interval: 60s
+    rules:
+      - alert: RetrievalReturningNothing
+        expr: >-
+          histogram_quantile(0.90,
+            sum(rate(researchsphere_retrieval_results_bucket{job="researchsphere-backend"}[15m])) by (le)
+          ) < 1
+        for: 15m
+        labels:
+          severity: critical
+          component: rag
+        annotations:
+          summary: "Vector search is returning no chunks"
+          description: >-
+            Answers are being generated without grounding, which is worse than
+            an outage because it is invisible to users. Check that documents
+            are indexed in the queried workspace and that the Qdrant collection
+            exists with the expected dimension.
+
+      - alert: ChatFailureRateHigh
+        expr: >-
+          sum(rate(researchsphere_chat_messages_total{job="researchsphere-backend",outcome="failed"}[10m]))
+          / clamp_min(sum(rate(researchsphere_chat_messages_total{job="researchsphere-backend"}[10m])), 0.001)
+          > 0.2
+        for: 10m
+        labels:
+          severity: critical
+          component: rag
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of chat requests are failing"
+          description: >-
+            Users see the degraded error event. Check Gemini availability and
+            quota, then Qdrant.
+
+      - alert: SlowTimeToFirstToken
+        expr: >-
+          histogram_quantile(0.95,
+            sum(rate(researchsphere_chat_time_to_first_token_seconds_bucket{job="researchsphere-backend"}[10m])) by (le)
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: rag
+        annotations:
+          summary: "p95 time to first token is {{ $value | humanizeDuration }}"
+          description: >-
+            The chat feels unresponsive even if it eventually completes.
+            Retrieval and embedding latency are the usual causes.

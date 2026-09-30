@@ -1,0 +1,40 @@
+###############################################################################
+# Prometheus configuration for the ResearchSphere monitoring stack.
+###############################################################################
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    # Prometheus does not expand shell variables here, so this is a literal.
+    # Override it per environment when deploying.
+    environment: production
+    service: researchsphere
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        # Alertmanager is not part of this stack; point this at yours, or run
+        # one alongside. Rules still evaluate and show in the Prometheus UI
+        # without it.
+        - targets: []
+
+scrape_configs:
+  - job_name: researchsphere-backend
+    metrics_path: /metrics
+    # The backend is reachable on the internal network; the edge proxy does not
+    # expose /metrics publicly.
+    static_configs:
+      - targets: ["backend:8000"]
+        labels:
+          component: api
+    # Uncomment when METRICS_TOKEN is set.
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/metrics_token
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

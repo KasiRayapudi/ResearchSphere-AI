@@ -9,7 +9,10 @@ export const AppLayout: React.FC = () => {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
 
   return (
-    <div className="min-h-screen flex bg-slate-950 text-slate-100 relative overflow-hidden">
+    <div
+      data-testid="app-shell"
+      className="min-h-screen flex bg-slate-950 text-slate-100 relative overflow-hidden"
+    >
       {/* Background Aurora Glow */}
       <div className="fixed inset-0 pointer-events-none z-0 bg-aurora-glow opacity-60" />
       <div className="fixed -top-40 -left-40 w-96 h-96 bg-brand-600/10 rounded-full blur-3xl pointer-events-none" />

@@ -1,7 +1,8 @@
-from app.core.database import SessionLocal, Base, engine
+from app.core.database import Base, SessionLocal, engine
+from app.core.security import hash_password
 from app.models.user import User
 from app.models.workspace import Workspace
-from app.core.security import hash_password
+
 
 def seed():
     Base.metadata.create_all(bind=engine)
@@ -35,6 +36,7 @@ def seed():
 
     db.close()
     print("Database schema created and initial enterprise data seeded successfully!")
+
 
 if __name__ == "__main__":
     seed()

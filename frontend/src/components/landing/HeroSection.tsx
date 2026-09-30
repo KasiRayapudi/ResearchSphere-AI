@@ -1,6 +1,6 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Sparkles, ArrowRight, ShieldCheck, Database, Cpu, Layers, GitBranch } from 'lucide-react';
+import { Sparkles, ArrowRight } from 'lucide-react';
 import { Button } from '../common/Button';
 import { AnimatedNetwork } from './AnimatedNetwork';
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { NavLink, useLocation } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard,
   MessageSquare,
@@ -7,16 +7,13 @@ import {
   Sparkles,
   BarChart3,
   Shield,
+  Users,
   Layers,
-  Settings,
-  Plus,
-  ChevronDown,
-  Database,
-  Cpu,
   LogOut,
-  FolderGit2,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { WorkspaceSwitcher } from './WorkspaceSwitcher';
+import { useToast } from '../../contexts/ToastContext';
 import { useWorkspace } from '../../contexts/WorkspaceContext';
 
 interface SidebarProps {
@@ -26,16 +23,33 @@ interface SidebarProps {
 
 export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggle }) => {
   const { user, logout } = useAuth();
-  const { workspaces, activeWorkspace, setActiveWorkspace } = useWorkspace();
+  const navigate = useNavigate();
+  const toast = useToast();
+
+  // logout is async now (it revokes the session server-side), so route the
+  // user to the landing page only once it has settled.
+  const handleLogout = async () => {
+    await logout();
+    toast.success('Signed out', 'Your session has been ended on this device.');
+    navigate('/', { replace: true });
+  };
   const location = useLocation();
+  const { activeWorkspace } = useWorkspace();
 
   const navItems = [
     { label: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
-    { label: 'AI RAG Chat', path: '/chat', icon: MessageSquare, badge: 'Live RAG' },
-    { label: 'Document Manager', path: '/documents', icon: FileText, badge: '128' },
+    { label: 'AI RAG Chat', path: '/chat', icon: MessageSquare },
+    {
+      label: 'Document Manager',
+      path: '/documents',
+      icon: FileText,
+      // Real count for the active workspace; was a hardcoded '128'.
+      badge: activeWorkspace?.documentCount ? String(activeWorkspace.documentCount) : undefined,
+    },
     { label: 'Research Workspace', path: '/workspace', icon: Sparkles },
     { label: 'Report Generator', path: '/reports', icon: Layers },
     { label: 'Analytics Engine', path: '/analytics', icon: BarChart3 },
+    { label: 'Members', path: '/members', icon: Users },
     { label: 'Admin & System', path: '/admin', icon: Shield },
   ];
 
@@ -64,23 +78,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggle }) => {
 
       {/* Workspace Selector */}
       <div className="p-3 border-b border-slate-800/60">
-        {!collapsed ? (
-          <div className="relative group">
-            <button className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-800 text-slate-200 text-xs font-medium hover:border-slate-700 transition-colors">
-              <div className="flex items-center gap-2 truncate">
-                <Cpu className="h-4 w-4 text-brand-400 shrink-0" />
-                <span className="truncate">{activeWorkspace.name}</span>
-              </div>
-              <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
-            </button>
-          </div>
-        ) : (
-          <div className="flex justify-center">
-            <div className="h-9 w-9 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center text-brand-400 font-bold text-xs" title={activeWorkspace.name}>
-              {activeWorkspace.name.substring(0, 2).toUpperCase()}
-            </div>
-          </div>
-        )}
+        <WorkspaceSwitcher collapsed={collapsed} />
       </div>
 
       {/* Navigation Links */}
@@ -130,7 +128,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggle }) => {
               </div>
             </div>
             <button
-              onClick={logout}
+              onClick={handleLogout}
               className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-900 transition-colors"
               title="Log out"
             >
@@ -139,7 +137,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed, onToggle }) => {
           </div>
         ) : (
           <button
-            onClick={logout}
+            onClick={handleLogout}
             className="w-full flex justify-center p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-900"
             title="Log out"
           >

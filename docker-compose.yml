@@ -42,6 +42,34 @@ services:
       - qdrant
       - redis
 
+  # Document ingestion runs here, not in the API request. REDIS_URL is set
+  # above, so the API queues uploads; without this service they would sit in
+  # `queued` forever with nothing to consume them.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "celery", "-A", "app.worker.celery_app:celery_app", "worker", "--loglevel", "info", "--concurrency", "2"]
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/researchsphere_db
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - FRONTEND_URL=http://localhost:3000
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - TRUSTED_HOSTS=${TRUSTED_HOSTS:-localhost,127.0.0.1,backend}
+      - UPLOAD_DIR=/app/uploads
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env}
+    volumes:
+      # The worker reads the files the API wrote, so it needs the same volume.
+      - uploads_data:/app/uploads
+    depends_on:
+      - postgres
+      - qdrant
+      - redis
+
   postgres:
     image: postgres:16-alpine
     ports:

@@ -1,9 +1,11 @@
+import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, Integer, Float, Text, ForeignKey, Enum
+
+from sqlalchemy import Boolean, Column, DateTime, String
 from sqlalchemy.orm import relationship
+
 from app.core.database import Base
-import enum
 
 
 class UserRole(str, enum.Enum):

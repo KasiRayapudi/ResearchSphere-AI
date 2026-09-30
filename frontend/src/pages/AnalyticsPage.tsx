@@ -1,32 +1,77 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import {
-  BarChart3,
   TrendingUp,
   Cpu,
-  Clock,
   Database,
-  HardDrive,
-  CheckCircle2,
-  Activity,
-  Layers,
 } from 'lucide-react';
 import { Card } from '../components/common/Card';
 import { Badge } from '../components/common/Badge';
 import { ApiService } from '../services/api';
-import { AnalyticsData } from '../types';
+import { useAsyncData } from '../hooks/useAsyncData';
+import { useWorkspace } from '../contexts/WorkspaceContext';
+import { QueryTrendChart } from '../components/analytics/QueryTrendChart';
+import {
+  EmptyState,
+  ErrorState,
+  ListSkeleton,
+  Skeleton,
+  StatCardSkeleton,
+} from '../components/common/States';
 
 export const AnalyticsPage: React.FC = () => {
-  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
+  const { activeWorkspace, isLoading: workspaceLoading } = useWorkspace();
+  const workspaceId = activeWorkspace?.id;
 
-  useEffect(() => {
-    const fetchAnalytics = async () => {
-      const data = await ApiService.getAnalytics();
-      setAnalytics(data);
-    };
-    fetchAnalytics();
-  }, []);
+  const {
+    data: analytics,
+    isInitialLoading,
+    error,
+    refresh,
+  } = useAsyncData(() => ApiService.getAnalytics(workspaceId), [workspaceId], {
+    enabled: Boolean(workspaceId),
+  });
 
-  if (!analytics) return null;
+  if (!workspaceLoading && !activeWorkspace) {
+    return (
+      <EmptyState
+        title="No workspace selected"
+        description="Create or select a workspace to see its analytics."
+      />
+    );
+  }
+
+  // Previously this returned null while loading and forever on failure, so a
+  // broken endpoint rendered a permanently blank page with no explanation.
+  if (isInitialLoading || workspaceLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-80" />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <StatCardSkeleton key={i} />
+          ))}
+        </div>
+        <div className="grid gap-6 lg:grid-cols-12">
+          <div className="lg:col-span-7"><ListSkeleton rows={5} /></div>
+          <div className="lg:col-span-5"><ListSkeleton rows={3} /></div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <ErrorState
+        title="Could not load analytics"
+        message={error.message}
+        onRetry={refresh}
+      />
+    );
+  }
+
+  if (!analytics) {
+    return <EmptyState title="No analytics available yet" />;
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -39,6 +84,22 @@ export const AnalyticsPage: React.FC = () => {
           Detailed metrics for hybrid RAG search queries, vector chunk generation, latency distribution, and model consumption.
         </p>
       </div>
+
+      {/* Query volume trend - dailyQueries was fetched but never rendered */}
+      <Card className="p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-base font-bold text-white">Query Volume</h3>
+            <p className="text-xs text-slate-400">
+              Questions asked per day across this workspace
+            </p>
+          </div>
+          <Badge variant="neutral" size="sm">
+            last {analytics.dailyQueries.length} days
+          </Badge>
+        </div>
+        <QueryTrendChart data={analytics.dailyQueries} />
+      </Card>
 
       {/* Top Stat Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

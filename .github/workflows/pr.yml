@@ -1,0 +1,114 @@
+name: Pull request
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  title:
+    name: Conventional commit title
+    runs-on: ubuntu-latest
+    steps:
+      # The release changelog groups commits by conventional-commit type, so a
+      # non-conforming squash-merge title silently disappears from the notes.
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" should start with a lowercase letter.
+
+  label:
+    name: Apply labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          sync-labels: true
+
+  size:
+    name: Report diff size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Summarise
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          {
+            echo "### Diff summary"
+            echo ""
+            echo '```'
+            git diff --stat "$BASE" "$HEAD" | tail -n 20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    name: Coverage comment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Backend coverage
+        id: backend
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          pytest --cov=app --cov-report=json --cov-report=term -q
+          pct=$(python -c "import json;print(round(json.load(open('coverage.json'))['totals']['percent_covered'],2))")
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+      - name: Frontend coverage
+        id: frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:coverage
+          pct=$(node -e "const s=require('./coverage/coverage-summary.json');console.log(s.total.lines.pct)")
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+      # Updates one comment in place instead of adding a new one on every push.
+      - name: Comment on the pull request
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          message: |
+            ## Coverage
+
+            | Suite | Line coverage |
+            |---|---|
+            | Backend (pytest) | **${{ steps.backend.outputs.pct }}%** |
+            | Frontend (vitest) | **${{ steps.frontend.outputs.pct }}%** |
+
+            Full HTML reports are attached to the CI run as artifacts.
