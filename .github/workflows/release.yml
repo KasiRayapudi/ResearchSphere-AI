@@ -199,6 +199,14 @@ jobs:
             echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:${{ steps.version.outputs.version }}"
             echo '```'
             echo ""
+            echo "## Deployment bundle"
+            echo ""
+            # Single-quoted so bash leaves the backticks alone; the version
+            # expression is substituted by Actions before bash ever sees it.
+            echo '`deploy-${{ steps.version.outputs.version }}.tar.gz` carries `docker-compose.prod.yml`,'
+            echo '`.env.prod.example`, the `Makefile` and the `nginx/` tree -- everything a host'
+            echo 'needs to run the images above. Unpack it into an empty deployment directory.'
+            echo ""
             echo "See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment instructions."
           } > RELEASE_NOTES.md
 
