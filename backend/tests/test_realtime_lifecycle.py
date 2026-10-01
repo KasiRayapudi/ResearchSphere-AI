@@ -8,7 +8,9 @@ catches it. They also prove the application's lifespan starts and stops the
 realtime layer without leaving tasks or connections behind.
 
 Sweeps are invoked directly on the application's loop, so nothing waits on a
-timer; the one test of the periodic schedule waits on the call it causes.
+timer; the one test of the periodic schedule waits on the call it causes. A
+test that measures what its own sweep did also suspends the reaper's, which
+would otherwise consume the condition first -- see ``explicit_sweeps_only``.
 """
 
 import asyncio
@@ -51,6 +53,48 @@ def _db():
     return SessionLocal()
 
 
+@pytest.fixture
+def explicit_sweeps_only(client):
+    """Let this test's own sweep be the only re-validation that sees its change.
+
+    A sweep acts once per condition, by design: ``revalidate`` works from a
+    snapshot of ``manager.live()``, and closing a connection unregisters it,
+    so the condition has gone by the time a second sweep looks. That is
+    right for production, and fatal for a test that measures the counter its
+    own sweep returned -- because the reaper shares the process-wide
+    manager, and the session-scoped ``client`` leaves it sweeping on its own
+    schedule (WS_REVALIDATE_SECONDS) for the whole run. A reaper sweep
+    landing between the change and the test's own closes the socket itself,
+    correctly, and the test then reads 0 where it expects 1.
+
+    Suspending the validator closes that window rather than narrowing it.
+    ``_reap_forever`` reads ``_validator`` immediately before awaiting it,
+    with no await in between, so once this swap lands no further sweep can
+    start; and a sweep already running took its snapshot before this test's
+    connections existed, so it cannot contain them either. Only the periodic
+    re-validation is held back: ``reap_stale`` still runs, the reaper task is
+    left alone, and no other test is affected.
+    """
+    manager = get_manager()
+
+    def swap(validator):
+        """Swap on the manager's own loop, where its state lives."""
+        previous = manager._validator
+        manager._validator = validator
+        return previous
+
+    scheduled = ws.on_loop(client, swap, None)
+    assert scheduled is not None, (
+        "the application was not re-validating at all, so this fixture is "
+        "guarding nothing -- check that the lifespan still starts the "
+        "manager with validator=revalidate"
+    )
+    try:
+        yield
+    finally:
+        ws.on_loop(client, swap, scheduled)
+
+
 # ------------------------------------------------------------ token lifetime --
 class TestTokenLifetime:
     def test_the_connection_carries_the_tokens_expiry_and_id(self, client, owner):
@@ -62,7 +106,7 @@ class TestTokenLifetime:
             assert connection.token_expires_at == float(claims["exp"])
             assert connection.token_id == claims["jti"]
 
-    def test_an_expired_token_closes_the_socket(self, client, owner):
+    def test_an_expired_token_closes_the_socket(self, client, owner, explicit_sweeps_only):
         """A socket may not outlive the credential it opened with."""
         with ws.open_socket(client, owner["token"], owner["workspace_id"]) as socket:
             connection = ws.connection_of(client, ws.ready(socket))
@@ -79,7 +123,9 @@ class TestTokenLifetime:
             assert stats["expired"] == 0 and stats["unauthorized"] == 0
             ws.assert_quiet(socket)
 
-    def test_a_revoked_token_closes_the_socket(self, client, owner, shared_redis):
+    def test_a_revoked_token_closes_the_socket(
+        self, client, owner, shared_redis, explicit_sweeps_only
+    ):
         """Revocation reaches sockets as well as requests (it needs Redis, as REST does)."""
         from jose import jwt
 
@@ -146,7 +192,7 @@ class TestTokenLifetime:
 class TestChangesBehindTheSocketsBack:
     """What the sweep exists for: the event that should have acted was lost."""
 
-    def test_a_removed_member_is_disconnected(self, client, owner, joiner):
+    def test_a_removed_member_is_disconnected(self, client, owner, joiner, explicit_sweeps_only):
         from app.models.membership import WorkspaceMember
 
         with (
@@ -169,7 +215,7 @@ class TestChangesBehindTheSocketsBack:
             assert stats["forbidden"] == 1
             assert ws.close_code(removed) == CLOSE_FORBIDDEN
 
-    def test_a_deactivated_account_is_disconnected(self, client, owner):
+    def test_a_deactivated_account_is_disconnected(self, client, owner, explicit_sweeps_only):
         from app.models.user import User
 
         with ws.open_socket(client, owner["token"], owner["workspace_id"]) as socket:
@@ -191,7 +237,9 @@ class TestChangesBehindTheSocketsBack:
                 finally:
                     db.close()
 
-    def test_a_role_changed_without_an_event_is_brought_up_to_date(self, client, owner, joiner):
+    def test_a_role_changed_without_an_event_is_brought_up_to_date(
+        self, client, owner, joiner, explicit_sweeps_only
+    ):
         from app.models.membership import WorkspaceMember
 
         with ws.open_socket(client, joiner["token"], owner["workspace_id"]) as socket:
