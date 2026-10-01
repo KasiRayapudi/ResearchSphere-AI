@@ -1,0 +1,349 @@
+name: Release deployment verification
+
+# Deploys a published release the way an operator would: on a bare Linux host
+# holding nothing but `deploy-<version>.tar.gz`, with the images pulled from
+# GHCR rather than built. That is the one path CI could never cover before --
+# the `prod-stack` job in ci.yml builds the images locally and reads `nginx/`
+# from the repository checkout, so it proves the topology works but not that
+# the published artefacts alone are sufficient, and it never performs a real
+# registry pull.
+#
+# Deliberately no actions/checkout: a checkout would supply `nginx/` and the
+# `Makefile` for free and make the whole exercise meaningless. The job asserts
+# the workspace is bare before it starts.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v1.0.1)"
+        required: true
+
+permissions:
+  contents: read   # download the release asset
+  packages: read   # pull the images from GHCR
+
+jobs:
+  clean-host:
+    name: Deploy a release on a clean host
+    runs-on: ubuntu-latest
+    env:
+      EDGE: http://localhost
+    steps:
+      - name: Determine the release under test
+        id: release
+        run: |
+          tag="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            echo "::error::no release tag was supplied"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "verifying release $tag, deploying with IMAGE_TAG=${tag#v}"
+
+      - name: The runner holds no repository checkout
+        run: |
+          # If anything is here, a later step could read nginx/ or the
+          # Makefile from it rather than from the bundle, and the result
+          # would prove nothing.
+          leftovers="$(ls -A . 2>/dev/null || true)"
+          if [ -n "$leftovers" ]; then
+            echo "::error::workspace is not empty, so the bundle would not be the only source: $leftovers"
+            exit 1
+          fi
+          echo "workspace is bare; the bundle will be the only source of files"
+
+      - name: Download only the deployment bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.release.outputs.tag }}" --repo "${{ github.repository }}" --pattern 'deploy-*.tar.gz' --dir "$RUNNER_TEMP"
+          ls -l "$RUNNER_TEMP"/deploy-*.tar.gz
+
+      - name: Unpack it, and show exactly what the host receives
+        run: |
+          mkdir host
+          tar -xzf "$RUNNER_TEMP"/deploy-*.tar.gz -C host
+          echo "--- everything the host now has ---"
+          find host -mindepth 1 | sort
+          # Every path docker-compose.prod.yml bind-mounts has to be here, or
+          # the nginx service cannot start.
+          for path in docker-compose.prod.yml .env.prod.example Makefile nginx/nginx.conf nginx/conf.d/researchsphere.conf nginx/certs; do
+            if [ ! -e "host/$path" ]; then
+              echo "::error::the bundle is missing $path"
+              exit 1
+            fi
+          done
+          echo "all required deployment paths are present"
+
+      - name: Compose a throwaway .env.prod from the template in the bundle
+        working-directory: host
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+          import secrets
+
+          values = {
+              "SECRET_KEY": base64.b64encode(secrets.token_bytes(48)).decode(),
+              "POSTGRES_PASSWORD": secrets.token_hex(24),
+              "REDIS_PASSWORD": secrets.token_hex(24),
+              "GEMINI_API_KEY": "ci-not-a-real-key",
+              "FRONTEND_URL": "http://localhost",
+              "CORS_ORIGINS": "http://localhost",
+              "TRUSTED_HOSTS": "localhost",
+              # The whole point of this job: a published version, never "local".
+              "IMAGE_TAG": os.environ["IMAGE_TAG"],
+          }
+          out, seen = [], set()
+          for line in pathlib.Path(".env.prod.example").read_text().splitlines():
+              key = line.split("=", 1)[0] if ("=" in line and not line.startswith("#")) else None
+              if key in values:
+                  out.append(key + "=" + values[key])
+                  seen.add(key)
+              else:
+                  out.append(line)
+          for key, value in values.items():
+              if key not in seen:
+                  out.append(key + "=" + value)
+          pathlib.Path(".env.prod").write_text(chr(10).join(out) + chr(10))
+
+          print("keys written (values withheld):")
+          for line in out:
+              if "=" in line and not line.startswith("#"):
+                  print("  " + line.split("=", 1)[0])
+          PY
+
+      - name: Compose parses the bundled file on its own
+        working-directory: host
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod config > /dev/null
+          echo "docker-compose.prod.yml parses with no overlay and no source tree"
+
+      - name: Pull the published images from GHCR
+        working-directory: host
+        run: |
+          # The step that has never run before: a real registry pull of the
+          # images this release published.
+          docker compose -f docker-compose.prod.yml --env-file .env.prod pull
+
+      - name: The pulled images came from GHCR at this version
+        working-directory: host
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          failed=0
+          for name in backend frontend; do
+            ref="ghcr.io/kasirayapudi/researchsphere-ai/$name:$VERSION"
+            digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref" 2>/dev/null || true)"
+            if [ -z "$digest" ]; then
+              echo "::error::$ref is not present locally after the pull"
+              failed=1
+              continue
+            fi
+            echo "$name -> $digest"
+          done
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "both application images were pulled from GHCR at $VERSION"
+
+      - name: Start the datastores and migrate
+        working-directory: host
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --no-build postgres redis qdrant
+          pending="not checked"
+          deadline=$((SECONDS + 240))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in postgres redis qdrant; do
+              cid="$(docker compose -f docker-compose.prod.yml --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "datastores healthy"
+              break
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          if [ -n "$pending" ]; then
+            echo "::error::datastores did not become healthy:$pending"
+            exit 1
+          fi
+          docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend migrate
+
+      - name: Start the full stack
+        working-directory: host
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --no-build
+
+      - name: Every service reports healthy
+        working-directory: host
+        run: |
+          services="nginx frontend backend worker beat postgres qdrant redis"
+          pending="not checked"
+          deadline=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in $services; do
+              cid="$(docker compose -f docker-compose.prod.yml --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "all 8 services healthy"
+              docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+              exit 0
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          echo "::error::services did not become healthy:$pending"
+          docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+          exit 1
+
+      - name: The edge serves the SPA and proxies the API
+        run: |
+          echo "--- nginx own health ---"
+          curl --fail --silent --show-error "$EDGE/healthz"
+          echo
+          echo "--- backend diagnostics through the edge ---"
+          curl --fail --silent --show-error "$EDGE/api/health" | head -c 400
+          echo
+          status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' "$EDGE/api/ready")"
+          if [ "$status" != "200" ]; then
+            echo "::error::readiness through the edge returned $status"
+            exit 1
+          fi
+          echo "readiness through the edge: $status"
+          echo "--- SPA through the edge ---"
+          body="$(curl --fail --silent --show-error "$EDGE/")"
+          printf '%s' "$body" | grep -qi "<!doctype html"
+          echo "index.html served through nginx, $(printf '%s' "$body" | wc -c) bytes"
+
+      - name: The datastores are not reachable from the host
+        run: |
+          for port in 5432 6379 6333; do
+            if curl --silent --max-time 3 "http://127.0.0.1:$port" > /dev/null 2>&1; then
+              echo "::error::port $port answered on the host; it must not be published"
+              exit 1
+            fi
+            echo "port $port is not reachable from the host, as intended"
+          done
+
+      - name: A WebSocket upgrade survives the edge proxy
+        run: |
+          python3 -m pip install --quiet "websockets==12.0"
+          python3 - <<'PY'
+          import asyncio
+          import json
+          import secrets
+          import sys
+          import urllib.error
+          import urllib.request
+
+          import websockets
+
+          EDGE = "http://localhost"
+          UPPER = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+          LOWER = "abcdefghijkmnopqrstuvwxyz"
+          DIGIT = "23456789"
+          SPECIAL = "!@#%^&*"
+
+
+          def password():
+              # Mirrors what the backend policy accepts: alternate a letter
+              # and a non-letter so no run of repeats or sequences can form.
+              out = []
+              for pair in range(8):
+                  out.append(secrets.choice(UPPER if pair % 2 == 0 else LOWER))
+                  out.append(secrets.choice(DIGIT if pair % 2 == 0 else SPECIAL))
+              return "".join(out)
+
+
+          def call(path, payload=None, token=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(EDGE + path, data=data)
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Origin", EDGE)
+              if token:
+                  req.add_header("Authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return json.loads(response.read().decode())
+              except urllib.error.HTTPError as exc:
+                  sys.exit("%s failed: HTTP %s %s" % (path, exc.code, exc.read().decode()[:300]))
+
+          marker = secrets.token_hex(6)
+          created = call("/api/v1/auth/signup", {
+              "name": "Clean Host Probe",
+              # example.com, never a .test address: .test is a reserved
+              # special-use TLD (RFC 6761) and email-validator, which backs
+              # pydantic EmailStr, rejects it outright -- signup answers 422
+              # and the probe never reaches the socket.
+              "email": "clean-host-%s@example.com" % marker,
+              "password": password(),
+          })
+          token = created["access_token"]
+          workspace_id = call("/api/v1/workspaces", token=token)[0]["id"]
+          print("signed up through the edge; workspace %s" % workspace_id)
+
+
+          async def probe():
+              url = "ws://localhost/api/v1/ws?workspace_id=%s" % workspace_id
+              async with websockets.connect(
+                  url,
+                  subprotocols=["bearer", token],
+                  origin=EDGE,
+                  open_timeout=30,
+                  close_timeout=5,
+              ) as socket:
+                  print("handshake completed through nginx")
+                  print("negotiated subprotocol: %r" % socket.subprotocol)
+                  if socket.subprotocol != "bearer":
+                      sys.exit("the server did not echo the bearer subprotocol")
+                  raw = await asyncio.wait_for(socket.recv(), timeout=30)
+                  return json.loads(raw)
+
+          event = asyncio.run(probe())
+          if not isinstance(event, dict) or "type" not in event:
+              sys.exit("unexpected first frame: %r" % (event,))
+          print("first frame through the proxy: %s" % json.dumps(event)[:300])
+          print("::notice::Clean-host deployment verified from the release bundle: "
+                "images pulled from GHCR, eight services healthy, SPA and API "
+                "through nginx, WebSocket upgrade accepted, first event type %r"
+                % event["type"])
+          PY
+
+      - name: Stack state and logs
+        if: always()
+        working-directory: host
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod ps || true
+          docker compose -f docker-compose.prod.yml --env-file .env.prod logs --tail=150 || true
+
+      - name: Tear down
+        if: always()
+        working-directory: host
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env.prod down -v --remove-orphans || true
