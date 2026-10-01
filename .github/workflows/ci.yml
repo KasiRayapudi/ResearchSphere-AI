@@ -986,11 +986,12 @@ jobs:
   # which the e2e suite reaches through the Vite dev proxy instead and so has
   # never exercised in its production form.
   #
-  # The images are built here rather than pulled, because nothing has been
-  # published to GHCR yet. They are tagged with the exact names Compose
-  # expects and the stack is started with --no-build, so this exercises the
-  # published-image path rather than the build overlay; the overlay is checked
-  # separately by asking Compose to merge it.
+  # The images are built here rather than pulled, because this job has to
+  # verify the commit under test: GHCR holds only images built from a release
+  # tag, and v1.0.0 is the sole one so far. They are tagged with the exact
+  # names Compose expects and the stack is started with --no-build, so this
+  # exercises the published-image path rather than the build overlay; the
+  # overlay is checked separately by asking Compose to merge it.
   prod-stack:
     name: Production stack verification
     runs-on: ubuntu-latest

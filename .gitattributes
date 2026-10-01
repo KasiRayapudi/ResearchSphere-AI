@@ -6,3 +6,9 @@ Dockerfile* text eol=lf
 *.conf text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# The Makefile and the env template ship inside the release deployment bundle
+# (deploy-<version>.tar.gz), so they must be LF wherever that bundle is built:
+# a CRLF Makefile breaks GNU make on the deployment host.
+Makefile text eol=lf
+.env.prod.example text eol=lf

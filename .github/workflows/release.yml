@@ -89,12 +89,17 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}
           # G9 -- the tag contract, stated once:
           #   git tag v1.2.0  ->  1.2.0, 1.2, 1, sha-<40 hex>
-          # There is deliberately no `latest`. This workflow runs only on tags
-          # and workflow_dispatch, so the usual
-          # `type=raw,value=latest,enable={{is_default_branch}}` line could
-          # never fire; it was removed rather than left to imply a tag that is
-          # never published. Production selects a release explicitly with
-          # IMAGE_TAG -- see .env.prod.example.
+          # There is deliberately no `latest`, and keeping it out takes the
+          # `flavor` input below -- leaving it out of `tags:` is not enough.
+          # `flavor` defaults to `latest=auto`, which appends `latest` for any
+          # non-prerelease semver tag independently of the tag list, so v1.0.0
+          # published one although no `latest` rule was ever listed here. The
+          # `type=raw,value=latest,enable={{is_default_branch}}` rule this
+          # workflow once carried was indeed dead -- it runs only on tags --
+          # but removing it never disabled the flavour default. Production
+          # selects a release explicitly with IMAGE_TAG -- see
+          # .env.prod.example.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -206,6 +211,23 @@ jobs:
           npm run build
           tar -czf ../frontend-dist-${{ steps.version.outputs.version }}.tar.gz dist
 
+      # G-R2 -- everything a host needs to run the published images, in one
+      # archive. A flat release asset cannot carry a directory, and GitHub
+      # rewrites a leading dot in an asset name, so `.env.prod.example`
+      # attaches as `default.env.prod.example`; inside an archive neither
+      # applies. `nginx/` goes in whole because the edge runs the stock nginx
+      # image with no configuration of its own -- all three of its bind-mount
+      # sources must exist on the host, and `certs/` must exist even with TLS
+      # off or the mount fails. Deliberately absent: application source,
+      # Dockerfiles and the build overlay, which the image-pull path never
+      # reads, and `.env.prod`, which the operator writes from the example.
+      - name: Build deployment bundle for attachment
+        run: |
+          bundle="deploy-${{ steps.version.outputs.version }}.tar.gz"
+          tar -czf "$bundle" docker-compose.prod.yml .env.prod.example Makefile nginx
+          echo "Bundle contents:"
+          tar -tzf "$bundle"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -215,6 +237,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(steps.version.outputs.tag, '-rc') || contains(steps.version.outputs.tag, '-beta') }}
           files: |
+            deploy-${{ steps.version.outputs.version }}.tar.gz
             frontend-dist-${{ steps.version.outputs.version }}.tar.gz
             docker-compose.prod.yml
             .env.prod.example

@@ -157,14 +157,13 @@ mode needs no application source. The build instructions live in
 name as a published one, so nothing downstream has to know which mode produced
 it — set `IMAGE_TAG=local` to keep them apart by eye.
 
-**The published-image mode is not source-free.** The nginx service bind-mounts
-`./nginx/nginx.conf`, `./nginx/conf.d` and `./nginx/certs` from the deployment
-directory, so a host needs the `nginx/` directory alongside
-`docker-compose.prod.yml` and `.env.prod`. What it does not need is the
-application source or any build toolchain. The GitHub release attaches
-`docker-compose.prod.yml` and `.env.prod.example` but **not** `nginx/`, so the
-published release artefact alone is not yet sufficient — see
-[Known deployment gaps](#11-known-deployment-gaps).
+**The published-image mode still needs files — just not source.** The nginx
+service bind-mounts `./nginx/nginx.conf`, `./nginx/conf.d` and `./nginx/certs`
+from the deployment directory, because the edge runs the stock `nginx` image,
+which carries no configuration of its own. What a host does not need is the
+application source or any build toolchain. Everything it does need ships in the
+release's `deploy-<version>.tar.gz` bundle — see
+[§6 step 0](#0-obtain-the-deployment-files).
 
 ### Selecting a version
 
@@ -175,10 +174,19 @@ published release artefact alone is not yet sufficient — see
 | `IMAGE_TAG` for a release | the Git tag **without** its leading `v` | `1.2.0` |
 | `IMAGE_TAG` for a local build | any label; the template ships `local` | `local` |
 
-There is **no `latest` tag**. `release.yml` runs only on tags, and production
-pins a version deliberately rather than following a moving target. `IMAGE_TAG`
-has no default: Compose refuses to start without it, and `make prod-pull`
-refuses to run when it is unset or still `local`.
+There is **no `latest` tag**. `release.yml` passes `flavor: latest=false` to
+`docker/metadata-action`, and production pins a version deliberately rather
+than following a moving target. `IMAGE_TAG` has no default: Compose refuses to
+start without it, and `make prod-pull` refuses to run when it is unset or
+still `local`.
+
+> **One exception already in the registry.** `v1.0.0` was released before
+> `flavor: latest=false` was set. Omitting `latest` from the tag list is not
+> enough on its own -- `metadata-action` defaults `flavor` to `latest=auto`,
+> which appends `latest` to any non-prerelease semver tag -- so that release
+> also published `backend:latest` and `frontend:latest`. Both still point at
+> `1.0.0`, neither is maintained, and no later release will move them. Pin
+> `IMAGE_TAG` to a version and ignore them.
 
 Both production images are built from dedicated Dockerfiles and run unprivileged:
 
@@ -228,6 +236,49 @@ Every dependency edge is health-gated with one deliberate exception:
 Every target below is defined in the `Makefile`. Targets that do not build
 expand to `docker compose -f docker-compose.prod.yml --env-file .env.prod …`;
 `prod` and `prod-build` add `-f docker-compose.prod.build.yml`.
+
+### 0. Obtain the deployment files
+
+A release attaches `deploy-<version>.tar.gz`, which carries everything the
+published-image mode needs and nothing it does not. Take it from the release
+page, or from a shell:
+
+```bash
+gh release download v<version> --pattern 'deploy-*.tar.gz'
+tar -xzf deploy-<version>.tar.gz
+```
+
+Unpacked into an empty directory, that restores exactly:
+
+```
+docker-compose.prod.yml
+.env.prod.example
+Makefile
+nginx/nginx.conf
+nginx/conf.d/researchsphere.conf
+nginx/certs/.gitkeep
+```
+
+`nginx/`, `nginx/conf.d/` and `nginx/certs/` come back as directories, which
+matters because all three are bind-mount sources: `certs/` has to exist even
+while TLS is off ([§9](#9-nginx-and-tls)) or the mount fails, which is what the
+tracked `.gitkeep` is for. Inside the archive the template keeps its real name,
+`.env.prod.example`, rather than the `default.env.prod.example` that GitHub
+produces when a leading dot is attached as a flat asset.
+
+The bundle deliberately omits `.env.prod` — step 1 creates it — along with the
+application source, the Dockerfiles and the build overlay, none of which the
+image-pull path reads. Choose the build explicitly with `IMAGE_TAG`
+([§4](#4-production-images)); releases after `v1.0.0` publish no `latest` tag
+to fall back on.
+
+> `v1.0.0` predates this bundle. Its assets are `docker-compose.prod.yml`, the
+> renamed `default.env.prod.example` and the frontend tarball only, so
+> deploying that particular release also needs `nginx/` and the `Makefile` from
+> a checkout of the `v1.0.0` tag.
+
+A clone of the repository serves just as well, and is what the local-build mode
+needs in any case.
 
 ### 1. Create `.env.prod`
 
@@ -467,13 +518,18 @@ frame.
 | Trigger | Push of a tag matching `v*.*.*`, or `workflow_dispatch` with a `tag` input |
 | Permissions | `contents: write`, `packages: write`, `id-token: write`, `attestations: write` |
 | Job 1 — `verify` | Runs the backend tests, then the frontend tests and build, against the tagged commit |
-| Job 2 — `publish` | Needs `verify`. Matrix over `backend` (`backend/Dockerfile.prod`) and `frontend` (`frontend/Dockerfile.prod`); Buildx; logs in to `ghcr.io`; derives tags with `docker/metadata-action` as `{{version}}`, `{{major}}.{{minor}}`, `{{major}}` and long SHA — **no `latest`**; builds with `push: true`, `provenance: true`, `sbom: true`; then `actions/attest-build-provenance` with `push-to-registry: true` |
+| Job 2 — `publish` | Needs `verify`. Matrix over `backend` (`backend/Dockerfile.prod`) and `frontend` (`frontend/Dockerfile.prod`); Buildx; logs in to `ghcr.io`; derives tags with `docker/metadata-action` as `{{version}}`, `{{major}}.{{minor}}`, `{{major}}` and long SHA, with `flavor: latest=false` — which is what actually suppresses `latest`, rather than its absence from the tag list; builds with `push: true`, `provenance: true`, `sbom: true`; then `actions/attest-build-provenance` with `push-to-registry: true` |
 | Job 3 — `release` | Needs `publish`. Creates a GitHub release with `softprops/action-gh-release`, whose notes include `docker pull` lines for both images and a link back to this document |
 | Registry | `ghcr.io/kasirayapudi/researchsphere-ai/{backend,frontend}`. The name is lowercase because OCI repository names must be; it comes from `IMAGE_NAMESPACE` in the workflow env, which `docker-compose.prod.yml` mirrors verbatim |
 
-> **Status — never exercised.** No tag exists in this repository, locally or on
-> the remote, so `release.yml` has never run and no image has been published to
-> GHCR. Everything above describes the workflow definition, not an observed run.
+> **Status — exercised once.** `v1.0.0` ran this workflow against commit
+> `e4547f1` (run 36918675130); `verify`, both `publish` matrix legs and
+> `release` all succeeded. Both images are published and were confirmed
+> anonymously pullable at `1.0.0`, `1.0`, `1` and
+> `sha-e4547f15ec8e0d23ca77d6936b950b8d115af765`, each carrying a
+> Sigstore-signed provenance attestation in the registry and in Rekor. That run
+> also published `latest`, from the `metadata-action` default described above;
+> `flavor: latest=false` was added afterwards, so later releases will not.
 
 ---
 
@@ -484,10 +540,8 @@ the deployment path is not mistaken for something more finished than it is.
 
 | # | Gap | Evidence |
 |---|---|---|
-| 1 | The release workflow has never been exercised | No tag exists locally or on the remote, so no image has ever been published and **pulling from GHCR has never actually been performed**. The CI job builds the images under their Compose names and starts the stack with `--no-build`, which verifies the published-image *path* but not a real registry pull |
-| 2 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
-| 3 | The release artefact is not self-sufficient | `release.yml` attaches `docker-compose.prod.yml` and `.env.prod.example`, but nginx bind-mounts three paths from `./nginx`, which is not attached. A host still needs those files from the repository |
-| 4 | Kubernetes support is absent | No manifests, chart or overlays exist |
+| 1 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
+| 2 | Kubernetes support is absent | No manifests, chart or overlays exist |
 
 ### Closed since the previous revision
 
@@ -502,7 +556,9 @@ the deployment path is not mistaken for something more finished than it is.
 | `beat` declared `deploy:` twice | The duplicate — a copy of the worker's limits — was removed; beat keeps 0.25 CPU / 256M |
 | The backend healthcheck probed `/api/live` while claiming readiness | Both `docker-compose.prod.yml` and `backend/Dockerfile.prod` now probe `/api/ready` |
 | The release workflow named an uppercase repository | `IMAGE_NAMESPACE` supplies the lowercase name to the attestation subject and the release notes |
-| `latest` was referenced but never published | The dead metadata rule was removed and `IMAGE_TAG` is now explicit — see [§4](#4-production-images) |
+| `latest` was kept out by omission alone | The dead metadata rule was removed and `IMAGE_TAG` is now explicit — see [§4](#4-production-images). That removal was not sufficient by itself: `metadata-action`'s `flavor: latest=auto` default published a `latest` tag for `v1.0.0` anyway, so `flavor: latest=false` is now set explicitly |
+| The release workflow had never been exercised | `v1.0.0` ran it end to end on `e4547f1`. Both images reached GHCR, were pulled anonymously to confirm they exist, and carry provenance attestations — see [§10](#10-ghcr-release-workflow) |
+| The release artefact was not self-sufficient | `release.yml` now also attaches `deploy-<version>.tar.gz`, carrying `docker-compose.prod.yml`, `.env.prod.example`, the `Makefile` and the whole `nginx/` tree with its `conf.d/` and `certs/` directories intact — see [§6 step 0](#0-obtain-the-deployment-files) |
 
 ---
 
