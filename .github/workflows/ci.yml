@@ -1550,7 +1550,10 @@ jobs:
             exit 1
           fi
           echo "--- and nothing silently fell back to http ---"
-          scheme="$(curl -sS --cacert "$CA" -o /dev/null -w '%{scheme}' "$EDGE/")"
+          # curl reports the scheme in upper case on some builds and lower on
+          # others, so normalise before comparing. The assertion itself is
+          # unchanged: anything but https still fails.
+          scheme="$(curl -sS --cacert "$CA" -o /dev/null -w '%{scheme}' "$EDGE/" | tr 'A-Z' 'a-z')"
           echo "  effective scheme: $scheme"
           if [ "$scheme" != "https" ]; then
             echo "::error::request did not use https"
@@ -1602,7 +1605,11 @@ jobs:
           CipherString = DEFAULT:@SECLEVEL=0
           CNF
           for v in -tls1 -tls1_1; do
-            out="$(OPENSSL_CONF="$RUNNER_TEMP/openssl-legacy.cnf" probe "$v")"
+            # `|| true` is required, not laxity: openssl exits non-zero when
+            # the server refuses the protocol, which is the outcome being
+            # asserted, and under `bash -e` a failing command substitution
+            # would abort the step before the checks below ever ran.
+            out="$(OPENSSL_CONF="$RUNNER_TEMP/openssl-legacy.cnf" probe "$v" || true)"
             if echo "$out" | grep -qE "Protocol *: *TLSv1(\.1)? *$"; then
               echo "::error::$v completed a handshake; obsolete TLS is enabled"
               exit 1
