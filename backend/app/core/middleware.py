@@ -122,8 +122,22 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if csp:
             response.headers["Content-Security-Policy"] = csp
 
-        # HSTS: production only, and never over a plain-HTTP request.
-        if settings.is_production and settings.HSTS_ENABLED:
+        # HSTS: production only, and never over a plain-HTTP request. The
+        # scheme check is what makes the second half true -- without it the
+        # header went out over http as well, where a browser must ignore it
+        # (RFC 6797 s8.1) but where it also advertises a guarantee the
+        # deployment may not be keeping.
+        #
+        # Behind the nginx edge the scheme arrives as X-Forwarded-Proto, which
+        # uvicorn applies to request.url.scheme through --proxy-headers; the
+        # edge sets it from $scheme, so it is "https" only from the TLS
+        # server. A client cannot forge it, because the backend port is not
+        # published and only nginx can reach it.
+        #
+        # This application is the single owner of HSTS: the TLS vhost
+        # deliberately does not add_header it, which would produce two
+        # competing Strict-Transport-Security headers.
+        if settings.is_production and settings.HSTS_ENABLED and request.url.scheme == "https":
             response.headers["Strict-Transport-Security"] = settings.hsts_value
 
         return response

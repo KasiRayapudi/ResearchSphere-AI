@@ -256,7 +256,9 @@ docker-compose.prod.yml
 Makefile
 nginx/nginx.conf
 nginx/conf.d/researchsphere.conf
+nginx/conf.d/locations.inc
 nginx/certs/.gitkeep
+nginx/tls/researchsphere-tls.conf
 ```
 
 `nginx/`, `nginx/conf.d/` and `nginx/certs/` come back as directories, which
@@ -446,41 +448,140 @@ healthcheck must agree on it.
 
 ## 9. Nginx and TLS
 
-### What is configured today
+### How the edge is organised
 
-- `nginx/nginx.conf` defines the rate-limit zones: `api_limit` at 30 r/s and
-  `auth_limit` at 5 r/s, both keyed on `$binary_remote_addr`.
-- `nginx/nginx.conf` also defines `map $http_upgrade $connection_upgrade`, the
-  standard mapping a WebSocket proxy needs.
-- `nginx/conf.d/researchsphere.conf` defines upstreams `backend:8000` and
-  `frontend:8080`, sets `proxy_http_version 1.1`, and serves a single
-  `server { listen 80; server_name _; }`.
-- Routing: a streaming location for `/api/v1/chat/stream` (with
-  `proxy_set_header Connection ''`), rate-limited locations for
-  `/api/v1/auth/(login|signup|refresh|password-reset)`,
-  `/api/v1/documents/upload` (with `client_max_body_size 64m`), the report and
-  research entrypoints, `/api/`, the API docs, and a catch-all `/` to the
-  frontend.
-- The ACME HTTP-01 challenge location `/.well-known/acme-challenge/` is active
-  and served from `/var/www/certbot`, backed by the `certbot_www` volume.
-- `./nginx/certs` is mounted read-only into the container at `/etc/nginx/certs`.
+Three files, so that one set of routes serves both transports:
 
-### What is **not** enabled
+| File | Contents |
+|---|---|
+| `nginx/nginx.conf` | http-level config: the rate-limit zones (`api_limit` 30 r/s, `auth_limit` 5 r/s, both keyed on `$binary_remote_addr`), `map $http_upgrade $connection_upgrade`, the `backend:8000` and `frontend:8080` upstreams, and the shared `proxy_set_header` set including `X-Forwarded-Proto $scheme` |
+| `nginx/conf.d/locations.inc` | **every application route**, defined once: the SSE location for `/api/v1/chat/stream`, the WebSocket location `^~ /api/v1/ws`, the rate-limited auth routes, `/api/v1/documents/upload`, the report and research entrypoints, `/api/`, the API docs, `= /healthz`, and the catch-all `/` to the frontend |
+| `nginx/conf.d/researchsphere.conf` | the active virtual host. Default: one `server { listen 80; }` that serves the ACME challenge and `include`s the routes above |
 
-> **Warning — this deployment serves plain HTTP.**
->
-> - The `listen 443 ssl` server block in `nginx/conf.d/researchsphere.conf` is
->   **commented out**, including its `ssl_certificate` and
->   `ssl_certificate_key` directives.
-> - The HTTP→HTTPS redirect (`return 301 https://$host$request_uri;`) is
->   **commented out**.
-> - The `${HTTPS_PORT:-443}:443` port mapping in `docker-compose.prod.yml` is
->   **commented out**.
-> - `nginx/certs/` contains only a `.gitkeep`; no certificate is provisioned,
->   and nothing automates issuance or renewal.
->
-> Enabling TLS means supplying certificates and uncommenting those blocks. That
-> work is **not** part of this document and has not been done.
+`locations.inc` is not named `*.conf` deliberately: `nginx.conf` includes
+`/etc/nginx/conf.d/*.conf`, and a bare `location` outside a `server` block is a
+configuration error, so the fragment must never be loaded on its own.
+
+The upstreams and the shared proxy headers sit in `nginx.conf` rather than in a
+vhost file because the two vhosts are alternatives — whichever is active needs
+both.
+
+### What is enabled by default
+
+**Plain HTTP on port 80**, serving the application. This is what the CI
+deployment tests exercise and what every release so far has been verified
+against. `./nginx/certs` is mounted read-only at `/etc/nginx/certs` and
+contains only a `.gitkeep`.
+
+### Switching the edge to HTTPS
+
+The TLS virtual host is written and parses, but it is **opt-in**: a `443` server
+whose `ssl_certificate` does not exist stops nginx from starting at all, so it
+ships outside `conf.d/` as `nginx/tls/researchsphere-tls.conf`.
+
+```bash
+cp /path/to/fullchain.pem /path/to/privkey.pem nginx/certs/
+cp nginx/tls/researchsphere-tls.conf nginx/conf.d/
+rm nginx/conf.d/researchsphere.conf
+```
+
+Then uncomment the `${HTTPS_PORT:-443}:443` mapping in
+`docker-compose.prod.yml`, set `server_name` in the copied file to the real
+hostname, and restart the edge. Reverse the two file operations to go back.
+
+Removing `researchsphere.conf` is **required, not tidying**: it also declares a
+default server on port 80, and nginx refuses to start with two.
+
+What the TLS vhost does:
+
+| Request | Result |
+|---|---|
+| `http://host/.well-known/acme-challenge/…` | served from `/var/www/certbot`, ahead of any redirect |
+| `http://host/healthz` | `200` from nginx itself — kept on HTTP for the container healthcheck, which probes `http://127.0.0.1/healthz` |
+| `http://host/anything-else` | `301` to `https://$host$request_uri` |
+| `https://host/` | the SPA |
+| `https://host/api/…` | the backend |
+| `wss://host/api/v1/ws` | the realtime socket, unchanged |
+
+The redirect is a **separate server block**, not a `location /` added to the
+application vhost: that vhost already defines `location /` for the SPA, and a
+second one in the same server is a duplicate-location error. Separate servers
+also mean the redirect genuinely covers every path rather than only those that
+fall through to `location /`.
+
+TLS settings: `ssl_protocols TLSv1.2 TLSv1.3` — everything older is disabled by
+omission, since nginx enables exactly the versions listed. No explicit
+`ssl_ciphers`: OpenSSL's own default list for those two versions is already
+modern and TLS 1.3 ignores the directive entirely, so pinning a hand-written
+list would only freeze it against future updates. `ssl_prefer_server_ciphers
+off` leaves the choice with the client. Session cache on, tickets off. OCSP
+stapling is left off rather than half-configured — it needs a `resolver` and a
+chain containing the issuer.
+
+### Who owns HSTS
+
+**The application, not nginx.** `SecurityHeadersMiddleware` emits
+`Strict-Transport-Security` only when `ENVIRONMENT=production` **and** the
+request arrived over `https`, which it learns from `X-Forwarded-Proto` through
+uvicorn's `--proxy-headers`. The TLS vhost deliberately does not `add_header`
+it; doing so as well would put two competing headers on every proxied
+response, and only the application knows whether it is running in production.
+
+`HSTS_INCLUDE_SUBDOMAINS` defaults to **false** and `HSTS_PRELOAD` to false.
+`includeSubDomains` commits every subdomain of the deployment host to HTTPS for
+`HSTS_MAX_AGE` (one year) and cannot be withdrawn inside that window, so it is
+opt-in once the whole domain is known to be HTTPS-only.
+
+### Certificates
+
+Supplied on the deployment host, never by this repository:
+
+- `.gitignore` excludes everything under `nginx/certs/` except `.gitkeep`, and
+  no certificate or key has ever been committed.
+- The release workflow refuses to build `deploy-<version>.tar.gz` if anything
+  other than `.gitkeep` is in `nginx/certs/`, or if any file matching `*.pem`,
+  `*.key`, `*.crt`, `*.cer`, `*.p12`, `*.pfx`, `*privkey*` or `*fullchain*`
+  appears anywhere in the packaged tree. It fails closed.
+- Nothing is baked into an image: the edge is the stock `nginx:1.27-alpine`
+  with its configuration and certificates bind-mounted.
+
+Replacing a certificate is therefore a file swap plus a reload, with no image
+rebuild:
+
+```bash
+cp /path/to/new-fullchain.pem nginx/certs/fullchain.pem
+cp /path/to/new-privkey.pem   nginx/certs/privkey.pem
+docker compose -f docker-compose.prod.yml --env-file .env.prod exec nginx nginx -s reload
+```
+
+> **Issuance and renewal are not implemented.** The ACME HTTP-01 location is
+> live and the `certbot_www` volume is mounted, so a certbot container or an
+> external client can complete a challenge — but no such service exists in
+> `docker-compose.prod.yml`, and nothing reloads nginx on renewal. Obtaining
+> and renewing certificates remains a deployment responsibility to be
+> automated before a real public-domain deployment. This document does not
+> claim otherwise.
+
+### Verifying HTTPS
+
+Once enabled, against the real hostname:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}
+' http://HOST/
+curl -sS -o /dev/null -w '%{http_code}
+' https://HOST/healthz
+curl -sS -o /dev/null -w '%{http_code}
+' https://HOST/api/ready
+curl -sSI https://HOST/api/health | grep -i strict-transport-security
+curl -sS --tlsv1.1 --tls-max 1.1 https://HOST/ || echo "TLS 1.1 refused, as intended"
+```
+
+Expect `301` with an `https://` target, `200` from both health endpoints, one
+`Strict-Transport-Security` header on the HTTPS response and none on HTTP, and
+the TLS 1.1 handshake to fail. The CI clean-host job will assert the same
+things against an ephemeral certificate — see
+[§11](#11-known-deployment-gaps).
 
 ### Realtime WebSocket
 
@@ -540,8 +641,9 @@ the deployment path is not mistaken for something more finished than it is.
 
 | # | Gap | Evidence |
 |---|---|---|
-| 1 | TLS is disabled | The 443 server block, the HTTP→HTTPS redirect and the `HTTPS_PORT` mapping are all commented out; no certificates are provisioned |
-| 2 | Kubernetes support is absent | No manifests, chart or overlays exist |
+| 1 | TLS is configured but off by default, and no CI job exercises it | The HTTPS virtual host exists and parses (`nginx/tls/researchsphere-tls.conf`), but enabling it is a manual file swap plus certificates — see [§9](#9-nginx-and-tls). No deployment test has yet served HTTPS or WSS, so the TLS path is verified only by configuration parsing, not by a running listener |
+| 2 | Certificate issuance and renewal are not automated | The ACME HTTP-01 location and the `certbot_www` volume exist, but no certbot service is defined and nothing reloads nginx on renewal |
+| 3 | Kubernetes support is absent | No manifests, chart or overlays exist |
 
 ### Closed since the previous revision
 
@@ -583,7 +685,9 @@ behaviour above was read from the files it describes:
 `backend/Dockerfile.prod`, `frontend/Dockerfile.prod`,
 `backend/docker-entrypoint.sh`, `.env.prod.example`, `backend/.env.example`,
 `.gitignore`, `Makefile`, `.github/workflows/release.yml`,
-`.github/workflows/ci.yml`, `nginx/nginx.conf`,
+`.github/workflows/ci.yml`, `.github/workflows/deploy-verify.yml`,
+`nginx/nginx.conf`, `nginx/conf.d/locations.inc`,
+`nginx/tls/researchsphere-tls.conf`,
 `nginx/conf.d/researchsphere.conf` and `README.md`.
 
 **What has been verified, and how:**

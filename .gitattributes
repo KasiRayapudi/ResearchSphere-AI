@@ -12,3 +12,7 @@ Dockerfile* text eol=lf
 # a CRLF Makefile breaks GNU make on the deployment host.
 Makefile text eol=lf
 .env.prod.example text eol=lf
+
+# nginx include fragments ship in the deployment bundle and are read inside a
+# Linux container, like the *.conf files above; *.conf does not match them.
+*.inc text eol=lf

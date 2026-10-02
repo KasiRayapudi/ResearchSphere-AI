@@ -229,6 +229,36 @@ jobs:
       # off or the mount fails. Deliberately absent: application source,
       # Dockerfiles and the build overlay, which the image-pull path never
       # reads, and `.env.prod`, which the operator writes from the example.
+      # Fail closed before anything is packaged. `nginx/` is archived whole,
+      # so a certificate or private key left in nginx/certs/ on the builder
+      # would be published inside a release asset. Nothing should put one
+      # there -- .gitignore excludes everything in that directory except
+      # .gitkeep, and the TLS certificates are supplied on the deployment host
+      # -- but the bundle is the wrong place to find out.
+      - name: No TLS key material may enter the bundle
+        run: |
+          found="$(find nginx/certs -type f -not -name .gitkeep -print 2>/dev/null || true)"
+          if [ -n "$found" ]; then
+            echo "::error::refusing to build the bundle: unexpected files under nginx/certs"
+            printf '%s\n' "$found"
+            exit 1
+          fi
+          # Belt and braces across the whole packaged tree, by extension and
+          # by the names Let's Encrypt uses, so a key dropped outside certs/
+          # is caught too.
+          leaked="$(find docker-compose.prod.yml .env.prod.example Makefile nginx -type f \
+            \( -iname '*.pem' -o -iname '*.key' -o -iname '*.crt' -o -iname '*.cer' \
+               -o -iname '*.p12' -o -iname '*.pfx' -o -iname '*privkey*' \
+               -o -iname '*fullchain*' \) -print 2>/dev/null || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::refusing to build the bundle: certificate or key material present"
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+          echo "no certificate or key material in the packaged tree"
+          echo "nginx/certs holds only:"
+          ls -A nginx/certs
+
       - name: Build deployment bundle for attachment
         run: |
           bundle="deploy-${{ steps.version.outputs.version }}.tar.gz"

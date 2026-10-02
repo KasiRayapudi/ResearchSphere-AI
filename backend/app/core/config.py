@@ -239,7 +239,11 @@ class Settings(BaseSettings):
     # HSTS (production only - see SecurityHeadersMiddleware)
     HSTS_ENABLED: bool = True
     HSTS_MAX_AGE: int = 31536000  # 1 year
-    HSTS_INCLUDE_SUBDOMAINS: bool = True
+    # Off by default: it commits every subdomain of the deployment hostname to
+    # HTTPS for HSTS_MAX_AGE, which is not reversible within that window and
+    # breaks any sibling host still on plain HTTP. Opt in only once the whole
+    # domain is known to be HTTPS-only.
+    HSTS_INCLUDE_SUBDOMAINS: bool = False
     HSTS_PRELOAD: bool = False
 
     model_config = {"env_file": ".env", "extra": "ignore"}

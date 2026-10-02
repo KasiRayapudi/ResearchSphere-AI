@@ -236,6 +236,30 @@ class TestMiddleware:
         # scheme the developer is not serving.
         assert "strict-transport-security" not in client.get("/api/live").headers
 
+    def test_hsts_is_not_sent_over_plain_http_in_production(self, client, monkeypatch):
+        """Regression: production alone used to be the whole condition.
+
+        The comment above the check claimed it was never sent over plain HTTP,
+        but nothing looked at the scheme, so every HTTP response in production
+        carried it -- advertising HTTPS-only for a year from a deployment that
+        serves port 80. Behind the edge the scheme comes from
+        X-Forwarded-Proto via uvicorn's --proxy-headers.
+        """
+        monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+        assert settings.is_production, "the monkeypatch must actually take effect"
+        assert "strict-transport-security" not in client.get("/api/live").headers
+
+    def test_hsts_is_sent_over_https_in_production(self, client, monkeypatch):
+        monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+        value = client.get("https://testserver/api/live").headers.get(
+            "strict-transport-security", ""
+        )
+        assert value.startswith("max-age="), f"no HSTS over https: {value!r}"
+        # Both are opt-in. includeSubDomains commits every sibling host for
+        # the whole max-age, and preload is irreversible in practice.
+        assert "includeSubDomains" not in value
+        assert "preload" not in value
+
     def test_docs_receive_a_relaxed_policy(self, client):
         response = client.get("/docs")
         if response.status_code == 200:
