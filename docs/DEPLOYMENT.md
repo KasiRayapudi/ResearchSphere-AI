@@ -579,9 +579,16 @@ curl -sS --tlsv1.1 --tls-max 1.1 https://HOST/ || echo "TLS 1.1 refused, as inte
 
 Expect `301` with an `https://` target, `200` from both health endpoints, one
 `Strict-Transport-Security` header on the HTTPS response and none on HTTP, and
-the TLS 1.1 handshake to fail. The CI clean-host job will assert the same
-things against an ephemeral certificate — see
-[§11](#11-known-deployment-gaps).
+the TLS 1.1 handshake to fail.
+
+CI asserts the same things on every run. The `prod-stack-tls` job in
+`ci.yml` generates an ephemeral self-signed `localhost` certificate inside the
+runner, enables this virtual host by the file swap described above, and drives
+the full eight-service stack through it: TLS 1.2 and 1.3 negotiate, TLS 1.0
+and 1.1 are refused by the server with a protocol-version alert, the
+certificate nginx presents matches the one generated, HSTS appears exactly
+once over HTTPS and not at all over HTTP, and a WebSocket upgrades over `wss`
+to a first `connection.ready` frame. The certificate never leaves the runner.
 
 ### Realtime WebSocket
 
@@ -641,7 +648,7 @@ the deployment path is not mistaken for something more finished than it is.
 
 | # | Gap | Evidence |
 |---|---|---|
-| 1 | TLS is configured but off by default, and no CI job exercises it | The HTTPS virtual host exists and parses (`nginx/tls/researchsphere-tls.conf`), but enabling it is a manual file swap plus certificates — see [§9](#9-nginx-and-tls). No deployment test has yet served HTTPS or WSS, so the TLS path is verified only by configuration parsing, not by a running listener |
+| 1 | TLS is off by default and is switched on by hand | Enabling it means supplying certificates and swapping the virtual host — see [§9](#9-nginx-and-tls). The configuration itself is no longer unproven: `prod-stack-tls` serves HTTPS and WSS from a running eight-service stack on every CI run. What is still manual is the switch, and what is still untested is the *released bundle* carrying the TLS files, because the published `v1.0.1` artefact predates them |
 | 2 | Certificate issuance and renewal are not automated | The ACME HTTP-01 location and the `certbot_www` volume exist, but no certbot service is defined and nothing reloads nginx on renewal |
 | 3 | Kubernetes support is absent | No manifests, chart or overlays exist |
 
