@@ -305,7 +305,7 @@ jobs:
       # GitHub Actions cache keeps rebuild times reasonable despite the large
       # ML dependency tree in the backend image.
       - name: Build backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           file: ./backend/Dockerfile.prod
@@ -316,7 +316,7 @@ jobs:
           cache-to: type=gha,scope=backend,mode=max
 
       - name: Build frontend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           file: ./frontend/Dockerfile.prod
@@ -1005,7 +1005,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build the backend image under its Compose name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           file: ./backend/Dockerfile.prod
@@ -1015,7 +1015,7 @@ jobs:
           cache-from: type=gha,scope=backend
 
       - name: Build the frontend image under its Compose name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           file: ./frontend/Dockerfile.prod
@@ -1309,7 +1309,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build the backend image under its Compose name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           file: ./backend/Dockerfile.prod
@@ -1319,7 +1319,7 @@ jobs:
           cache-from: type=gha,scope=backend
 
       - name: Build the frontend image under its Compose name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           file: ./frontend/Dockerfile.prod
