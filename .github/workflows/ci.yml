@@ -1580,12 +1580,26 @@ jobs:
           probe() {
             echo | openssl s_client -connect localhost:443 -servername localhost "$1" 2>&1
           }
+          # Two markers, because the output differs by OpenSSL version. The
+          # SSL-Session block carries `Protocol :` only once a session exists:
+          # TLS 1.2 establishes one during the handshake, but TLS 1.3 gets its
+          # session from a post-handshake ticket that never arrives here
+          # because `echo` closes stdin at once -- so OpenSSL 3.0 on the
+          # runner prints no session block for 1.3 while 3.5 does. `New,
+          # TLSv1.x,` is printed immediately after the handshake either way
+          # and names the negotiated version. With -tls1_3 the client offers
+          # nothing else, so a completed handshake is proof of 1.3.
+          #
+          # Each probe runs once and is captured, so the assertion and the
+          # diagnostic see the same output, and a failure prints enough of it
+          # to diagnose in one pass.
           for v in -tls1_2 -tls1_3; do
-            if probe "$v" | grep -qE "Protocol *: *TLSv1\.[23]"; then
-              echo "  accepted: $v"
+            out="$(probe "$v" || true)"
+            if printf '%s' "$out" | grep -qE "New, TLSv1\.[23],|Protocol *: *TLSv1\.[23]"; then
+              echo "  accepted: $v ($(printf '%s' "$out" | grep -oE 'New, TLSv1\.[0-9]' | head -1))"
             else
               echo "::error::$v was refused but should be accepted"
-              probe "$v" | tail -5
+              printf '%s\n' "$out" | tail -40
               exit 1
             fi
           done
