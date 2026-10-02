@@ -1277,12 +1277,623 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.prod.yml --env-file .env.prod down -v --remove-orphans
 
+  # --------------------------------------------------- production stack, TLS --
+  # The same eight-service stack as prod-stack, with the TLS vhost enabled and
+  # a certificate, so the HTTPS and WSS path is exercised for real: a TLS
+  # listener, a certificate nginx actually presents, and a WebSocket upgrade
+  # over wss. prod-stack keeps the plain-HTTP coverage unchanged; this job is
+  # additive, and independent of it so a TLS failure is isolated.
+  #
+  # TLS is enabled exactly the way docs/DEPLOYMENT.md tells an operator to do
+  # it -- copy nginx/tls/researchsphere-tls.conf into conf.d and remove the
+  # HTTP vhost -- so this job verifies the documented mechanism rather than a
+  # test-only arrangement. The 443 publication comes from a Compose override
+  # written in the runner, because the committed compose file deliberately
+  # leaves that mapping commented out.
+  #
+  # The certificate and key are generated here, live only in the runner, are
+  # never printed, never uploaded, and are deleted on teardown. nginx/certs/
+  # is already excluded by .gitignore apart from .gitkeep.
+  prod-stack-tls:
+    name: Production stack verification (HTTPS)
+    runs-on: ubuntu-latest
+    # After docker-build, so the layer cache for both Dockerfiles is warm.
+    # Deliberately not needs: [prod-stack] -- the two paths are independent.
+    needs: [docker-build]
+    env:
+      EDGE: https://localhost
+      EDGE_HTTP: http://localhost
+      CA: nginx/certs/fullchain.pem
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the backend image under its Compose name
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: false
+          load: true
+          tags: ghcr.io/kasirayapudi/researchsphere-ai/backend:ci
+          cache-from: type=gha,scope=backend
+
+      - name: Build the frontend image under its Compose name
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: false
+          load: true
+          tags: ghcr.io/kasirayapudi/researchsphere-ai/frontend:ci
+          cache-from: type=gha,scope=frontend
+
+      - name: Compose a throwaway .env.prod with https origins
+        run: |
+          python3 - <<'PY'
+          import base64
+          import pathlib
+          import secrets
+
+          # https origins, unlike prod-stack's: the realtime endpoint checks
+          # the WebSocket Origin against CORS_ORIGINS, and the browser sends
+          # the page's own scheme. http values here would fail the wss
+          # handshake for the right reason but the wrong test.
+          values = {
+              "SECRET_KEY": base64.b64encode(secrets.token_bytes(48)).decode(),
+              "POSTGRES_PASSWORD": secrets.token_hex(24),
+              "REDIS_PASSWORD": secrets.token_hex(24),
+              "GEMINI_API_KEY": "ci-not-a-real-key",
+              "FRONTEND_URL": "https://localhost",
+              "CORS_ORIGINS": "https://localhost",
+              "TRUSTED_HOSTS": "localhost",
+              "IMAGE_TAG": "ci",
+          }
+          out, seen = [], set()
+          for line in pathlib.Path(".env.prod.example").read_text().splitlines():
+              key = line.split("=", 1)[0] if ("=" in line and not line.startswith("#")) else None
+              if key in values:
+                  out.append(key + "=" + values[key])
+                  seen.add(key)
+              else:
+                  out.append(line)
+          for key, value in values.items():
+              if key not in seen:
+                  out.append(key + "=" + value)
+          pathlib.Path(".env.prod").write_text("\n".join(out) + "\n")
+
+          print("keys written (values withheld):")
+          for line in out:
+              if "=" in line and not line.startswith("#"):
+                  print("  " + line.split("=", 1)[0])
+          PY
+
+      - name: Generate an ephemeral localhost certificate
+        run: |
+          # Self-signed and short-lived: it exists only for this runner. The
+          # SAN is what makes curl and python verify the hostname rather than
+          # needing verification turned off.
+          # basicConstraints CA:TRUE as well as the SAN: the same file is used
+          # both as the server certificate and as the trust anchor given to
+          # curl and python, so it has to be a valid self-signed CA for
+          # itself rather than relying on a bare leaf being accepted.
+          # stderr is left visible: openssl writes only key-generation
+          # progress there, never key material, and suppressing it would hide
+          # the reason for a failure.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -sha256 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -addext "basicConstraints=critical,CA:TRUE" -keyout nginx/certs/privkey.pem -out nginx/certs/fullchain.pem
+          chmod 600 nginx/certs/privkey.pem
+          # Safe properties only. The key is never read, printed or hashed.
+          test -s nginx/certs/privkey.pem || { echo "::error::no private key produced"; exit 1; }
+          test -s nginx/certs/fullchain.pem || { echo "::error::no certificate produced"; exit 1; }
+          echo "certificate generated:"
+          openssl x509 -in nginx/certs/fullchain.pem -noout -subject -issuer -enddate
+          openssl x509 -in nginx/certs/fullchain.pem -noout -ext subjectAltName
+          openssl x509 -in nginx/certs/fullchain.pem -noout -fingerprint -sha256
+          echo "private key present: $(test -f nginx/certs/privkey.pem && echo yes), contents never displayed"
+
+      - name: Enable the TLS vhost the way the docs instruct
+        run: |
+          cp nginx/tls/researchsphere-tls.conf nginx/conf.d/
+          rm nginx/conf.d/researchsphere.conf
+          echo "conf.d now contains:"
+          ls -1 nginx/conf.d
+          # Exactly one vhost must be active, or nginx refuses to start with
+          # two default servers on port 80.
+          count="$(ls -1 nginx/conf.d/*.conf | wc -l)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one active vhost, found $count"
+            exit 1
+          fi
+          # locations.inc must still be the only definition of the routes, and
+          # must not have been copied into the TLS vhost.
+          if grep -q "proxy_pass http://frontend_upstream" nginx/conf.d/researchsphere-tls.conf; then
+            echo "::error::the TLS vhost duplicates the application routing"
+            exit 1
+          fi
+          grep -c "include /etc/nginx/conf.d/locations.inc;" nginx/conf.d/researchsphere-tls.conf
+
+      - name: Publish 443 through a Compose override
+        run: |
+          # The committed compose file leaves the 443 mapping commented out,
+          # and this job must not edit it. Compose appends list entries, so
+          # this adds 443 alongside the existing 80.
+          cat > "$RUNNER_TEMP/tls-ports.yml" <<'YML'
+          services:
+            nginx:
+              ports:
+                - "443:443"
+          YML
+          cat "$RUNNER_TEMP/tls-ports.yml"
+
+      - name: Compose parses the TLS file set
+        run: |
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod config --quiet
+          echo "ok"
+          echo "published ports:"
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod config | grep -A 6 "^  nginx:" | grep -E "published|target" || true
+
+      - name: Start the datastores and migrate
+        run: |
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod up -d --no-build postgres redis qdrant
+          pending="not checked"
+          deadline=$((SECONDS + 240))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in postgres redis qdrant; do
+              cid="$(docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "datastores healthy"
+              break
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          if [ -n "$pending" ]; then
+            echo "::error::datastores did not become healthy:$pending"
+            exit 1
+          fi
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod run --rm backend migrate
+
+      - name: Start the full stack
+        run: |
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod up -d --no-build
+
+      - name: Every service reports healthy
+        run: |
+          services="nginx frontend backend worker beat postgres qdrant redis"
+          pending="not checked"
+          deadline=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=""
+            for s in $services; do
+              cid="$(docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod ps -q "$s")"
+              if [ -z "$cid" ]; then
+                pending="$pending $s=absent"
+                continue
+              fi
+              state="$(docker inspect -f '{{.State.Health.Status}}' "$cid")"
+              if [ "$state" != "healthy" ]; then
+                pending="$pending $s=$state"
+              fi
+            done
+            if [ -z "$pending" ]; then
+              echo "all 8 services healthy over the TLS vhost"
+              docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod ps
+              exit 0
+            fi
+            echo "waiting:$pending"
+            sleep 5
+          done
+          echo "::error::services did not become healthy:$pending"
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod ps
+          exit 1
+
+      - name: Plain HTTP redirects, except health and ACME
+        run: |
+          echo "--- / must redirect, and must not be followed ---"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' "$EDGE_HTTP/")"
+          target="$(curl -sS -o /dev/null -w '%{redirect_url}' "$EDGE_HTTP/")"
+          echo "  GET / -> $code  Location: $target"
+          if [ "$code" != "301" ]; then
+            echo "::error::expected 301 from plain HTTP, got $code"
+            exit 1
+          fi
+          case "$target" in
+            https://localhost/*|https://localhost) echo "  redirect target is https on the same host" ;;
+            *) echo "::error::unexpected redirect target: $target"; exit 1 ;;
+          esac
+          echo "--- a deep path keeps its URI ---"
+          deep="$(curl -sS -o /dev/null -w '%{redirect_url}' "$EDGE_HTTP/api/v1/workspaces?x=1")"
+          echo "  /api/v1/workspaces?x=1 -> $deep"
+          case "$deep" in
+            https://localhost/api/v1/workspaces?x=1) echo "  path and query preserved" ;;
+            *) echo "::error::redirect did not preserve the request URI: $deep"; exit 1 ;;
+          esac
+          echo "--- /healthz stays on HTTP for the container healthcheck ---"
+          hz="$(curl -sS -w ' [%{http_code}]' "$EDGE_HTTP/healthz")"
+          echo "  /healthz -> $hz"
+          case "$hz" in
+            "ok [200]") echo "  edge health answered over plain HTTP" ;;
+            *) echo "::error::/healthz over HTTP returned: $hz"; exit 1 ;;
+          esac
+          echo "--- the ACME challenge path is not redirected ---"
+          acme="$(curl -sS -o /dev/null -w '%{http_code}' "$EDGE_HTTP/.well-known/acme-challenge/probe")"
+          echo "  /.well-known/acme-challenge/probe -> $acme"
+          if [ "$acme" = "301" ]; then
+            echo "::error::the ACME challenge path is being redirected; renewal would break"
+            exit 1
+          fi
+          echo "  not redirected (404 is expected: no challenge file is staged)"
+
+      - name: HTTPS serves the SPA and the API through the edge
+        run: |
+          echo "--- the SPA over https, with the certificate verified ---"
+          body="$(curl -sS --cacert "$CA" "$EDGE/")"
+          printf '%s' "$body" | grep -qi "<!doctype html"
+          echo "  index.html over https: $(printf '%s' "$body" | wc -c) bytes"
+          echo "--- API diagnostics and readiness through the edge ---"
+          curl -sS --cacert "$CA" "$EDGE/api/health" | head -c 300
+          echo
+          ready="$(curl -sS --cacert "$CA" -o /dev/null -w '%{http_code}' "$EDGE/api/ready")"
+          echo "  /api/ready -> $ready"
+          if [ "$ready" != "200" ]; then
+            echo "::error::readiness over https returned $ready"
+            exit 1
+          fi
+          echo "--- and nothing silently fell back to http ---"
+          scheme="$(curl -sS --cacert "$CA" -o /dev/null -w '%{scheme}' "$EDGE/")"
+          echo "  effective scheme: $scheme"
+          if [ "$scheme" != "https" ]; then
+            echo "::error::request did not use https"
+            exit 1
+          fi
+
+      - name: nginx presents the certificate that was generated
+        run: |
+          expected="$(openssl x509 -in "$CA" -noout -fingerprint -sha256 | sed 's/.*=//')"
+          served="$(echo | openssl s_client -connect localhost:443 -servername localhost 2>/dev/null | openssl x509 -noout -fingerprint -sha256 | sed 's/.*=//')"
+          echo "  expected fingerprint: $expected"
+          echo "  served fingerprint:   $served"
+          if [ "$expected" != "$served" ]; then
+            echo "::error::nginx is serving a different certificate than the one generated"
+            exit 1
+          fi
+          echo "  identity of the served certificate:"
+          echo | openssl s_client -connect localhost:443 -servername localhost 2>/dev/null | openssl x509 -noout -subject -issuer -ext subjectAltName
+          echo "  negotiated protocol and cipher:"
+          echo | openssl s_client -connect localhost:443 -servername localhost 2>/dev/null | grep -E "^(New|Protocol|Cipher)" | head -4
+
+      - name: TLS 1.2 and 1.3 are accepted, 1.0 and 1.1 are not
+        run: |
+          probe() {
+            echo | openssl s_client -connect localhost:443 -servername localhost "$1" 2>&1
+          }
+          for v in -tls1_2 -tls1_3; do
+            if probe "$v" | grep -qE "Protocol *: *TLSv1\.[23]"; then
+              echo "  accepted: $v"
+            else
+              echo "::error::$v was refused but should be accepted"
+              probe "$v" | tail -5
+              exit 1
+            fi
+          done
+          # Ubuntu's OpenSSL 3 refuses TLS 1.0/1.1 in its own default config,
+          # so a bare probe would fail client-side and prove nothing about
+          # nginx. This config re-enables them for the client only, so what we
+          # observe is the server's rejection.
+          cat > "$RUNNER_TEMP/openssl-legacy.cnf" <<'CNF'
+          openssl_conf = default_conf
+          [default_conf]
+          ssl_conf = ssl_sect
+          [ssl_sect]
+          system_default = system_default_sect
+          [system_default_sect]
+          MinProtocol = None
+          MaxProtocol = None
+          CipherString = DEFAULT:@SECLEVEL=0
+          CNF
+          for v in -tls1 -tls1_1; do
+            out="$(OPENSSL_CONF="$RUNNER_TEMP/openssl-legacy.cnf" probe "$v")"
+            if echo "$out" | grep -qE "Protocol *: *TLSv1(\.1)? *$"; then
+              echo "::error::$v completed a handshake; obsolete TLS is enabled"
+              exit 1
+            fi
+            if echo "$out" | grep -qiE "no protocols available|unsupported protocol"; then
+              echo "::error::$v could not be offered by this OpenSSL even with the legacy config, so the server's behaviour was not tested"
+              echo "$out" | tail -5
+              exit 1
+            fi
+            echo "  rejected: $v ($(echo "$out" | grep -oiE "alert [a-z ]+|handshake failure|no cipher" | head -1))"
+          done
+
+      - name: HSTS is sent over HTTPS only, without includeSubDomains
+        run: |
+          echo "--- https ---"
+          hdr="$(curl -sS --cacert "$CA" -D - -o /dev/null "$EDGE/api/health")"
+          count="$(printf '%s' "$hdr" | grep -ci '^strict-transport-security:' || true)"
+          value="$(printf '%s' "$hdr" | grep -i '^strict-transport-security:' | head -1)"
+          echo "  headers found: $count"
+          echo "  $value"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one Strict-Transport-Security header over https, found $count"
+            exit 1
+          fi
+          case "$value" in
+            *max-age=*) : ;;
+            *) echo "::error::HSTS header has no max-age"; exit 1 ;;
+          esac
+          if printf '%s' "$value" | grep -qi "includeSubDomains"; then
+            echo "::error::includeSubDomains is present; it must be opt-in"
+            exit 1
+          fi
+          if printf '%s' "$value" | grep -qi "preload"; then
+            echo "::error::preload is present; it must stay off"
+            exit 1
+          fi
+          echo "  one header, max-age set, no includeSubDomains, no preload"
+          echo "--- plain http must carry none ---"
+          httphdr="$(curl -sS -D - -o /dev/null "$EDGE_HTTP/healthz")"
+          if printf '%s' "$httphdr" | grep -qi '^strict-transport-security:'; then
+            echo "::error::HSTS was sent over plain http"
+            printf '%s' "$httphdr" | grep -i '^strict-transport-security:'
+            exit 1
+          fi
+          echo "  no HSTS over http, as intended"
+
+      - name: Security headers survive the TLS edge
+        run: |
+          hdr="$(curl -sS --cacert "$CA" -D - -o /dev/null "$EDGE/api/health")"
+          for h in x-content-type-options x-frame-options referrer-policy permissions-policy content-security-policy; do
+            line="$(printf '%s' "$hdr" | grep -i "^$h:" | head -1)"
+            if [ -z "$line" ]; then
+              echo "::error::missing $h on the https API response"
+              exit 1
+            fi
+            echo "  $line"
+          done
+          # The SPA is served by the frontend container's own nginx, which sets
+          # no CSP. That is existing behaviour, recorded rather than changed
+          # here: with no page CSP there is no connect-src to block wss, and
+          # the wss assertion below is the real proof.
+          spa="$(curl -sS --cacert "$CA" -D - -o /dev/null "$EDGE/")"
+          if printf '%s' "$spa" | grep -qi '^content-security-policy:'; then
+            echo "  SPA sends a CSP:"
+            printf '%s' "$spa" | grep -i '^content-security-policy:'
+          else
+            echo "  SPA sends no CSP (existing behaviour; nothing can block wss)"
+          fi
+
+      - name: HTTPS authentication, WSS, and the SSE proxy path
+        run: |
+          python3 -m pip install --quiet "websockets==12.0"
+          python3 - <<'PY'
+          import asyncio
+          import json
+          import secrets
+          import ssl
+          import sys
+          import urllib.error
+          import urllib.request
+
+          import websockets
+
+          EDGE = "https://localhost"
+          CA = "nginx/certs/fullchain.pem"
+          UPPER = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+          LOWER = "abcdefghijkmnopqrstuvwxyz"
+          DIGIT = "23456789"
+          SPECIAL = "!@#%^&*"
+
+          # Trust only the certificate this job generated, with hostname
+          # checking left on -- so a wrong or missing SAN fails the test
+          # rather than passing silently.
+          ctx = ssl.create_default_context(cafile=CA)
+          assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+
+
+          def password():
+              out = []
+              for pair in range(8):
+                  out.append(secrets.choice(UPPER if pair % 2 == 0 else LOWER))
+                  out.append(secrets.choice(DIGIT if pair % 2 == 0 else SPECIAL))
+              return "".join(out)
+
+
+          def call(path, payload=None, token=None, raw=False):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(EDGE + path, data=data)
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Origin", EDGE)
+              if token:
+                  req.add_header("Authorization", "Bearer " + token)
+              try:
+                  response = urllib.request.urlopen(req, timeout=60, context=ctx)
+                  return response if raw else json.loads(response.read().decode())
+              except urllib.error.HTTPError as exc:
+                  if raw:
+                      return exc
+                  sys.exit("%s failed: HTTP %s %s" % (path, exc.code, exc.read().decode()[:300]))
+
+          marker = secrets.token_hex(6)
+          created = call("/api/v1/auth/signup", {
+              "name": "TLS Probe",
+              # example.com, never .test: .test is reserved (RFC 6761) and
+              # email-validator rejects it, so signup would answer 422.
+              "email": "tls-probe-%s@example.com" % marker,
+              "password": password(),
+          })
+          token = created["access_token"]
+          print("HTTPS signup succeeded through the edge")
+          print("  token segments: %d" % (token.count(".") + 1))
+
+          workspace_id = call("/api/v1/workspaces", token=token)[0]["id"]
+          print("HTTPS authenticated read succeeded; workspace %s" % workspace_id)
+
+
+          async def probe():
+              url = "wss://localhost/api/v1/ws?workspace_id=%s" % workspace_id
+              assert url.startswith("wss://"), "the test must not use ws://"
+              async with websockets.connect(
+                  url,
+                  subprotocols=["bearer", token],
+                  origin=EDGE,
+                  ssl=ctx,
+                  open_timeout=30,
+                  close_timeout=5,
+              ) as socket:
+                  tls = socket.transport.get_extra_info("ssl_object")
+                  if tls is None:
+                      sys.exit("the socket is not TLS; it must not downgrade to ws://")
+                  print("WSS handshake completed through nginx")
+                  print("  TLS version: %s" % tls.version())
+                  print("  cipher: %s" % (tls.cipher()[0],))
+                  print("  negotiated subprotocol: %r" % socket.subprotocol)
+                  if socket.subprotocol != "bearer":
+                      sys.exit("the server did not echo the bearer subprotocol")
+                  raw = await asyncio.wait_for(socket.recv(), timeout=30)
+                  return json.loads(raw), tls.version()
+
+          event, tls_version = asyncio.run(probe())
+          if not isinstance(event, dict) or event.get("type") != "connection.ready":
+              sys.exit("expected connection.ready as the first frame, got %r" % (event,))
+          print("first frame over wss: %s" % json.dumps(event)[:200])
+          print("connection.ready received over wss")
+
+          # SSE through the TLS edge. The Gemini key in CI is not real, so
+          # generation cannot be asserted -- what is asserted is the proxy
+          # path: the request reaches the backend through nginx over https
+          # (the backend's X-Request-ID proves it was not answered by nginx),
+          # and the response is unbuffered, which is what the SSE location's
+          # proxy_buffering off and chunked_transfer_encoding exist for.
+          sse = call("/api/v1/chat/stream",
+                     {"query": "tls probe", "workspace_id": workspace_id},
+                     token=token, raw=True)
+          status = getattr(sse, "status", None) or getattr(sse, "code", None)
+          headers = {k.lower(): v for k, v in sse.headers.items()}
+          print("SSE proxy path: HTTP %s" % status)
+          print("  content-type: %s" % headers.get("content-type"))
+          print("  transfer-encoding: %s" % headers.get("transfer-encoding"))
+          print("  content-length: %s" % headers.get("content-length"))
+          if "x-request-id" not in headers:
+              sys.exit("no X-Request-ID: the response did not come from the backend")
+          if status in (502, 503, 504):
+              sys.exit("nginx could not reach the backend for the SSE route: %s" % status)
+          if "content-length" in headers:
+              sys.exit("the SSE response was buffered; proxy_buffering off is not in effect")
+          print("  reached the backend through nginx, unbuffered")
+          print("::notice::HTTPS/WSS verified: TLS %s, certificate verified, "
+                "connection.ready over wss, SSE proxy path unbuffered" % tls_version)
+          PY
+
+      - name: The datastores and the application ports are not on the host
+        run: |
+          # Same intent as prod-stack's check, extended to the application
+          # ports: only nginx may be reachable.
+          for port in 5432 6379 6333 8000 8080; do
+            if curl --silent --max-time 3 "http://127.0.0.1:$port" > /dev/null 2>&1; then
+              echo "::error::port $port answered on the host; it must not be published"
+              exit 1
+            fi
+            echo "  port $port is not reachable from the host, as intended"
+          done
+          echo "  reachable edge ports: 80 (redirect/health) and 443 (application)"
+
+      - name: The private key stayed out of Git and the workspace artefacts
+        run: |
+          echo "--- Git must still track only the placeholder ---"
+          tracked="$(git ls-files nginx/certs/)"
+          echo "  tracked: $tracked"
+          if [ "$tracked" != "nginx/certs/.gitkeep" ]; then
+            echo "::error::unexpected tracked files under nginx/certs: $tracked"
+            exit 1
+          fi
+          echo "--- and the generated files must be untracked, not merely unstaged ---"
+          if git status --porcelain nginx/certs | grep -vE '^\?\?' | grep -q .; then
+            echo "::error::certificate material appears as a tracked modification"
+            git status --porcelain nginx/certs
+            exit 1
+          fi
+          echo "  working tree sees them as untracked only:"
+          git status --porcelain nginx/certs || true
+          echo "--- .gitignore is what keeps them out ---"
+          git check-ignore -v nginx/certs/privkey.pem nginx/certs/fullchain.pem
+
+      - name: TLS verification summary
+        run: |
+          echo "Every line below corresponds to an assertion that ran and passed"
+          echo "in the steps above; a failure would have stopped the job there."
+          echo
+          echo "  HTTP -> HTTPS redirect (301, URI preserved)  PASS"
+          echo "  ACME challenge path exempt from redirect     PASS"
+          echo "  /healthz still answered over HTTP            PASS"
+          echo "  HTTPS frontend (SPA, cert verified)          PASS"
+          echo "  HTTPS /api/health                            PASS"
+          echo "  HTTPS /api/ready                             PASS"
+          echo "  HTTPS authentication (signup + bearer read)  PASS"
+          echo "  WSS /api/v1/ws (TLS, no ws:// downgrade)     PASS"
+          echo "  WebSocket connection.ready                   PASS"
+          echo "  SSE proxy path (backend reached, unbuffered) PASS"
+          echo "  TLS 1.2 accepted                             PASS"
+          echo "  TLS 1.3 accepted                             PASS"
+          echo "  TLS 1.0 rejected by the server               PASS"
+          echo "  TLS 1.1 rejected by the server               PASS"
+          echo "  Certificate identity (fingerprint match)     PASS"
+          echo "  HSTS over HTTPS, exactly one header          PASS"
+          echo "  No HSTS over HTTP                            PASS"
+          echo "  No includeSubDomains, no preload             PASS"
+          echo "  Security headers present over TLS            PASS"
+          echo "  Datastore and app ports not on the host      PASS"
+          echo "  Private key untracked and ignored            PASS"
+          echo
+          echo "Not asserted here: SSE token generation (the CI Gemini key is"
+          echo "not real), and certificate issuance/renewal, which is not"
+          echo "implemented - see gap 2 in docs/DEPLOYMENT.md."
+
+      - name: Stack state, logs and TLS diagnostics
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod ps || true
+          echo "--- nginx log ---"
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod logs --tail=80 nginx || true
+          echo "--- backend log ---"
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod logs --tail=80 backend || true
+          echo "--- certificate metadata (no key) ---"
+          openssl x509 -in nginx/certs/fullchain.pem -noout -subject -enddate -fingerprint -sha256 2>/dev/null || true
+          echo "--- handshake ---"
+          echo | openssl s_client -connect localhost:443 -servername localhost 2>&1 | grep -E "^(New|Protocol|Cipher|Verify)" || true
+
+      - name: Tear down and destroy the certificate
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml -f "$RUNNER_TEMP/tls-ports.yml" --env-file .env.prod down -v --remove-orphans || true
+          # shred rather than rm, and never read the file.
+          shred -u nginx/certs/privkey.pem 2>/dev/null || rm -f nginx/certs/privkey.pem
+          rm -f nginx/certs/fullchain.pem
+          rm -f "$RUNNER_TEMP/openssl-legacy.cnf" "$RUNNER_TEMP/tls-ports.yml"
+          echo "nginx/certs now holds:"
+          ls -A nginx/certs
+          remaining="$(find nginx/certs -type f -not -name .gitkeep | wc -l)"
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::certificate material survived cleanup"
+            exit 1
+          fi
+          echo "certificate and key destroyed"
+
   # ------------------------------------------------------------------- gate --
   ci-passed:
     name: CI passed
     runs-on: ubuntu-latest
     if: always()
-    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build, e2e, prod-stack]
+    needs: [backend-quality, backend-tests, backend-config, frontend, docker-build, e2e, prod-stack, prod-stack-tls]
     steps:
       # A single required status check for branch protection. Without this,
       # protection rules have to enumerate every matrix leg by name.
