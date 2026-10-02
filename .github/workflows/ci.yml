@@ -1624,8 +1624,17 @@ jobs:
             # asserted, and under `bash -e` a failing command substitution
             # would abort the step before the checks below ever ran.
             out="$(OPENSSL_CONF="$RUNNER_TEMP/openssl-legacy.cnf" probe "$v" || true)"
-            if echo "$out" | grep -qE "Protocol *: *TLSv1(\.1)? *$"; then
+            # The negotiated cipher, not the Protocol field. OpenSSL prints
+            # `Protocol  : TLSv1` for the version the client *attempted*, even
+            # when the server refused it -- verified against a host that
+            # rejects TLS 1.0 and answers `tlsv1 alert protocol version`,
+            # whose output still carries that line alongside
+            # `New, (NONE), Cipher is (NONE)`. Only a real cipher means a
+            # handshake completed, so `Cipher is [^(]` separates
+            # `Cipher is ECDHE-...` from `Cipher is (NONE)`.
+            if printf '%s' "$out" | grep -qE "New, TLSv1(\.[01])?, Cipher is [^(]"; then
               echo "::error::$v completed a handshake; obsolete TLS is enabled"
+              printf '%s\n' "$out" | tail -40
               exit 1
             fi
             if echo "$out" | grep -qiE "no protocols available|unsupported protocol"; then
@@ -1795,8 +1804,14 @@ jobs:
           # (the backend's X-Request-ID proves it was not answered by nginx),
           # and the response is unbuffered, which is what the SSE location's
           # proxy_buffering off and chunked_transfer_encoding exist for.
+          # The field is `prompt` -- ChatQuery in app/api/v1/chat.py. Sending
+          # the wrong name would answer 422 with a Content-Length, which the
+          # buffering check below would misreport as nginx buffering the
+          # stream. StreamingResponse is returned before the generator runs,
+          # so the status is 200 and the fake Gemini key surfaces as stream
+          # content rather than an error code.
           sse = call("/api/v1/chat/stream",
-                     {"query": "tls probe", "workspace_id": workspace_id},
+                     {"prompt": "tls probe", "workspace_id": workspace_id},
                      token=token, raw=True)
           status = getattr(sse, "status", None) or getattr(sse, "code", None)
           headers = {k.lower(): v for k, v in sse.headers.items()}
@@ -1809,7 +1824,9 @@ jobs:
           if status in (502, 503, 504):
               sys.exit("nginx could not reach the backend for the SSE route: %s" % status)
           if "content-length" in headers:
-              sys.exit("the SSE response was buffered; proxy_buffering off is not in effect")
+              sys.exit("the SSE response carried Content-Length (HTTP %s, %s), so it was "
+                       "not streamed; either nginx buffered it or the backend answered with "
+                       "a non-streaming body" % (status, headers.get("content-type")))
           print("  reached the backend through nginx, unbuffered")
           print("::notice::HTTPS/WSS verified: TLS %s, certificate verified, "
                 "connection.ready over wss, SSE proxy path unbuffered" % tls_version)
