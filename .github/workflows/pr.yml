@@ -16,7 +16,7 @@ jobs:
     steps:
       # The release changelog groups commits by conventional-commit type, so a
       # non-conforming squash-merge title silently disappears from the notes.
-      - uses: amannn/action-semantic-pull-request@v5
+      - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
