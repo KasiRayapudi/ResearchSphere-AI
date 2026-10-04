@@ -132,20 +132,225 @@ jobs:
         working-directory: frontend
         run: npm ci --no-audit --no-fund
 
-      # Blocking on high and critical only: moderate advisories in build-time
-      # dependencies do not reach production, and blocking on them would stall
-      # unrelated work.
+      # Two legs, because "high or critical" and "reaches production" are
+      # different questions and a single --audit-level gate conflates them.
+      # The previous gate blocked on severity alone while its rationale
+      # appealed to build-time-versus-production, so a high advisory in a
+      # build-time dependency fell between the two.
+      #
+      #   leg 1  the production dependency tree blocks unconditionally. No
+      #          exception mechanism applies to code that ships.
+      #   leg 2  the full tree blocks as well, except for advisories named in
+      #          ACCEPTED_ADVISORIES, each of which must carry a section in
+      #          docs/SECURITY.md.
+      #
+      # An accepted advisory that is no longer reported is a defect rather
+      # than a relief: the exception has outlived its cause, so leg 2 fails
+      # and names the entry to delete. That makes the revisit rule in
+      # docs/SECURITY.md enforced rather than aspirational, and it triggers
+      # on the real condition instead of a guessed review date.
+      #
+      # Both audits are also checked for having run at all. npm exits
+      # non-zero both when it finds vulnerabilities and when it cannot reach
+      # the advisory endpoint, and those must never be confused: a DNS
+      # failure reported as a vulnerability would be a false alarm, and a
+      # vulnerability reported as a DNS failure would be worse.
       - name: Audit
         working-directory: frontend
+        env:
+          # Accepted build-time-only advisories, whitespace or comma
+          # separated. Every entry needs a section in docs/SECURITY.md
+          # explaining why the exposure is bounded. Delete an entry as soon
+          # as its advisory stops being reported -- the step enforces that.
+          ACCEPTED_ADVISORIES: GHSA-vfj7-8cjw-p6xm
         run: |
+          # The reports are written whatever the verdict, so the uploaded
+          # artefact is useful on a pass as well as a failure.
           npm audit --json > npm-audit.json || true
-          npm audit --audit-level=high
+          npm audit --omit=dev --json > npm-audit-production.json || true
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          BLOCKING = ("high", "critical")
+
+
+          def load(path, label):
+              """Parse an npm audit report, or stop with a tooling error.
+
+              npm exits non-zero for a failed request as well as for a real
+              finding, and with --json it writes an error object instead of a
+              report. Checking the shape is what separates the two.
+              """
+              try:
+                  data = json.loads(pathlib.Path(path).read_text())
+              except Exception as exc:
+                  sys.exit("::error::the %s audit produced no parseable JSON (%s). "
+                           "That is a tooling or network failure, not a vulnerability "
+                           "verdict -- the gate has not run." % (label, exc))
+              counts = (data.get("metadata") or {}).get("vulnerabilities")
+              if not isinstance(counts, dict) or "high" not in counts:
+                  sys.exit("::error::the %s audit JSON carries no "
+                           "metadata.vulnerabilities. That is a tooling or network "
+                           "failure, not a vulnerability verdict -- the gate has not "
+                           "run." % label)
+              return data, counts
+
+
+          def blocking_packages(data):
+              return {name: entry
+                      for name, entry in (data.get("vulnerabilities") or {}).items()
+                      if entry.get("severity") in BLOCKING}
+
+
+          def advisories(data):
+              """Distinct root advisories behind the blocking-severity packages.
+
+              A package entry lists its causes in `via`: a dict is an advisory,
+              a string names another package that carries one. Keying on the
+              GHSA id collapses the transitive reports onto the one advisory
+              that actually has to be judged.
+              """
+              found = {}
+              for name, entry in blocking_packages(data).items():
+                  for via in entry.get("via") or []:
+                      if not isinstance(via, dict):
+                          continue
+                      url = via.get("url") or ""
+                      match = re.search(r"(GHSA-[0-9a-zA-Z-]+)", url)
+                      key = match.group(1) if match else "npm-%s" % via.get("source")
+                      record = found.setdefault(key, {
+                          "url": url,
+                          "title": via.get("title"),
+                          "severity": via.get("severity"),
+                          "package": via.get("name"),
+                          "range": via.get("range"),
+                          "reported_against": set(),
+                      })
+                      record["reported_against"].add(name)
+              return found
+
+
+          def describe(key, record, indent="    "):
+              print("%s%s  [%s]" % (indent, key, record.get("severity")))
+              print("%s  %s" % (indent, record.get("title")))
+              print("%s  package %s, vulnerable %s"
+                    % (indent, record.get("package"), record.get("range")))
+              print("%s  reported against: %s"
+                    % (indent, ", ".join(sorted(record["reported_against"]))))
+              if record.get("url"):
+                  print("%s  %s" % (indent, record["url"]))
+
+
+          accepted = [token for token in
+                      re.split(r"[\s,]+", os.environ.get("ACCEPTED_ADVISORIES", ""))
+                      if token]
+          failures = []
+
+          print("--- leg 1: the production dependency tree ---")
+          prod, prod_counts = load("npm-audit-production.json", "production-tree")
+          prod_total = int(prod_counts.get("high", 0)) + int(prod_counts.get("critical", 0))
+          print("  counts: %s" % json.dumps(prod_counts))
+          if prod_total:
+              print("::error::%d high or critical advisories affect the production "
+                    "dependency tree. No exception applies to shipped code."
+                    % prod_total)
+              for key, record in sorted(advisories(prod).items()):
+                  describe(key, record)
+              failures.append("production tree")
+          else:
+              print("  no high or critical advisories reach the production tree")
+
+          print()
+          print("--- leg 2: the full tree, minus accepted advisories ---")
+          full, full_counts = load("npm-audit.json", "full-tree")
+          print("  counts: %s" % json.dumps(full_counts))
+          found = advisories(full)
+          flagged = blocking_packages(full)
+          print("  %d blocking-severity package(s), %d distinct advisory(ies)"
+                % (len(flagged), len(found)))
+          print("  accepted by configuration: %s" % (", ".join(accepted) or "none"))
+
+          # Fail closed: if packages are flagged but no advisory identity could
+          # be extracted, the exception list cannot be applied safely.
+          if flagged and not found:
+              print("::error::%d package(s) are flagged at blocking severity but no "
+                    "advisory identity could be read from the report, so the accepted "
+                    "list cannot be applied. Treating this as a failure."
+                    % len(flagged))
+              failures.append("unidentifiable advisories")
+
+          unaccepted = {k: v for k, v in found.items() if k not in accepted}
+          if unaccepted:
+              print("::error::%d high or critical advisory(ies) are not accepted:"
+                    % len(unaccepted))
+              for key, record in sorted(unaccepted.items()):
+                  describe(key, record)
+              failures.append("unaccepted advisories")
+          else:
+              print("  every blocking advisory is accounted for")
+
+          stale = [key for key in accepted if key not in found]
+          if stale:
+              print("::error::%d accepted advisory(ies) are no longer reported, so the "
+                    "exception has outlived its cause:" % len(stale))
+              for key in stale:
+                  print("    %s" % key)
+              print("  Remove it from ACCEPTED_ADVISORIES in "
+                    ".github/workflows/security.yml and delete its section in "
+                    "docs/SECURITY.md.")
+              failures.append("stale exceptions")
+
+          print()
+          if failures:
+              sys.exit("audit gate failed: %s" % ", ".join(failures))
+          for key in accepted:
+              print("accepted, see docs/SECURITY.md:")
+              describe(key, found[key], indent="  ")
+          print()
+          print("audit gate passed: nothing reaches production, and every high or "
+                "critical advisory in the build-time tree is explicitly accepted.")
+          PY
+
+      - name: Summarise
+        if: always()
+        working-directory: frontend
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import pathlib
+
+          print("### Node dependency audit")
+          print()
+          for path, label in (("npm-audit-production.json", "Production tree"),
+                              ("npm-audit.json", "Full tree (including build-time)")):
+              print("**%s**" % label)
+              print()
+              try:
+                  counts = json.loads(pathlib.Path(path).read_text())["metadata"]["vulnerabilities"]
+              except Exception:
+                  print("- report unavailable (the audit did not run)")
+                  print()
+                  continue
+              print("| severity | count |")
+              print("| --- | --- |")
+              for key in ("critical", "high", "moderate", "low", "info"):
+                  print("| %s | %s |" % (key, counts.get(key, 0)))
+              print()
+          print("Accepted advisories are listed in `ACCEPTED_ADVISORIES` in")
+          print("`.github/workflows/security.yml` and justified in `docs/SECURITY.md`.")
+          PY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: npm-audit-report
-          path: frontend/npm-audit.json
+          path: |
+            frontend/npm-audit.json
+            frontend/npm-audit-production.json
           retention-days: 30
 
   # ---------------------------------------------------------------- secrets --

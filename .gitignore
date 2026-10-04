@@ -83,6 +83,7 @@ frontend/coverage/
 frontend/module-graph.json
 frontend/circular.txt
 frontend/npm-audit.json
+frontend/npm-audit-production.json
 
 # Playwright artefacts (reports, traces, browser cache)
 frontend/playwright-report/
