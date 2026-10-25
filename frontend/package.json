@@ -19,7 +19,7 @@
     "@types/react-syntax-highlighter": "^15.5.13",
     "clsx": "^2.1.1",
     "framer-motion": "^12.4.7",
-    "lucide-react": "^0.475.0",
+    "lucide-react": "^1.48.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
