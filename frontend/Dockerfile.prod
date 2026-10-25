@@ -30,7 +30,7 @@ RUN npm run build
 
 # ---------------------------------------------------------------- runtime ---
 # nginx-unprivileged runs as uid 101 and listens on 8080; no root anywhere.
-FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 
 USER root
 # curl for the container HEALTHCHECK; removed from the layer cost by cleaning
